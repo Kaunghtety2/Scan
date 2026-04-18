@@ -23914,22 +23914,77 @@ def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
     return sorted(found, key=lambda x: -x['confidence'])
 
 
+# ── Donation / payment path keywords ────────────────────────────────
+_DONATE_PAY_RE = re.compile(
+    r'(?i)(donat|contribut|payment|checkout|pay(?:ment)?|subscribe|'
+    r'fund|giving|support|pledge|tip|sponsor|billing|purchase|order|cart)',
+)
+
+def _endpoint_is_pay_related(ep: str) -> bool:
+    """Endpoint URL က donate/pay နဲ့ သက်ဆိုင်ရင် True."""
+    return bool(_DONATE_PAY_RE.search(ep))
+
+def _resolve(base: str, href: str) -> str:
+    """Safe urljoin wrapper."""
+    if not href:
+        return base
+    if href.startswith(('javascript:', '#', 'mailto:')):
+        return ''
+    if href.startswith('http'):
+        return href
+    return urljoin(base, href)
+
 def _extract_forms_static(html: str, page_url: str) -> list:
-    """BeautifulSoup ဖြင့် <form> မှ payload structure ထုတ်သည်။"""
+    """
+    Improved form extractor:
+      • <form> — standard HTML forms
+      • hx-post / hx-put / hx-patch — HTMX endpoints
+      • @submit / x-on:submit — Alpine.js form actions
+      • data-action — Stimulus.js
+      • button[formaction] — submit button override
+      • v-bind:action / :action — Vue.js bound action
+      • (ngSubmit) — Angular template event
+      • donate/pay URL detection
+    """
     from bs4 import BeautifulSoup
     soup    = BeautifulSoup(html, 'html.parser')
     results = []
-    for idx, form in enumerate(soup.find_all('form')):
-        action  = form.get('action', '')
-        method  = form.get('method', 'GET').upper()
-        enctype = form.get('enctype', 'application/x-www-form-urlencoded')
-        endpoint = (urljoin(page_url, action)
-                    if action and not action.startswith('http') else (action or page_url))
+    seen_eps: set = set()
+
+    def _make_entry(source_label: str, idx: int, endpoint: str,
+                    method: str, enctype: str, fields: list) -> dict:
+        card_fields = [f for f in fields if f.get('is_card')]
+        is_pay = len(card_fields) > 0 or _endpoint_is_pay_related(endpoint)
+        return {
+            'source':     source_label,
+            'form_idx':   idx,
+            'endpoint':   endpoint,
+            'method':     method,
+            'enctype':    enctype,
+            'fields':     fields,
+            'card_fields': card_fields,
+            'is_payment': is_pay,
+        }
+
+    def _collect_fields(container) -> list:
         fields = []
-        for inp in form.find_all(['input', 'textarea', 'select']):
+        for inp in container.find_all(['input', 'textarea', 'select', 'button']):
             name  = inp.get('name') or inp.get('id') or ''
-            if not name: continue
+            if not name:
+                continue
             ftype = inp.get('type', 'text').lower()
+            if ftype in ('submit', 'reset', 'button', 'image'):
+                # button[formaction] — endpoint override
+                fa = inp.get('formaction', '')
+                if fa:
+                    ep = _resolve(page_url, fa)
+                    if ep and ep not in seen_eps:
+                        seen_eps.add(ep)
+                        results.append(_make_entry(
+                            'button_formaction', len(results) + 1,
+                            ep, inp.get('formmethod', 'POST').upper(),
+                            'application/x-www-form-urlencoded', []))
+                continue
             value = inp.get('value', '')
             req   = inp.has_attr('required')
             label, icon, is_dyn, card_type = _classify_field(name, value)
@@ -23939,18 +23994,183 @@ def _extract_forms_static(html: str, page_url: str) -> list:
                 'is_dynamic': is_dyn, 'is_card': card_type is not None,
                 'card_type': card_type,
             })
-        card_fields = [f for f in fields if f.get('is_card')]
-        results.append({
-            'source': 'static', 'form_idx': idx + 1,
-            'endpoint': endpoint, 'method': method, 'enctype': enctype,
-            'fields': fields, 'card_fields': card_fields,
-            'is_payment': len(card_fields) > 0,
-        })
+        return fields
+
+    # ── ① Standard <form> tags ───────────────────────────────────────
+    for idx, form in enumerate(soup.find_all('form'), 1):
+        action  = form.get('action', '')
+        method  = form.get('method', 'GET').upper()
+        enctype = form.get('enctype', 'application/x-www-form-urlencoded')
+        endpoint = _resolve(page_url, action) or page_url
+
+        # Vue :action / v-bind:action override
+        vue_action = form.get(':action') or form.get('v-bind:action')
+        if vue_action and not vue_action.startswith(('{', '[')):
+            ep2 = _resolve(page_url, vue_action.strip("'\""))
+            if ep2:
+                endpoint = ep2
+
+        # Angular (ngSubmit) — note endpoint from action attr
+        ng_submit = form.get('(ngsubmit)')
+
+        fields = _collect_fields(form)
+        if endpoint not in seen_eps:
+            seen_eps.add(endpoint)
+        results.append(_make_entry('static', idx, endpoint, method, enctype, fields))
+
+        # Angular note
+        if ng_submit:
+            results[-1]['notes'] = f'Angular ngSubmit: {ng_submit[:80]}'
+
+    # ── ② HTMX — hx-post / hx-put / hx-patch ───────────────────────
+    htmx_attrs = [
+        ('hx-post',  'POST'),
+        ('hx-put',   'PUT'),
+        ('hx-patch', 'PATCH'),
+    ]
+    for attr, method in htmx_attrs:
+        for tag in soup.find_all(attrs={attr: True}):
+            ep = _resolve(page_url, tag[attr])
+            if not ep or ep in seen_eps:
+                continue
+            seen_eps.add(ep)
+            # Collect nearby inputs (parent form or tag itself)
+            container = tag.find_parent('form') or tag
+            fields = _collect_fields(container)
+            entry = _make_entry('htmx', len(results) + 1, ep, method,
+                                tag.get('hx-encoding', 'application/x-www-form-urlencoded'),
+                                fields)
+            entry['htmx_trigger'] = tag.get('hx-trigger', 'click')
+            results.append(entry)
+
+    # ── ③ Alpine.js — @submit / x-on:submit ────────────────────────
+    alpine_selectors = ['@submit', 'x-on:submit', '@submit.prevent', 'x-on:submit.prevent']
+    for asel in alpine_selectors:
+        for tag in soup.find_all(attrs={asel: True}):
+            # action extracted from x-bind:action or action attr
+            action_raw = tag.get('action') or tag.get(':action') or tag.get('x-bind:action','')
+            ep = _resolve(page_url, action_raw.strip("'\"")) if action_raw else page_url
+            if ep in seen_eps:
+                continue
+            seen_eps.add(ep)
+            fields = _collect_fields(tag)
+            entry = _make_entry('alpine', len(results) + 1, ep, 'POST',
+                                'application/json', fields)
+            entry['alpine_handler'] = tag[asel][:80]
+            results.append(entry)
+
+    # ── ④ Stimulus.js — data-action="submit->ctrl#method" ──────────
+    for tag in soup.find_all(attrs={'data-action': True}):
+        da = tag['data-action']
+        if 'submit' not in da:
+            continue
+        # data-url or action attr as endpoint
+        ep_raw = tag.get('data-url') or tag.get('action') or ''
+        ep = _resolve(page_url, ep_raw) if ep_raw else ''
+        if not ep or ep in seen_eps:
+            continue
+        seen_eps.add(ep)
+        fields = _collect_fields(tag)
+        results.append(_make_entry('stimulus', len(results) + 1, ep, 'POST',
+                                   'application/json', fields))
+
+    # ── ⑤ Donate / pay links — <a href> with pay-related paths ─────
+    for a_tag in soup.find_all('a', href=True):
+        href = a_tag['href']
+        if not _DONATE_PAY_RE.search(href):
+            continue
+        ep = _resolve(page_url, href)
+        if not ep or ep in seen_eps:
+            continue
+        seen_eps.add(ep)
+        results.append(_make_entry('pay_link', len(results) + 1,
+                                   ep, 'GET', '', []))
+
     return results
 
 
+# ── JS Endpoint Scanner ──────────────────────────────────────────────
+
+# fetch / axios / $.ajax / XHR patterns to find hardcoded API paths in JS
+_JS_ENDPOINT_PATTERNS = [
+    # fetch('/api/...', { method: 'POST' })
+    re.compile(r'''fetch\s*\(\s*['"`]([^'"`\s]{4,150})['"`]''', re.I),
+    # axios.post('/path') / axios.get / axios.put / axios.patch / axios.delete
+    re.compile(r'''axios\s*\.\s*(?:post|put|patch|delete|get)\s*\(\s*['"`]([^'"`\s]{4,150})['"`]''', re.I),
+    # axios({ url: '/path' })
+    re.compile(r'''axios\s*\(\s*\{[^}]*?url\s*:\s*['"`]([^'"`\s]{4,150})['"`]''', re.I | re.S),
+    # $.ajax({ url: '/path' }) / $.post('/path') / $.get('/path')
+    re.compile(r'''\$\s*\.\s*(?:ajax|post|put|get)\s*\(\s*(?:\{[^}]*?url\s*:\s*)?['"`]([^'"`\s]{4,150})['"`]''', re.I | re.S),
+    # XMLHttpRequest: xhr.open('POST', '/path')
+    re.compile(r'''\.open\s*\(\s*['"`](?:POST|PUT|PATCH|DELETE|GET)['"`]\s*,\s*['"`]([^'"`\s]{4,150})['"`]''', re.I),
+    # this.$http.post('/path') — Vue resource
+    re.compile(r'''\$http\s*\.\s*(?:post|put|patch|delete|get)\s*\(\s*['"`]([^'"`\s]{4,150})['"`]''', re.I),
+    # request({ url: '/path' }) — superagent/request
+    re.compile(r'''(?:request|superagent)\s*\.\s*(?:post|put|patch|get)\s*\(\s*['"`]([^'"`\s]{4,150})['"`]''', re.I),
+    # createAsyncThunk('name', async () => fetch('/path'))
+    re.compile(r'''['"` /](/(?:api|v\d|graphql|rest|auth|user|payment|checkout|donat|pay)[^'"`\s]{0,100})['"`]''', re.I),
+]
+
+_JS_DONATE_PAY_RE = re.compile(
+    r'(?i)/(donat|contribut|payment|checkout|pay(?:out|ment)?|subscribe|'
+    r'fund|giving|pledge|tip|sponsor|billing|purchase|order|cart)',
+)
+
+def _scan_js_endpoints(js_text: str, page_url: str) -> list:
+    """
+    JS bundle / inline script ထဲမှ fetch/axios/XHR endpoint တွေ ရှာတယ်။
+    donate/pay related path တွေကို is_payment=True နဲ့ mark လုပ်တယ်။
+    Returns list of dicts compatible with _extract_forms_static output.
+    """
+    found = []
+    seen  = set()
+    base  = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+
+    for pat in _JS_ENDPOINT_PATTERNS:
+        for m in pat.finditer(js_text):
+            raw = m.group(1).strip().rstrip('/')
+            if not raw or len(raw) < 4:
+                continue
+            # Normalize to full URL
+            if raw.startswith('http'):
+                ep = raw
+            elif raw.startswith('/'):
+                ep = base + raw
+            else:
+                continue   # relative paths without leading / → unreliable
+
+            if ep in seen:
+                continue
+            # Filter out obvious non-endpoints (fonts, images, cdn assets)
+            if re.search(r'\.(png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|css|ico)(\?|$)', ep, re.I):
+                continue
+            seen.add(ep)
+
+            is_pay = bool(_JS_DONATE_PAY_RE.search(ep))
+            found.append({
+                'source':     'js_scan',
+                'form_idx':   len(found) + 1,
+                'endpoint':   ep,
+                'method':     'POST',
+                'enctype':    'application/json',
+                'fields':     [],
+                'card_fields': [],
+                'is_payment': is_pay,
+            })
+
+    return found
+
+
 def _extract_requests_playwright(url: str, progress_cb=None) -> list:
-    """Playwright network intercept — fetch/XHR POST ဖမ်းသည်။"""
+    """
+    Improved Playwright network intercept:
+      • POST/PUT/PATCH request ဖမ်းတယ် (မူရင်း)
+      • Scroll simulate → lazy-load / infinite scroll API trigger
+      • Inline <script> ထဲမှ fetch/axios endpoint scan
+      • External JS bundle download + scan (js_text)
+      • donate/pay endpoint ကို is_payment=True mark
+      • GET requests with pay-related URL ကိုပါ record လုပ်တယ်
+    """
     if not PLAYWRIGHT_OK:
         return []
     safe, _ = is_safe_url(url)
@@ -23960,13 +24180,62 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
     captured = []
     js_text  = ''
 
+    def _parse_body_fields(body: str, ct: str) -> list:
+        fields = []
+        if 'json' in ct:
+            try:
+                d = json.loads(body)
+                if isinstance(d, dict):
+                    def _flat(obj, prefix=''):
+                        items = []
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                key = f"{prefix}.{k}" if prefix else k
+                                if isinstance(v, (dict, list)):
+                                    items.extend(_flat(v, key))
+                                else:
+                                    items.append((key, str(v)[:120]))
+                        elif isinstance(obj, list):
+                            for i, v in enumerate(obj[:5]):
+                                items.extend(_flat(v, f"{prefix}[{i}]"))
+                        return items
+                    for k, v in _flat(d):
+                        label, icon, is_dyn, card_type = _classify_field(k, v)
+                        fields.append({'name': k, 'type': 'json', 'value': v[:80],
+                            'required': True, 'field_label': label, 'icon': icon,
+                            'is_dynamic': is_dyn, 'is_card': card_type is not None,
+                            'card_type': card_type})
+            except Exception:
+                pass
+        elif 'urlencoded' in ct or 'form' in ct:
+            try:
+                for k, vals in parse_qs(body).items():
+                    v = vals[0] if vals else ''
+                    label, icon, is_dyn, card_type = _classify_field(k, v)
+                    fields.append({'name': k, 'type': 'form', 'value': v[:80],
+                        'required': True, 'field_label': label, 'icon': icon,
+                        'is_dynamic': is_dyn, 'is_card': card_type is not None,
+                        'card_type': card_type})
+            except Exception:
+                pass
+        elif 'multipart' in ct:
+            for match in re.finditer(r'name="([^"]+)"', body):
+                k = match.group(1)
+                label, icon, is_dyn, card_type = _classify_field(k, '')
+                fields.append({'name': k, 'type': 'multipart', 'value': '',
+                    'required': False, 'field_label': label, 'icon': icon,
+                    'is_dynamic': is_dyn, 'is_card': card_type is not None,
+                    'card_type': card_type})
+        return fields
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox","--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled","--disable-gpu"])
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--disable-gpu"])
             ctx = browser.new_context(
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -23974,85 +24243,147 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                 viewport={"width": 1366, "height": 768},
                 ignore_https_errors=True)
             ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};")
             page = ctx.new_page()
 
+            seen_eps: set = set()
+
             def on_request(request):
-                if request.method not in ('POST','PUT','PATCH'): return
+                ep = request.url
+                method = request.method
                 try:
-                    body     = request.post_data or ''
-                    ct       = request.headers.get('content-type','')
-                    endpoint = request.url
-                    fields   = []
+                    ct   = request.headers.get('content-type', '')
+                    body = request.post_data or ''
 
-                    if 'json' in ct:
-                        try:
-                            data = json.loads(body)
-                            if isinstance(data, dict):
-                                for k, v in data.items():
-                                    label,icon,is_dyn,card_type = _classify_field(k,str(v))
-                                    fields.append({'name':k,'type':'json','value':str(v)[:80],
-                                        'required':True,'field_label':label,'icon':icon,
-                                        'is_dynamic':is_dyn,'is_card':card_type is not None,
-                                        'card_type':card_type})
-                        except Exception: pass
-                    elif 'urlencoded' in ct or 'form' in ct:
-                        try:
-                            for k,vals in parse_qs(body).items():
-                                v = vals[0] if vals else ''
-                                label,icon,is_dyn,card_type = _classify_field(k,v)
-                                fields.append({'name':k,'type':'form','value':v[:80],
-                                    'required':True,'field_label':label,'icon':icon,
-                                    'is_dynamic':is_dyn,'is_card':card_type is not None,
-                                    'card_type':card_type})
-                        except Exception: pass
-                    elif 'multipart' in ct:
-                        for match in re.finditer(r'name="([^"]+)"', body):
-                            k = match.group(1)
-                            label,icon,is_dyn,card_type = _classify_field(k,'')
-                            fields.append({'name':k,'type':'multipart','value':'',
-                                'required':False,'field_label':label,'icon':icon,
-                                'is_dynamic':is_dyn,'is_card':card_type is not None,
-                                'card_type':card_type})
+                    # ── POST/PUT/PATCH — full field parse ──────────
+                    if method in ('POST', 'PUT', 'PATCH'):
+                        fields      = _parse_body_fields(body, ct)
+                        card_fields = [f for f in fields if f.get('is_card')]
+                        is_pay      = (len(card_fields) > 0 or
+                                       _endpoint_is_pay_related(ep))
+                        if fields or body.strip():
+                            if ep not in seen_eps:
+                                seen_eps.add(ep)
+                            captured.append({
+                                'source':     'playwright',
+                                'form_idx':   len(captured) + 1,
+                                'endpoint':   ep,
+                                'method':     method,
+                                'enctype':    ct or 'unknown',
+                                'fields':     fields,
+                                'card_fields': card_fields,
+                                'is_payment': is_pay,
+                                'raw_body':   body[:300] if not fields else '',
+                            })
 
-                    card_fields = [f for f in fields if f.get('is_card')]
-                    if fields or body:
-                        captured.append({
-                            'source':'playwright','form_idx':len(captured)+1,
-                            'endpoint':endpoint,'method':request.method,'enctype':ct or 'unknown',
-                            'fields':fields,'card_fields':card_fields,
-                            'is_payment':len(card_fields)>0,
-                            'raw_body': body[:200] if not fields else '',
-                        })
-                except Exception: pass
+                    # ── GET — donate/pay URL ────────────────────────
+                    elif method == 'GET' and _endpoint_is_pay_related(ep):
+                        if ep not in seen_eps:
+                            seen_eps.add(ep)
+                            captured.append({
+                                'source':     'playwright_get',
+                                'form_idx':   len(captured) + 1,
+                                'endpoint':   ep,
+                                'method':     'GET',
+                                'enctype':    '',
+                                'fields':     [],
+                                'card_fields': [],
+                                'is_payment': True,
+                                'raw_body':   '',
+                            })
+                except Exception:
+                    pass
 
             page.on('request', on_request)
-            if progress_cb: progress_cb("🌐 Playwright loading + intercepting...")
+            if progress_cb:
+                progress_cb("🌐 Playwright loading + intercepting...")
 
-            try: page.goto(url, wait_until="networkidle", timeout=40_000)
-            except Exception:
-                try: page.goto(url, wait_until="load", timeout=25_000)
-                except Exception: pass
-            try: page.wait_for_timeout(3000)
-            except Exception: pass
-
-            # Grab JS source for gateway detection
+            # ── Navigate ──────────────────────────────────────────
             try:
-                for s in page.query_selector_all('script[src]'):
-                    src = s.get_attribute('src') or ''
-                    if src:
-                        full = urljoin(url,src) if not src.startswith('http') else src
-                        try:
-                            r = requests.get(full, timeout=5, verify=False, headers=_get_headers())
-                            if r.status_code == 200: js_text += r.text[:50000]
-                        except Exception: pass
-            except Exception: pass
+                page.goto(url, wait_until="networkidle", timeout=40_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="load", timeout=25_000)
+                except Exception:
+                    pass
+
+            # ── Scroll simulate — lazy API / infinite scroll trigger ──
+            if progress_cb:
+                progress_cb("📜 Scroll simulating...")
+            try:
+                page_height = page.evaluate("document.body.scrollHeight") or 3000
+                step        = 400
+                pos         = 0
+                while pos < min(page_height, 6000):
+                    page.evaluate(f"window.scrollTo(0, {pos})")
+                    page.wait_for_timeout(300)
+                    pos += step
+                # Scroll back to top (trigger top-bar lazy loads)
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            # Extra settle time for SPA async renders
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+            # ── Inline <script> scan ──────────────────────────────
+            if progress_cb:
+                progress_cb("🔍 Scanning inline scripts...")
+            try:
+                inline_scripts = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('script:not([src])'))
+                        .map(s => s.textContent || '')
+                        .filter(t => t.length > 30)
+                        .join('\\n');
+                }""") or ''
+                js_text += inline_scripts
+            except Exception:
+                pass
+
+            # ── External JS bundle download + scan ────────────────
+            if progress_cb:
+                progress_cb("📦 Fetching JS bundles...")
+            try:
+                script_srcs = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('script[src]'))
+                        .map(s => s.src).filter(Boolean)
+                """) or []
+                for src in script_srcs[:15]:          # max 15 bundles
+                    full = src if src.startswith('http') else urljoin(url, src)
+                    safe2, _ = is_safe_url(full)
+                    if not safe2:
+                        continue
+                    try:
+                        r = requests.get(full, timeout=6, verify=False,
+                                         headers=_get_headers(),
+                                         proxies=proxy_manager.get_proxy())
+                        if r.status_code == 200:
+                            js_text += r.text[:80_000]   # 80KB per bundle
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             browser.close()
+
     except Exception as e:
         logger.warning(f"Playwright payload intercept error: {e}")
 
-    # Attach js_text to first captured item for gateway detection
+    # ── JS endpoint scan (fetch/axios/XHR) ───────────────────────────
+    if js_text:
+        js_eps = _scan_js_endpoints(js_text, url)
+        # Merge: avoid duplicates already captured by network hook
+        live_eps = {c['endpoint'] for c in captured}
+        for je in js_eps:
+            if je['endpoint'] not in live_eps:
+                captured.append(je)
+
+    # Attach raw js_text for gateway detection in _payload_sync
     if captured:
         captured[0]['_js_text'] = js_text
     elif js_text:
@@ -24480,7 +24811,14 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
 
 
 def _payload_sync(url: str, progress_cb=None) -> dict:
-    """Main sync — static + playwright + payment + header detection."""
+    """
+    Improved main sync:
+      • Static HTML form/HTMX/Alpine/Stimulus/pay-link scan
+      • Playwright network intercept + scroll simulate + JS bundle scan
+      • JS-rendered HTML form scan (SPA)
+      • JS endpoint scan (fetch/axios/XHR) — merged, deduplicated
+      • Payment gateway, header probe, token source, captcha
+    """
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
 
     static_html = ''
@@ -24491,27 +24829,55 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     except Exception: pass
 
     static_forms = _extract_forms_static(static_html, url) if static_html else []
-    if progress_cb: progress_cb(f"📋 {len(static_forms)} form(s) — Playwright launching...")
+    if progress_cb:
+        pay_cnt = sum(1 for f in static_forms if f.get('is_payment'))
+        progress_cb(f"📋 {len(static_forms)} form(s) ({pay_cnt} pay-related) — Playwright launching...")
 
     pw_requests = _extract_requests_playwright(url, progress_cb)
 
+    # ── JS-rendered HTML form scan (SPA: React/Vue/Angular) ──────────
     js_html  = fetch_with_playwright(url) or ''
     js_forms = []
     if js_html and js_html != static_html:
-        js_forms = _extract_forms_static(js_html, url)
-        existing = {(f['endpoint'],f['method']) for f in static_forms}
-        js_forms = [f for f in js_forms if (f['endpoint'],f['method']) not in existing]
-        for f in js_forms: f['source'] = 'js_render'
+        if progress_cb: progress_cb("🔧 Scanning JS-rendered forms (SPA)...")
+        js_forms_raw = _extract_forms_static(js_html, url)
+        existing = {(f['endpoint'], f['method']) for f in static_forms}
+        js_forms = [f for f in js_forms_raw
+                    if (f['endpoint'], f['method']) not in existing]
+        for f in js_forms:
+            f['source'] = f.get('source', 'static') + '+js_render'
 
-    # Extract js_text & clean internal entries
-    js_text = ''
+    # ── Extract js_text & clean internal sentinel entries ─────────────
+    js_text       = ''
     real_requests = []
     for r in pw_requests:
         if r.pop('_js_only', False):
-            js_text = r.pop('_js_text','')
+            js_text += r.pop('_js_text', '')
         else:
-            js_text += r.pop('_js_text','')
+            js_text += r.pop('_js_text', '')
             real_requests.append(r)
+
+    # ── Deduplicate across all sources ────────────────────────────────
+    all_forms = static_forms + js_forms
+    seen_key  = set()
+    dedup_forms = []
+    for f in all_forms:
+        key = (f.get('endpoint',''), f.get('method',''), f.get('source',''))
+        if key not in seen_key:
+            seen_key.add(key)
+            dedup_forms.append(f)
+
+    seen_req = set()
+    dedup_req = []
+    for r in real_requests:
+        key = (r.get('endpoint',''), r.get('method',''))
+        if key not in seen_req:
+            seen_req.add(key)
+            dedup_req.append(r)
+
+    if progress_cb:
+        js_ep_cnt = sum(1 for r in dedup_req if r.get('source') == 'js_scan')
+        progress_cb(f"📦 JS scan: {js_ep_cnt} endpoint(s) from bundles")
 
     gateways = _detect_payment_gateway(static_html + js_html, js_text)
     if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
@@ -24534,8 +24900,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     return {
         'url':           url,
         'base_url':      base_url,
-        'forms':         static_forms + js_forms,
-        'requests':      real_requests,
+        'forms':         dedup_forms,
+        'requests':      dedup_req,
         'gateways':      gateways,
         'headers':       headers_result,
         'token_sources': token_sources,
@@ -24612,7 +24978,19 @@ def _format_payload_report(data: dict) -> str:
         ct     = entry.get('enctype', '')
         fields = entry.get('fields', [])
         is_pay = entry.get('is_payment', False)
-        src    = '🌐 XHR' if entry.get('source') == 'playwright' else '📋 Form'
+        src_raw = entry.get('source', '')
+        src = {
+            'playwright':        '🌐 XHR/Fetch',
+            'playwright_get':    '🔗 GET (pay)',
+            'js_scan':           '📦 JS Bundle',
+            'htmx':              '⚡ HTMX',
+            'alpine':            '🏔️ Alpine.js',
+            'stimulus':          '🎯 Stimulus',
+            'pay_link':          '💸 Pay Link',
+            'button_formaction': '🔘 Button',
+            'static':            '📋 Form',
+            'js_render':         '⚛️ SPA Form',
+        }.get(src_raw.split('+')[0], f'📋 {src_raw}' if src_raw else '📋 Form')
         dup_n  = seen_sigs.get(_fields_sig(entry), 1)
 
         # Shorten content-type label
@@ -24758,76 +25136,181 @@ def _format_payload_report(data: dict) -> str:
 
 
 def _build_json_export(data: dict) -> str:
-    """Full JSON export — clean version."""
-    clean = {
-        'url':      data.get('url'),
-        'base_url': data.get('base_url', ''),
-        'recaptcha': data.get('recaptcha'),
-        'gateways': data.get('gateways',[]),
-        'forms':    [],
-        'requests': [],
+    """
+    Clean JSON export — grouped fields, noise removed, summary on top.
+
+    Field grouping:
+      card_fields    — card number, cvv, expiry, cardholder
+      payment_fields — amount, currency, order id, billing address
+      token_fields   — csrf, nonce, session, captcha, dynamic tokens
+      user_fields    — name, email, phone, address (user-typed)
+      hidden_fields  — static hidden inputs (no sensitive value)
+
+    Noise removed:
+      • is_card: false / card_type: null  → omitted
+      • required: false                   → omitted
+      • field_label: "User Input"         → omitted (not informative)
+      • value: ""                         → omitted
+    """
+
+    def _clean_field(f: dict) -> dict:
+        """Strip noise from a single field dict."""
+        out = {'name': f['name']}
+        # type — only if not plain "text" or "hidden" (already obvious from group)
+        if f.get('type') not in ('text', 'hidden', ''):
+            out['type'] = f['type']
+        # value — only if non-empty
+        v = f.get('value', '')
+        if v:
+            out['value'] = v
+        # required — only if True
+        if f.get('required'):
+            out['required'] = True
+        # field_label — skip generic "User Input" / "Static Param"
+        lbl = f.get('field_label', '')
+        if lbl and lbl not in ('User Input', 'Static Param', ''):
+            out['label'] = lbl
+        # card_type — only if meaningful
+        ct = f.get('card_type')
+        if ct:
+            out['card_type'] = ct
+        return out
+
+    def _group_fields(fields: list) -> dict:
+        """Split fields list into semantic groups."""
+        card_types   = {'Card Number', 'CVV/CVC', 'Expiry', 'Cardholder Name'}
+        pay_types    = {'Amount', 'Currency', 'Order/Txn ID', 'Billing Address'}
+
+        groups: dict = {
+            'card':    [],
+            'payment': [],
+            'token':   [],
+            'user':    [],
+            'hidden':  [],
+        }
+        for f in fields:
+            ct  = f.get('card_type')
+            dyn = f.get('is_dynamic', False)
+            ftype = f.get('type', 'text')
+            lbl   = f.get('field_label', '')
+
+            cf = _clean_field(f)
+            if ct in card_types:
+                groups['card'].append(cf)
+            elif ct in pay_types:
+                groups['payment'].append(cf)
+            elif dyn or lbl in ('Dynamic Token', 'Captcha', 'CSRF Token',
+                                 'Nonce', 'Session Token'):
+                groups['token'].append(cf)
+            elif ftype == 'hidden':
+                groups['hidden'].append(cf)
+            else:
+                groups['user'].append(cf)
+
+        # Drop empty groups
+        return {k: v for k, v in groups.items() if v}
+
+    def _clean_entry(entry: dict) -> dict:
+        """Build a clean endpoint entry."""
+        out: dict = {}
+        src = entry.get('source', '')
+        if src:
+            out['source'] = src
+        out['endpoint']   = entry.get('endpoint', '')
+        out['method']     = entry.get('method', 'POST')
+        enc = (entry.get('enctype') or '').replace('application/', '').strip()
+        if enc and enc not in ('', 'unknown'):
+            out['format'] = enc
+        if entry.get('is_payment'):
+            out['is_payment'] = True
+        raw = entry.get('raw_body', '')
+        if raw:
+            out['raw_body'] = raw[:200]
+        fields = entry.get('fields', [])
+        if fields:
+            out['fields'] = _group_fields(fields)
+        # Extra framework-specific notes
+        for k in ('htmx_trigger', 'alpine_handler', 'notes'):
+            if entry.get(k):
+                out[k] = entry[k]
+        return out
+
+    # ── Build top-level summary ─────────────────────────────────────
+    all_entries = data.get('forms', []) + data.get('requests', [])
+    total_card  = sum(1 for e in all_entries
+                      for f in e.get('fields', [])
+                      if f.get('card_type') in {'Card Number','CVV/CVC','Expiry'})
+    total_token = sum(1 for e in all_entries
+                      for f in e.get('fields', [])
+                      if f.get('is_dynamic'))
+    required_hdrs = [h['header'] for h in data.get('headers', [])
+                     if h.get('status') == 'required']
+
+    rc = data.get('recaptcha')
+    gw = data.get('gateways', [])
+
+    summary: dict = {
+        'url':            data.get('url', ''),
+        'endpoints_found': len(all_entries),
+        'card_fields':    total_card,
+        'token_fields':   total_token,
+        'gateways':       [g['name'] for g in gw] if gw else [],
+        'required_headers': required_hdrs,
     }
-    for entry in data.get('forms',[]):
-        clean['forms'].append({
-            'source':     entry.get('source'),
-            'endpoint':   entry.get('endpoint'),
-            'method':     entry.get('method'),
-            'enctype':    entry.get('enctype'),
-            'is_payment': entry.get('is_payment', False),
-            'fields': [{
-                'name':        f['name'],
-                'type':        f['type'],
-                'value':       f['value'],
-                'required':    f['required'],
-                'field_label': f['field_label'],
-                'is_dynamic':  f['is_dynamic'],
-                'is_card':     f.get('is_card', False),
-                'card_type':   f.get('card_type'),
-            } for f in entry.get('fields', [])]
-        })
-    for entry in data.get('requests',[]):
-        clean['requests'].append({
-            'endpoint':   entry.get('endpoint'),
-            'method':     entry.get('method'),
-            'enctype':    entry.get('enctype'),
-            'is_payment': entry.get('is_payment', False),
-            'raw_body':   entry.get('raw_body',''),
-            'fields': [{
-                'name':        f['name'],
-                'type':        f['type'],
-                'value':       f['value'],
-                'required':    f['required'],
-                'field_label': f['field_label'],
-                'is_dynamic':  f['is_dynamic'],
-                'is_card':     f.get('is_card', False),
-                'card_type':   f.get('card_type'),
-            } for f in entry.get('fields', [])]
-        })
-    # Headers
-    clean['headers'] = [
-        {
-            'header':       h['header'],
-            'description':  h['description'],
-            'status':       h['status_key'],
-            'status_label': h['status_label'],
-            'reason':       h['reason'],
-            'base_status':  h['base_status'],
-            'probe_status': h['probe_status'],
-            'notes':        h['notes'],
+    if rc:
+        summary['captcha'] = {
+            'type':     rc.get('captcha_type'),
+            'site_key': rc.get('site_key'),
+            'page_url': rc.get('page_url'),
         }
-        for h in data.get('headers', [])
-    ]
-    # Token Sources
-    clean['token_sources'] = [
-        {
-            'name':          t['name'],
-            'value_preview': t.get('value_preview', ''),
-            'source_type':   t['source_type'],
-            'location':      t['location'],
-            'label':         t['label'],
-        }
-        for t in data.get('token_sources', [])
-    ]
+
+    # ── Assemble clean output ───────────────────────────────────────
+    clean: dict = {'summary': summary}
+
+    # Endpoints (forms + requests merged, cleaned)
+    endpoints = [_clean_entry(e) for e in all_entries]
+    if endpoints:
+        clean['endpoints'] = endpoints
+
+    # Headers — only non-optional ones get full detail; optional → compact
+    hdr_required = []
+    hdr_optional = []
+    for h in data.get('headers', []):
+        status = h.get('status', h.get('status_key', ''))
+        if status == 'required':
+            hdr_required.append({
+                'header': h['header'],
+                'status': '🔴 Required',
+                'notes':  h.get('notes', ''),
+            })
+        elif status == 'important':
+            hdr_required.append({
+                'header': h['header'],
+                'status': '🟡 Important',
+                'notes':  h.get('notes', ''),
+            })
+        else:
+            hdr_optional.append(h['header'])
+
+    clean['headers'] = {}
+    if hdr_required:
+        clean['headers']['important'] = hdr_required
+    if hdr_optional:
+        clean['headers']['optional'] = hdr_optional
+
+    # Token sources — compact
+    tok_src = data.get('token_sources', [])
+    if tok_src:
+        clean['token_sources'] = [
+            {
+                'name':     t['name'],
+                'value':    t.get('value_preview', ''),
+                'location': t.get('location', ''),
+            }
+            for t in tok_src
+            if t.get('name')
+        ]
+
     return json.dumps(clean, indent=2, ensure_ascii=False)
 
 
