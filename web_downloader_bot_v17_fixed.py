@@ -24174,6 +24174,189 @@ def _probe_header_requirement(url: str, progress_cb=None) -> list:
 
     return results
 
+# ── Token Source location patterns ────────────────────────────
+_TOKEN_SOURCE_RULES = [
+    # (token_name_pattern, source_type, description, icon)
+    # Hidden input
+    (re.compile(r'csrf|_token|authenticity_token|__requestverification|xsrf', re.I),
+     'hidden_input', 'Hidden <input type="hidden"> in form', '🔒'),
+    (re.compile(r'nonce|_nonce|wp_nonce', re.I),
+     'hidden_input', 'Hidden <input> / WordPress nonce field', '🔒'),
+    (re.compile(r'sess|session|phpsessid', re.I),
+     'cookie', 'Server-set Cookie (not in HTML source)', '🍪'),
+    (re.compile(r'otp|pin|verification_?code', re.I),
+     'server_response', 'Server sends via SMS/Email — not in HTML', '📟'),
+    (re.compile(r'payment.?token|pm_|pay.?token|stripe|braintree', re.I),
+     'js_gateway', 'JS gateway SDK generates at runtime', '💳'),
+]
+
+_JS_VAR_PATTERNS = [
+    # window.xxx = "..."  /  var xxx = "..."  /  const xxx = "..."
+    re.compile(r'(?:window\.|var\s+|const\s+|let\s+)(\w*(?:token|nonce|csrf|xsrf|secret|key)\w*)\s*[=:]\s*["\']([^"\']{8,})["\']', re.I),
+    # PHP/template inline: "csrfToken":"abc..."
+    re.compile(r'["\'](\w*(?:token|nonce|csrf|xsrf)\w*)["\']\s*:\s*["\']([^"\']{8,})["\']', re.I),
+]
+
+_META_PATTERN = re.compile(
+    r'<meta[^>]+name=["\'](\w*(?:token|nonce|csrf|xsrf)\w*)["\'][^>]+content=["\']([^"\']{4,})["\']',
+    re.I
+)
+
+_HIDDEN_INPUT_PATTERN = re.compile(
+    r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+    re.I
+)
+
+
+_RECAPTCHA_SITEKEY_PATTERNS = [
+    # data-sitekey="xxx"
+    re.compile(r'data-sitekey=["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+    # grecaptcha.render(..., {sitekey: "xxx"})
+    re.compile(r'sitekey["\']?\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+    # grecaptcha.execute('xxx')
+    re.compile(r'grecaptcha\.execute\(["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+    # hcaptcha data-sitekey
+    re.compile(r'h-captcha[^>]*data-sitekey=["\']([A-Za-z0-9_\-\-]{20,})["\']', re.I),
+    # turnstile (Cloudflare)
+    re.compile(r'turnstile[^>]*data-sitekey=["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+    # JS var: recaptchaSiteKey = "..."
+    re.compile(r'(?:recaptcha|captcha|siteKey|site_key)\w*\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+]
+
+def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | None:
+    """
+    HTML + JS မှ reCAPTCHA / hCaptcha / Turnstile site key ဖမ်းသည်။
+    Returns {site_key, page_url, base_url, captcha_type} or None
+    """
+    combined = html + js_text
+
+    # Detect captcha type
+    captcha_type = 'reCAPTCHA v2'
+    if re.search(r'grecaptcha\.execute', combined, re.I):
+        captcha_type = 'reCAPTCHA v3'
+    elif re.search(r'h-captcha|hcaptcha', combined, re.I):
+        captcha_type = 'hCaptcha'
+    elif re.search(r'cf-turnstile|turnstile', combined, re.I):
+        captcha_type = 'Cloudflare Turnstile'
+
+    site_key = None
+    for pat in _RECAPTCHA_SITEKEY_PATTERNS:
+        m = pat.search(combined)
+        if m:
+            site_key = m.group(1)
+            break
+
+    if not site_key:
+        return None
+
+    parsed   = urlparse(page_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    return {
+        'site_key':    site_key,
+        'page_url':    page_url,
+        'base_url':    base_url,
+        'captcha_type': captcha_type,
+    }
+
+
+
+    """
+    HTML + JS ထဲမှ dynamic token တွေ ဘယ်နေရာမှာ define လုပ်သည် စစ်သည်။
+    Returns list of dicts: {name, value_preview, source_type, location, icon}
+    """
+    results = []
+    seen = set()
+
+    # 1. Hidden input fields
+    for m in _HIDDEN_INPUT_PATTERN.finditer(html):
+        name  = m.group(1)
+        value = m.group(2)
+        label, icon, is_dyn, _ = _classify_field(name, value)
+        if not is_dyn:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            'name':          name,
+            'value_preview': value[:30] + ('…' if len(value) > 30 else ''),
+            'source_type':   'hidden_input',
+            'location':      'HTML → <input type="hidden">',
+            'icon':          '🔒',
+            'label':         label,
+        })
+
+    # 2. Meta tag tokens
+    for m in _META_PATTERN.finditer(html):
+        name  = m.group(1)
+        value = m.group(2)
+        key   = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            'name':          name,
+            'value_preview': value[:30] + ('…' if len(value) > 30 else ''),
+            'source_type':   'meta_tag',
+            'location':      'HTML → <meta name="…" content="…">',
+            'icon':          '🏷️',
+            'label':         'CSRF/Nonce Token',
+        })
+
+    # 3. JS variable tokens (inline scripts + external JS)
+    combined_js = html + js_text
+    for pat in _JS_VAR_PATTERNS:
+        for m in pat.finditer(combined_js):
+            name  = m.group(1)
+            value = m.group(2)
+            key   = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            # Determine if it's inline script or external JS
+            # Check if match position is inside a <script> tag in html
+            pos   = m.start()
+            loc   = ('HTML → inline <script> variable'
+                     if pos < len(html) else 'External JS file variable')
+            results.append({
+                'name':          name,
+                'value_preview': value[:30] + ('…' if len(value) > 30 else ''),
+                'source_type':   'js_variable',
+                'location':      loc,
+                'icon':          '📜',
+                'label':         'Dynamic JS Token',
+            })
+
+    # 4. Cookie-based tokens (infer from field names)
+    all_html = html
+    for rule_pat, src_type, desc, icon in _TOKEN_SOURCE_RULES:
+        if src_type != 'cookie':
+            continue
+        # Look for cookie reads in JS: document.cookie, getCookie(
+        if re.search(r'document\.cookie|getCookie\(|Cookies\.get\(', combined_js, re.I):
+            # find field names that match session pattern
+            for m in re.finditer(
+                r'["\'](\w*(?:sess|session|phpsessid)\w*)["\']', combined_js, re.I
+            ):
+                name = m.group(1)
+                key  = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({
+                    'name':          name,
+                    'value_preview': '(runtime value)',
+                    'source_type':   'cookie',
+                    'location':      'Browser Cookie → JS reads via document.cookie',
+                    'icon':          '🍪',
+                    'label':         'Session Cookie',
+                })
+
+    return results
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + playwright + payment + header detection."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
@@ -24215,12 +24398,26 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🔍 Probing header requirements...")
     headers_result = _probe_header_requirement(url, progress_cb)
 
+    # Phase 6: Token source detection
+    if progress_cb: progress_cb("🔎 Locating token sources...")
+    token_sources = _find_token_sources(static_html + js_html, js_text)
+
+    # Phase 7: reCAPTCHA / hCaptcha / Turnstile info
+    if progress_cb: progress_cb("🤖 Extracting CAPTCHA site key...")
+    recaptcha_info = _extract_recaptcha_info(static_html + js_html, js_text, url)
+
+    parsed   = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
     return {
-        'url':      url,
-        'forms':    static_forms + js_forms,
-        'requests': real_requests,
-        'gateways': gateways,
-        'headers':  headers_result,
+        'url':           url,
+        'base_url':      base_url,
+        'forms':         static_forms + js_forms,
+        'requests':      real_requests,
+        'gateways':      gateways,
+        'headers':       headers_result,
+        'token_sources': token_sources,
+        'recaptcha':     recaptcha_info,
     }
 
 
@@ -24229,114 +24426,212 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def _format_payload_report(data: dict) -> str:
-    url       = data.get('url','')
+    url       = data.get('url', '')
     domain    = urlparse(url).hostname or url
-    forms     = data.get('forms',[])
-    requests_ = data.get('requests',[])
-    gateways  = data.get('gateways',[])
+    forms     = data.get('forms', [])
+    requests_ = data.get('requests', [])
+    gateways  = data.get('gateways', [])
 
     lines = [
         f"🧩 *Payload Structure — `{escape_md(domain)}`*",
-        f"🔗 `{escape_md(url[:80])}`\n",
+        f"🔗 `{escape_md(url[:80])}`",
+        f"🌐 *Base URL:* `{escape_md(data.get('base_url', ''))}`",
     ]
 
-    # ── Payment Gateway Section ──────────────────────────────
-    if gateways:
-        lines.append("━━━ 💳 Payment Gateways ━━━")
-        for gw in gateways:
-            lines.append(f"{gw['icon']} *{escape_md(gw['name'])}* (conf: {'⭐'*gw['confidence']})")
-            lines.append(f"   {escape_md(gw['tokenization'])}")
-            if gw.get('raw_post_risk'):
-                lines.append("   🚨 *Raw POST risk* — card data may be sent unmasked")
+    # ── reCAPTCHA / hCaptcha info ────────────────────────────
+    rc = data.get('recaptcha')
+    if rc:
         lines.append("")
+        lines.append(f"🤖 *{escape_md(rc['captcha_type'])} Detected*")
+        lines.append(f"  `RECAPTCHA_SITE_KEY` = `{escape_md(rc['site_key'])}`")
+        lines.append(f"  `RECAPTCHA_PAGE_URL` = `{escape_md(rc['page_url'])}`")
 
-    total    = len(forms) + len(requests_)
-    pay_cnt  = sum(1 for e in forms + requests_ if e.get('is_payment'))
+    all_entries = forms + requests_
+    total   = len(all_entries)
+    pay_cnt = sum(1 for e in all_entries if e.get('is_payment'))
 
     if total == 0:
-        lines.append("ℹ️ No forms or intercepted requests found.")
+        lines.append("\nℹ️ No forms or intercepted requests found.")
         return '\n'.join(lines)
 
-    lines.append(
-        f"📊 `{len(forms)}` form(s) + `{len(requests_)}` XHR — "
-        f"💳 `{pay_cnt}` payment endpoint(s)\n")
+    # ── Payment Gateway ──────────────────────────────────────
+    if gateways:
+        lines.append("")
+        for gw in gateways:
+            lines.append(f"💳 *Gateway:* {gw['icon']} {escape_md(gw['name'])}")
+            lines.append(f"🔒 {escape_md(gw['tokenization'])}")
+            if gw.get('raw_post_risk'):
+                lines.append("🚨 *Raw POST* — card data may reach server unmasked")
 
-    for f in forms:    f['_label'] = '📋 Form'
-    for r in requests_: r['_label'] = '🌐 XHR/Fetch'
+    # ── Deduplicate identical forms ──────────────────────────
+    def _fields_sig(entry):
+        return tuple(sorted(f['name'] for f in entry.get('fields', [])))
 
-    # Payment endpoints first
-    all_entries = forms + requests_
-    ordered = ([e for e in all_entries if e.get('is_payment')] +
-               [e for e in all_entries if not e.get('is_payment')])
+    seen_sigs = {}
+    unique_entries = []
+    for entry in all_entries:
+        sig = _fields_sig(entry)
+        if sig not in seen_sigs:
+            seen_sigs[sig] = 1
+            unique_entries.append(entry)
+        else:
+            seen_sigs[sig] += 1
 
-    for entry in ordered[:8]:
-        src    = entry.get('_label','📋')
-        ep     = entry.get('endpoint','')
-        method = entry.get('method','POST')
-        ct     = entry.get('enctype','')
-        fields = entry.get('fields',[])
+    # Payment first
+    ordered = (
+        [e for e in unique_entries if e.get('is_payment')] +
+        [e for e in unique_entries if not e.get('is_payment')]
+    )
+
+    # ── Per-entry block ──────────────────────────────────────
+    for idx, entry in enumerate(ordered[:6], 1):
+        ep     = entry.get('endpoint', '')
+        method = entry.get('method', 'POST')
+        ct     = entry.get('enctype', '')
+        fields = entry.get('fields', [])
         is_pay = entry.get('is_payment', False)
+        src    = '🌐 XHR' if entry.get('source') == 'playwright' else '📋 Form'
+        dup_n  = seen_sigs.get(_fields_sig(entry), 1)
+
+        # Shorten content-type label
+        ct_short = (ct.replace('application/', '')
+                      .replace('x-www-form-urlencoded', 'urlencoded')
+                      .replace('; charset=utf-8', '')
+                      .strip()[:40])
 
         pay_badge = " 💳" if is_pay else ""
-        lines.append(f"{'─'*32}")
-        lines.append(f"{src}{pay_badge} `{escape_md(method)}` → `{escape_md(ep[:68])}`")
-        lines.append(f"📦 `{escape_md(ct[:50])}`")
+        dup_note  = f" _(×{dup_n} identical)_" if dup_n > 1 else ""
+
+        lines.append(f"\n{'━'*34}")
+        lines.append(f"{src}{pay_badge} *#{idx}*{dup_note}")
+        lines.append(f"📡 *Endpoint* : `{escape_md(ep[:70])}`")
+        lines.append(f"🔁 *Method*   : `{escape_md(method)}`")
+        lines.append(f"📦 *Format*   : `{escape_md(ct_short)}`")
 
         if not fields:
-            rb = entry.get('raw_body','')
-            lines.append(f"📝 `{escape_md(rb[:100])}`" if rb else "⚠️ No extractable fields")
+            rb = entry.get('raw_body', '')
+            lines.append(f"📝 `{escape_md(rb[:120])}`" if rb else "⚠️ No extractable fields")
             continue
 
-        card_f = [f for f in fields if f.get('is_card')]
-        dyn_f  = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
-        stat_f = [f for f in fields if not f.get('is_dynamic') and not f.get('is_card')]
+        # ── Classify fields by purpose ───────────────────────
+        # Strict card: only actual card number / cvv / expiry
+        card_strict = [f for f in fields if f.get('card_type') in
+                       ('Card Number', 'CVV/CVC', 'Expiry', 'Cardholder Name')]
+        # Payment info: amount, currency, order id, billing addr
+        pay_info    = [f for f in fields if f.get('card_type') in
+                       ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')]
+        # User input: text/email/tel fields, not card, not hidden
+        user_f      = [f for f in fields
+                       if not f.get('is_card') and not f.get('is_dynamic')
+                       and f.get('type') not in ('hidden', 'submit', 'button', 'reset')
+                       and f not in pay_info]
+        # Dynamic: csrf, nonce, session, captcha, tokens
+        dyn_f       = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
+        # Hidden/static
+        hidden_f    = [f for f in fields
+                       if not f.get('is_card') and not f.get('is_dynamic')
+                       and f.get('type') in ('hidden', 'submit', 'button')
+                       and f not in pay_info and f not in user_f]
 
-        if card_f:
-            lines.append(f"\n💳 *Card Fields* ({len(card_f)}):")
-            for f in card_f:
-                req = "\\*" if f.get('required') else ""
-                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req} [{escape_md(f['field_label'])}]")
+        lines.append("")
+
+        # Required fields block (what user must fill)
+        required_shown = []
+        if card_strict:
+            lines.append(f"💳 *Card Fields* ({len(card_strict)}):")
+            for f in card_strict:
+                req_mark = "\\*" if f.get('required') else " "
+                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req_mark} → {escape_md(f['field_label'])}")
+            required_shown.extend(card_strict)
+
+        if pay_info:
+            lines.append(f"💰 *Payment Info* ({len(pay_info)}):")
+            for f in pay_info:
+                val_hint = f"`{escape_md(f['value'][:25])}`" if f.get('value') else '_required_'
+                lines.append(f"  {f['icon']} `{escape_md(f['name'])}` → {escape_md(f['field_label'])} {val_hint}")
+
+        if user_f:
+            lines.append(f"✏️ *User Fields* ({len(user_f)}):")
+            for f in user_f[:10]:
+                ftype    = f.get('type', 'text')
+                val_hint = f"`{escape_md(f['value'][:25])}`" if f.get('value') else f"_{escape_md(ftype)}_"
+                req_mark = "\\*" if f.get('required') else " "
+                lines.append(f"  ✏️ `{escape_md(f['name'])}`{req_mark} → {val_hint}")
+            if len(user_f) > 10:
+                lines.append(f"  _... +{len(user_f)-10} more_")
 
         if dyn_f:
-            lines.append(f"\n🔄 *Dynamic Fields* ({len(dyn_f)}):")
-            for f in dyn_f[:8]:
-                req = "\\*" if f.get('required') else ""
-                val = f"`{escape_md(f['value'][:30])}`" if f['value'] else "_auto_"
-                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req} [{escape_md(f['field_label'])}] = {val}")
+            lines.append(f"🔄 *Auto Fields* ({len(dyn_f)}):")
+            for f in dyn_f[:6]:
+                lines.append(f"  {f['icon']} `{escape_md(f['name'])}` → {escape_md(f['field_label'])}")
 
-        if stat_f:
-            lines.append(f"\n📌 *Static Fields* ({len(stat_f)}):")
-            for f in stat_f[:8]:
-                req = "\\*" if f.get('required') else ""
-                val = f"`{escape_md(f['value'][:30])}`" if f['value'] else "_empty_"
-                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req} [{escape_md(f['field_label'])}] = {val}")
+        if hidden_f:
+            lines.append(f"📌 *Hidden* ({len(hidden_f)}):")
+            for f in hidden_f[:5]:
+                val = f"`{escape_md(f['value'][:25])}`" if f.get('value') else '_empty_'
+                lines.append(f"  `{escape_md(f['name'])}` = {val}")
+            if len(hidden_f) > 5:
+                lines.append(f"  _... +{len(hidden_f)-5} more (see JSON)_")
 
-    if total > 8:
-        lines.append(f"\n_... +{total-8} more — see JSON file_")
+    skipped = len(ordered) - min(len(ordered), 6)
+    if skipped > 0:
+        lines.append(f"\n_... +{skipped} more endpoint(s) — see JSON file_")
 
-    # ── Header Requirements Section ──────────────────────────
+    # ── Header Requirements (compact) ───────────────────────
     headers_result = data.get('headers', [])
     if headers_result:
-        lines.append(f"\n{'━'*32}")
-        lines.append("🔍 *Header Requirements*")
-        req  = [h for h in headers_result if h['status_key'] == 'required']
-        imp  = [h for h in headers_result if h['status_key'] == 'important']
-        opt  = [h for h in headers_result if h['status_key'] == 'optional']
-        unk  = [h for h in headers_result if h['status_key'] == 'not_checked']
+        req_h = [h for h in headers_result if h['status_key'] == 'required']
+        imp_h = [h for h in headers_result if h['status_key'] == 'important']
+        opt_h = [h for h in headers_result if h['status_key'] == 'optional']
 
-        for group, label in [(req, "🔴 Required"), (imp, "🟡 Important"),
-                              (opt, "🟢 Optional"), (unk, "⚪ Unknown")]:
-            if not group: continue
-            lines.append(f"\n*{label}* ({len(group)}):")
-            for h in group:
-                lines.append(
-                    f"  {h['icon']} `{escape_md(h['header'])}` — "
-                    f"_{escape_md(h['notes'])}_"
-                )
+        lines.append(f"\n{'━'*34}")
+        lines.append("🔍 *Required Headers*")
+        if req_h:
+            for h in req_h:
+                lines.append(f"  🔴 `{escape_md(h['header'])}` — _{escape_md(h['notes'])}_")
+        if imp_h:
+            for h in imp_h:
+                lines.append(f"  🟡 `{escape_md(h['header'])}` — _{escape_md(h['notes'])}_")
+        if not req_h and not imp_h:
+            lines.append("  🟢 No required headers detected")
+        if opt_h:
+            opt_names = ', '.join(f"`{escape_md(h['header'])}`" for h in opt_h)
+            lines.append(f"  🟢 Optional: {opt_names}")
 
-    lines.append(f"\n{'─'*32}")
-    lines.append("🔑 Legend: 💳 Card  🔄 Dynamic  📌 Static  ✏️ User  🔑 Session  ⏱️ Time  📟 OTP  🤖 Captcha")
-    lines.append("⚠️ _For authorized security testing only._")
+    # ── Token Source Section ─────────────────────────────────
+    token_sources = data.get('token_sources', [])
+    if token_sources:
+        lines.append(f"\n{'━'*34}")
+        lines.append("🔎 *Token Sources*")
+        lines.append("_Where dynamic tokens live in page source:_\n")
+
+        # Group by source_type
+        groups: dict = {}
+        for t in token_sources:
+            groups.setdefault(t['source_type'], []).append(t)
+
+        src_order = ['hidden_input', 'meta_tag', 'js_variable', 'cookie', 'server_response']
+        src_icons = {
+            'hidden_input':    '🔒',
+            'meta_tag':        '🏷️',
+            'js_variable':     '📜',
+            'cookie':          '🍪',
+            'server_response': '📟',
+        }
+        for st in src_order:
+            if st not in groups:
+                continue
+            grp = groups[st]
+            loc = grp[0]['location']
+            lines.append(f"{src_icons.get(st,'🔄')} *{escape_md(loc)}*")
+            for t in grp:
+                val_str = ''
+                if t.get('value_preview') and t['value_preview'] != '(runtime value)':
+                    val_str = f" = `{escape_md(t['value_preview'])}`"
+                lines.append(f"  `{escape_md(t['name'])}`{val_str}")
+                lines.append(f"  _{escape_md(t['label'])}_")
+
+    lines.append(f"\n⚠️ _Authorized testing only._")
     return '\n'.join(lines)
 
 
@@ -24344,6 +24639,8 @@ def _build_json_export(data: dict) -> str:
     """Full JSON export — clean version."""
     clean = {
         'url':      data.get('url'),
+        'base_url': data.get('base_url', ''),
+        'recaptcha': data.get('recaptcha'),
         'gateways': data.get('gateways',[]),
         'forms':    [],
         'requests': [],
@@ -24397,6 +24694,17 @@ def _build_json_export(data: dict) -> str:
             'notes':        h['notes'],
         }
         for h in data.get('headers', [])
+    ]
+    # Token Sources
+    clean['token_sources'] = [
+        {
+            'name':          t['name'],
+            'value_preview': t.get('value_preview', ''),
+            'source_type':   t['source_type'],
+            'location':      t['location'],
+            'label':         t['label'],
+        }
+        for t in data.get('token_sources', [])
     ]
     return json.dumps(clean, indent=2, ensure_ascii=False)
 
@@ -24612,6 +24920,437 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.unlink(tmp_path)
     except Exception as e:
         logger.warning(f"payload JSON export error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# 🔴 /payloadlive — Realtime Network Request Stream
+# ══════════════════════════════════════════════════════════════
+
+# Known tokenization endpoints — request ဒီ URLs တွေ သွားရင် tokenize လုပ်တယ်
+_TOKENIZATION_ENDPOINTS = [
+    (re.compile(r'api\.stripe\.com', re.I),                    "Stripe",      "💳"),
+    (re.compile(r'payments\.braintree-api\.com|braintreepayments', re.I), "Braintree", "🌿"),
+    (re.compile(r'api\.paypal\.com|paypalobjects', re.I),      "PayPal",      "🅿️"),
+    (re.compile(r'accept\.authorize\.net', re.I),              "Authorize.Net","🏦"),
+    (re.compile(r'checkout\.adyen\.com|adyen\.com/v\d', re.I), "Adyen",       "🔷"),
+    (re.compile(r'api\.squareup\.com|squareup\.com/v\d', re.I),"Square",      "⬛"),
+    (re.compile(r'api\.razorpay\.com', re.I),                  "Razorpay",    "🇮🇳"),
+    (re.compile(r'api\.klarna\.com|klarna\.com/v\d', re.I),    "Klarna",      "🟢"),
+    (re.compile(r'api\.mollie\.com', re.I),                    "Mollie",      "🟡"),
+    (re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "Shopify", "🛍️"),
+    (re.compile(r'js\.stripe\.com/v\d', re.I),                 "Stripe JS",   "💳"),
+    (re.compile(r'token|tokenize|createToken|paymentMethod', re.I), "Token Endpoint", "🔐"),
+]
+
+def _detect_tokenization_url(url: str) -> tuple | None:
+    """Request URL ကို tokenization endpoint ဆိုး စစ်သည်။ Returns (name, icon) or None."""
+    for pattern, name, icon in _TOKENIZATION_ENDPOINTS:
+        if pattern.search(url):
+            return name, icon
+    return None
+
+
+def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
+                        fields: list, tokenization: tuple | None,
+                        raw_body: str = '') -> str:
+    """Single intercepted request ကို Telegram message format ထုတ်သည်။"""
+    ep_short = endpoint[:70]
+    ct_short = (ct.replace('application/', '')
+                  .replace('x-www-form-urlencoded', 'urlencoded')
+                  .replace('; charset=utf-8', '').strip()[:35])
+
+    lines = [f"{'─'*34}"]
+
+    # Tokenization badge
+    if tokenization:
+        tok_name, tok_icon = tokenization
+        lines.append(f"🔐 *Tokenization → {tok_icon} {escape_md(tok_name)}*")
+
+    lines.append(f"📡 *#{idx}* `{escape_md(method)}` → `{escape_md(ep_short)}`")
+    lines.append(f"📦 `{escape_md(ct_short)}`")
+
+    if not fields:
+        if raw_body:
+            lines.append(f"📝 `{escape_md(raw_body[:120])}`")
+        else:
+            lines.append("⚠️ No parseable fields")
+        return '\n'.join(lines)
+
+    # Classify fields
+    card_f   = [f for f in fields if f.get('card_type') in
+                ('Card Number', 'CVV/CVC', 'Expiry', 'Cardholder Name')]
+    pay_f    = [f for f in fields if f.get('card_type') in
+                ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')]
+    user_f   = [f for f in fields
+                if not f.get('is_card') and not f.get('is_dynamic')
+                and f.get('type') not in ('hidden', 'submit', 'button', 'reset')
+                and f not in pay_f]
+    dyn_f    = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
+    hidden_f = [f for f in fields
+                if not f.get('is_card') and not f.get('is_dynamic')
+                and f.get('type') in ('hidden', 'submit', 'button')
+                and f not in pay_f]
+
+    if card_f:
+        lines.append(f"\n💳 *Card* ({len(card_f)}):")
+        for f in card_f:
+            val = f"`{escape_md(f['value'][:20])}`" if f.get('value') else '_—_'
+            lines.append(f"  {f['icon']} `{escape_md(f['name'])}` → {escape_md(f['field_label'])} {val}")
+
+    if pay_f:
+        lines.append(f"💰 *Payment Info* ({len(pay_f)}):")
+        for f in pay_f:
+            val = f"`{escape_md(f['value'][:25])}`" if f.get('value') else '_—_'
+            lines.append(f"  {f['icon']} `{escape_md(f['name'])}` = {val}")
+
+    if user_f:
+        lines.append(f"✏️ *User Fields* ({len(user_f)}):")
+        for f in user_f[:8]:
+            val = f"`{escape_md(f['value'][:25])}`" if f.get('value') else f"_{escape_md(f.get('type','text'))}_"
+            lines.append(f"  ✏️ `{escape_md(f['name'])}` = {val}")
+        if len(user_f) > 8:
+            lines.append(f"  _... +{len(user_f)-8} more_")
+
+    if dyn_f:
+        lines.append(f"🔄 *Auto* ({len(dyn_f)}):")
+        for f in dyn_f[:4]:
+            lines.append(f"  {f['icon']} `{escape_md(f['name'])}` → {escape_md(f['field_label'])}")
+
+    if hidden_f:
+        names = ', '.join(f"`{escape_md(f['name'])}`" for f in hidden_f[:5])
+        extra = f" +{len(hidden_f)-5}" if len(hidden_f) > 5 else ""
+        lines.append(f"📌 *Hidden:* {names}{escape_md(extra)}")
+
+    return '\n'.join(lines)
+
+
+def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 180):
+    """
+    Playwright realtime intercept.
+    on_request_cb(entry_text: str) — ဒါကို main thread safe queue ထဲ ထည့်မယ်
+    stop_event: threading.Event — set() ဖြစ်ရင် ရပ်မယ်
+    """
+    if not PLAYWRIGHT_OK:
+        on_request_cb("❌ Playwright မရှိ — `pip install playwright && playwright install chromium`")
+        return
+
+    import threading
+    safe, reason = is_safe_url(url)
+    if not safe:
+        on_request_cb(f"🚫 {reason}")
+        return
+
+    counter    = [0]      # POST request counter
+    seen_keys  = set()    # deduplicate sitekeys already reported
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled", "--disable-gpu"])
+            ctx = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/122.0.0.0 Safari/537.36"),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True)
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page = ctx.new_page()
+
+            # ── Response hook — scan JS files for sitekeys ──────
+            def on_resp(response):
+                if stop_event.is_set():
+                    return
+                resp_url = response.url
+                ct       = response.headers.get('content-type', '')
+                # Only scan JS / HTML responses
+                if not any(x in ct for x in ('javascript', 'html', 'text')):
+                    return
+                try:
+                    body_text = response.text()
+                except Exception:
+                    return
+
+                for pat in _RECAPTCHA_SITEKEY_PATTERNS:
+                    m = pat.search(body_text)
+                    if not m:
+                        continue
+                    key = m.group(1)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    # Detect type
+                    captcha_type = 'reCAPTCHA v2'
+                    if re.search(r'grecaptcha\.execute', body_text, re.I):
+                        captcha_type = 'reCAPTCHA v3'
+                    elif re.search(r'h-captcha|hcaptcha', body_text, re.I):
+                        captcha_type = 'hCaptcha'
+                    elif re.search(r'cf-turnstile|turnstile', body_text, re.I):
+                        captcha_type = 'Cloudflare Turnstile'
+
+                    parsed   = urlparse(url)
+                    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+                    # Source location
+                    if 'javascript' in ct:
+                        src_loc = f"External JS — `{resp_url[:60]}`"
+                    else:
+                        src_loc = "Inline HTML / <script> tag"
+
+                    msg_text = (
+                        f"{'─'*34}\n"
+                        f"🤖 *{escape_md(captcha_type)} — Site Key Found*\n\n"
+                        f"  `RECAPTCHA_SITE_KEY` = `{escape_md(key)}`\n"
+                        f"  `RECAPTCHA_PAGE_URL` = `{escape_md(url)}`\n"
+                        f"  `BASE_URL`           = `{escape_md(base_url)}`\n\n"
+                        f"📍 *Source:* {escape_md(src_loc)}"
+                    )
+                    on_request_cb(msg_text)
+
+            page.on('response', on_resp)
+
+            def on_req(request):
+                if stop_event.is_set():
+                    return
+                if request.method not in ('POST', 'PUT', 'PATCH'):
+                    return
+
+                try:
+                    endpoint = request.url
+                    method   = request.method
+                    ct       = request.headers.get('content-type', '')
+                    body     = request.post_data or ''
+                    fields   = []
+
+                    # Parse fields
+                    if 'json' in ct:
+                        try:
+                            d = json.loads(body)
+                            if isinstance(d, dict):
+                                for k, v in d.items():
+                                    lb, ic, dyn, card = _classify_field(k, str(v))
+                                    fields.append({'name': k, 'type': 'json',
+                                        'value': str(v)[:80], 'required': True,
+                                        'field_label': lb, 'icon': ic,
+                                        'is_dynamic': dyn,
+                                        'is_card': card is not None, 'card_type': card})
+                        except Exception:
+                            pass
+                    elif 'urlencoded' in ct or 'form' in ct:
+                        from urllib.parse import parse_qs
+                        try:
+                            for k, vals in parse_qs(body).items():
+                                v = vals[0] if vals else ''
+                                lb, ic, dyn, card = _classify_field(k, v)
+                                fields.append({'name': k, 'type': 'form',
+                                    'value': v[:80], 'required': True,
+                                    'field_label': lb, 'icon': ic,
+                                    'is_dynamic': dyn,
+                                    'is_card': card is not None, 'card_type': card})
+                        except Exception:
+                            pass
+                    elif 'multipart' in ct:
+                        for m in re.finditer(r'name="([^"]+)"', body):
+                            k = m.group(1)
+                            lb, ic, dyn, card = _classify_field(k, '')
+                            fields.append({'name': k, 'type': 'multipart',
+                                'value': '', 'required': False,
+                                'field_label': lb, 'icon': ic,
+                                'is_dynamic': dyn,
+                                'is_card': card is not None, 'card_type': card})
+
+                    # Tokenization URL check
+                    tokenization = _detect_tokenization_url(endpoint)
+
+                    # Skip if no fields and no body (GET-like noise)
+                    if not fields and not body.strip():
+                        return
+
+                    counter[0] += 1
+                    entry_text = _format_live_entry(
+                        counter[0], endpoint, method, ct,
+                        fields, tokenization, body if not fields else '')
+                    on_request_cb(entry_text)
+
+                except Exception as e:
+                    logger.debug(f"payloadlive on_req error: {e}")
+
+            page.on('request', on_req)
+
+            try:
+                page.goto(url, wait_until="networkidle", timeout=40_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="load", timeout=25_000)
+                except Exception:
+                    pass
+
+            # Keep monitoring until stop or timeout
+            elapsed = 0
+            interval = 0.5
+            while not stop_event.is_set() and elapsed < timeout_sec:
+                import time as _t
+                _t.sleep(interval)
+                elapsed += interval
+
+            browser.close()
+
+    except Exception as e:
+        on_request_cb(f"❌ Playwright error: `{escape_md(str(e))}`")
+
+
+async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payloadlive <url> — Realtime network request stream + tokenization detection"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/payloadlive https://example.com`\n\n"
+            "🔴 *Realtime intercepts:*\n"
+            "  • POST/PUT/PATCH requests ဝင်တိုင်း ချက်ချင်း ပြသည်\n"
+            "  • 💳 Card fields, 💰 Payment info, ✏️ User fields\n"
+            "  • 🔐 Tokenization URL detection\n"
+            "     (Stripe / Braintree / PayPal / Adyen…)\n"
+            "  • 🔄 CSRF / Nonce / Session tokens\n\n"
+            "⏱️ Max 3 minutes — `/stop` နှိပ်ရင် ချက်ချင်း ရပ်သည်\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(
+            f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).hostname or url
+
+    # ── Cancel flag ────────────────────────────────────────────
+    import threading
+    stop_event = threading.Event()
+
+    # Register in _cancel_flags so /stop works
+    _cancel_flags[uid] = asyncio.Event()
+    old_task = _user_tasks.get(uid)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    # ── Async queue for thread-safe Telegram sends ─────────────
+    send_queue: asyncio.Queue = asyncio.Queue()
+
+    def on_request_cb(text: str):
+        """Called from Playwright thread → put into async queue."""
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(send_queue.put_nowait, text)
+        except Exception:
+            pass
+
+    # ── Status message ─────────────────────────────────────────
+    status_msg = await update.effective_message.reply_text(
+        f"🔴 *PayloadLive — `{escape_md(domain)}`*\n\n"
+        f"🌐 Intercepting requests...\n"
+        f"⏱️ Max 3 min — `/stop` နှိပ်ရင် ရပ်မည်\n\n"
+        f"⏳ Waiting for first request...",
+        parse_mode='Markdown'
+    )
+
+    # ── Run Playwright in thread ───────────────────────────────
+    loop    = asyncio.get_event_loop()
+    TIMEOUT = 180  # 3 minutes
+
+    def run_thread():
+        _payloadlive_sync(url, on_request_cb, stop_event, timeout_sec=TIMEOUT)
+        loop.call_soon_threadsafe(send_queue.put_nowait, "__DONE__")
+
+    thread = threading.Thread(target=run_thread, daemon=True)
+    thread.start()
+
+    request_count = 0
+    first_received = False
+
+    async def sender_loop():
+        nonlocal request_count, first_received
+        while True:
+            # Also watch for /stop
+            if _cancel_flags.get(uid) and _cancel_flags[uid].is_set():
+                stop_event.set()
+                break
+
+            try:
+                item = await asyncio.wait_for(send_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            if item == "__DONE__":
+                break
+
+            request_count += 1
+
+            # Edit status on first request
+            if not first_received:
+                first_received = True
+                try:
+                    await status_msg.edit_text(
+                        f"🔴 *PayloadLive — `{escape_md(domain)}`*\n"
+                        f"📡 Streaming... `/stop` နှိပ်ရင် ရပ်မည်",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+            # Send each intercepted request as new message
+            try:
+                await update.effective_message.reply_text(
+                    item, parse_mode='Markdown')
+            except Exception:
+                # Markdown parse error fallback
+                try:
+                    await update.effective_message.reply_text(item)
+                except Exception:
+                    pass
+
+    task = asyncio.create_task(sender_loop())
+    _user_tasks[uid] = task
+
+    try:
+        await asyncio.wait_for(task, timeout=TIMEOUT + 10)
+    except asyncio.TimeoutError:
+        stop_event.set()
+        task.cancel()
+    except asyncio.CancelledError:
+        stop_event.set()
+
+    # ── Final summary ──────────────────────────────────────────
+    stop_reason = "🛑 Stopped" if (_cancel_flags.get(uid) and
+                                    _cancel_flags[uid].is_set()) else "⏱️ Timeout (3 min)"
+    summary = (
+        f"{'─'*34}\n"
+        f"📊 *Summary — `{escape_md(domain)}`*\n"
+        f"📡 Total intercepted: `{request_count}`\n"
+        f"{stop_reason}"
+    )
+    try:
+        await update.effective_message.reply_text(summary, parse_mode='Markdown')
+    except Exception:
+        pass
+
+    _cancel_flags.pop(uid, None)
+    _user_tasks.pop(uid, None)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -30201,6 +30940,7 @@ def main():
     app.add_handler(CommandHandler("payconfig",       cmd_payconfig))
     app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
     app.add_handler(CommandHandler("payload",         cmd_payload))
+    app.add_handler(CommandHandler("payloadlive",    cmd_payloadlive))
     app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
