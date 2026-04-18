@@ -23819,20 +23819,55 @@ _PAYMENT_GATEWAYS = [
 
 # ── Card Field Patterns ────────────────────────────────────────
 _CARD_FIELDS = [
-    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|card$', re.I),
+    # ── Card number variants ───────────────────────────────────
+    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|card$|^number$', re.I),
      "Card Number", "💳", True),
+    # ── CVV ───────────────────────────────────────────────────
     (re.compile(r'cvv|cvc|csc|card.?code|security.?code|cvv2', re.I),
      "CVV/CVC", "🔐", True),
-    (re.compile(r'exp.?date|expiry|exp.?month|exp.?year|card.?exp|mm.?yy|valid.?thru', re.I),
-     "Expiry", "📅", True),
+    # ── Expiry ────────────────────────────────────────────────
+    (re.compile(r'exp.?year|expirationDateYear|card.?year|expyear', re.I),
+     "Expiry Year", "📅", True),
+    (re.compile(r'exp.?date|expiry|exp.?month|expirationDateMonth|card.?exp|mm.?yy|valid.?thru', re.I),
+     "Expiry Month", "📅", True),
+    # ── Cardholder ────────────────────────────────────────────
     (re.compile(r'card.?holder|cardholder|name.?on.?card|billing.?name', re.I),
      "Cardholder Name", "👤", False),
-    (re.compile(r'billing.?zip|billing.?postal|billing.?address|billing.?city', re.I),
+    # ── Banking (ACH) ─────────────────────────────────────────
+    (re.compile(r'routing.?num|routingnumber|aba.?num|transit.?num', re.I),
+     "Routing Number", "🏦", True),
+    (re.compile(r'account.?num|accountnumber|acct.?num|bank.?acct', re.I),
+     "Account Number", "🏦", True),
+    (re.compile(r'account.?type|acct.?type', re.I),
+     "Account Type", "🏦", False),
+    # ── Customer/Merchant ID ──────────────────────────────────
+    (re.compile(r'customer.?id|cust.?id|merchant.?id|client.?id$', re.I),
+     "Customer ID", "🆔", False),
+    # ── Billing address fields ─────────────────────────────────
+    (re.compile(r'billing.?zip|billing.?postal|bill.?zip|bill.?postal', re.I),
+     "Billing Zip", "🏠", False),
+    (re.compile(r'billing.?address|billing.?addr|bill.?addr|bill.?address', re.I),
      "Billing Address", "🏠", False),
+    (re.compile(r'billing.?city|bill.?city', re.I),
+     "Billing City", "🏠", False),
+    (re.compile(r'billing.?state|bill.?state|tempBillState', re.I),
+     "Billing State", "🏠", False),
+    (re.compile(r'billing.?country|bill.?country', re.I),
+     "Billing Country", "🏠", False),
+    (re.compile(r'billing.?province|bill.?province|tempBillProvince', re.I),
+     "Billing Province", "🏠", False),
+    (re.compile(r'bill.?fname|bill.?first|billing.?first', re.I),
+     "Billing First Name", "👤", False),
+    (re.compile(r'bill.?lname|bill.?last|billing.?last', re.I),
+     "Billing Last Name", "👤", False),
+    (re.compile(r'bill.?company|billing.?company', re.I),
+     "Billing Company", "🏢", False),
+    # ── Amount / Currency ─────────────────────────────────────
     (re.compile(r'amount|total|price|subtotal|grand.?total', re.I),
      "Amount", "💰", False),
     (re.compile(r'currency|cur$', re.I),
      "Currency", "💱", False),
+    # ── Order / Transaction ───────────────────────────────────
     (re.compile(r'order.?id|transaction.?id|payment.?id|invoice', re.I),
      "Order/Txn ID", "🧾", True),
 ]
@@ -23880,6 +23915,64 @@ def _classify_field(name: str, value: str) -> tuple:
     if _STATIC_KEYWORDS.search(name):
         return "Static Param", "📌", False, None
     return "User Input", "✏️", False, None
+
+
+def _smart_placeholder(name: str, label: str, ftype: str) -> str:
+    """
+    Field name + label ကနေ meaningful placeholder ထုတ်သည်။
+    'text' ကဲ့သို့ generic fallback မပြ — field purpose ကို ဖော်ပြသည်။
+    """
+    n = name.lower()
+
+    # ── Contact ───────────────────────────────────────────────
+    if re.search(r'fname|first.?name|given.?name|bill.?fname', n):  return '<first_name>'
+    if re.search(r'lname|last.?name|surname|family.?name|bill.?lname', n): return '<last_name>'
+    if re.search(r'full.?name|your.?name|name$', n):                return '<full_name>'
+    if re.search(r'email', n):                                       return '<email@domain.com>'
+    if re.search(r'phone|mobile|tel', n):                            return '<phone_number>'
+    if re.search(r'company|corp|organisation|bill.?company', n):     return '<company_name>'
+
+    # ── Address ───────────────────────────────────────────────
+    if re.search(r'address1|addr1|street', n):                       return '<street_address>'
+    if re.search(r'address2|addr2|apt|suite|unit', n):               return '<apt_suite>'
+    if re.search(r'city', n):                                        return '<city>'
+    if re.search(r'state|province|region', n):                       return '<state_province>'
+    if re.search(r'zip|postal', n):                                  return '<zip_code>'
+    if re.search(r'country', n):                                     return '<country_code>'
+
+    # ── Card & Banking ────────────────────────────────────────
+    if re.search(r'routing', n):                                     return '<routing_number>'
+    if re.search(r'account.?num|acct', n):                           return '<account_number>'
+    if re.search(r'customer.?id|cust.?id', n):                       return '<customer_id>'
+    if re.search(r'^number$|card.?num|cc.?num|pan', n):              return '<card_number>'
+    if re.search(r'cvv|cvc|csc|security.?code', n):                  return '<cvv>'
+    if re.search(r'exp.*month|month.*exp|expirationdatemonth', n):   return '<MM>'
+    if re.search(r'exp.*year|year.*exp|expirationdateyear', n):      return '<YYYY>'
+
+    # ── Auth / Tokens ─────────────────────────────────────────
+    if re.search(r'password|passwd|pwd', n):                         return '<password>'
+    if re.search(r'username|user.?name|login', n):                   return '<username>'
+    if re.search(r'csrf|_token|nonce', n):                           return '<csrf_token>'
+    if re.search(r'session', n):                                     return '<session_id>'
+    if re.search(r'otp|verification.?code|pin', n):                  return '<otp_code>'
+    if re.search(r'captcha', n):                                     return '<captcha_value>'
+
+    # ── IDs / references ──────────────────────────────────────
+    if re.search(r'order.?id|txn.?id|transaction', n):               return '<order_id>'
+    if re.search(r'amount|total|price', n):                          return '<amount>'
+    if re.search(r'currency', n):                                    return '<USD>'
+    if re.search(r'redirect|return.?url|callback', n):               return '<redirect_url>'
+    if re.search(r'lang|locale', n):                                 return '<en>'
+
+    # ── Label-based fallback ──────────────────────────────────
+    if label and label not in ('User Input', 'Static Param', 'Dynamic Token'):
+        slug = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
+        return f'<{slug}>'
+
+    # ── Name-based snake_case fallback ────────────────────────
+    slug = re.sub(r'([A-Z])', r'_', name).lower().strip('_')
+    slug = re.sub(r'[^a-z0-9_]', '_', slug).strip('_')
+    return f'<{slug}>'
 
 
 def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
@@ -24674,8 +24767,8 @@ def _format_payload_report(data: dict) -> str:
             lines.append(f"✏️ *User Fields* ({len(user_f)}):")
             user_json_lines = ["{"]
             for f in user_f:
-                ftype   = f.get('type', 'text')
-                val     = f['value'][:40] if f.get('value') else ftype
+                val     = (f['value'][:40] if f.get('value')
+                           else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
                 comment = " // required" if f.get('required') else ""
                 user_json_lines.append(
                     f'  "{f["name"]}": "{val}",{comment}'
@@ -24996,24 +25089,126 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domain = urlparse(url).hostname or url
 
+    # ── Phase definitions (icon, label, keyword triggers from progress_cb) ──
+    _PAYLOAD_PHASES = [
+        ("⬇️", "Static HTML parse",              ["Fetching HTML"]),
+        ("🌐", "Playwright JS render",            ["Playwright launching", "Playwright loading"]),
+        ("📡", "Network intercept (XHR/fetch)",   ["intercepting", "form(s)"]),
+        ("💳", "Payment gateway detection",        ["gateway"]),
+        ("🔍", "Header requirement probing",       ["Probing header", "header"]),
+        ("🔎", "Token source detection",           ["token source", "Locating token"]),
+        ("🤖", "CAPTCHA site key extraction",      ["CAPTCHA", "site key", "reCAPTCHA"]),
+    ]
+    TOTAL_PHASES = len(_PAYLOAD_PHASES)
+
+    def _build_progress_msg(domain: str, phase_idx: int, note: str = "") -> str:
+        """Build the animated progress message."""
+        lines = [f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n"]
+        for i, (icon, label, _) in enumerate(_PAYLOAD_PHASES):
+            if i < phase_idx:
+                marker = "✅"
+            elif i == phase_idx:
+                marker = "⏳"
+            else:
+                marker = "·"
+            phase_num = f"Phase {i+1}"
+            lines.append(f"{marker} {icon} {phase_num}: {label}")
+        # Progress bar
+        filled  = min(phase_idx, TOTAL_PHASES)
+        empty   = TOTAL_PHASES - filled - (1 if phase_idx < TOTAL_PHASES else 0)
+        running = 1 if phase_idx < TOTAL_PHASES else 0
+        bar     = "█" * filled + ("▓" * running) + "░" * empty
+        pct     = int((filled / TOTAL_PHASES) * 100)
+        lines.append(f"\n`[{bar}]` {pct}%")
+        if note:
+            lines.append(f"_{escape_md(note[:80])}_")
+        return "\n".join(lines)
+
+    def _msg_to_phase(text: str) -> int | None:
+        """Map a progress_cb message to a phase index (0-based)."""
+        tl = text.lower()
+        for i, (_, _, keywords) in enumerate(_PAYLOAD_PHASES):
+            if any(kw.lower() in tl for kw in keywords):
+                return i
+        return None
+
+    # ── Send initial progress message ──────────────────────────
     msg = await update.effective_message.reply_text(
-        f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n\n"
-        "⬇️ Phase 1: Static HTML parse\n"
-        "🌐 Phase 2: Playwright JS render\n"
-        "📡 Phase 3: Network intercept (XHR/fetch)\n"
-        "💳 Phase 4: Payment gateway detection\n"
-        "🔍 Phase 5: Header requirement probing\n\n⏳",
+        _build_progress_msg(domain, 0, "Starting…"),
         parse_mode='Markdown'
     )
 
+    # ── Thread-safe progress bridge ────────────────────────────
+    loop           = asyncio.get_event_loop()
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    phase_state    = [0]   # mutable so thread closure can update
+
+    def progress_cb(text: str):
+        """Called from sync thread — puts (phase_idx, note) into async queue."""
+        detected = _msg_to_phase(text)
+        if detected is not None and detected >= phase_state[0]:
+            phase_state[0] = detected
+        loop.call_soon_threadsafe(
+            progress_queue.put_nowait, (phase_state[0], text)
+        )
+
+    async def progress_editor():
+        """Async task: drain queue, edit Telegram message."""
+        last_text = ""
+        while True:
+            try:
+                item = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                # Check if scan task is still running
+                task_obj = _user_tasks.get(uid)
+                if task_obj and task_obj.done():
+                    break
+                continue
+            if item is None:        # sentinel — scan done
+                break
+            idx, note = item
+            new_text = _build_progress_msg(domain, idx, note)
+            if new_text == last_text:
+                continue
+            last_text = new_text
+            try:
+                await msg.edit_text(new_text, parse_mode='Markdown')
+            except Exception:
+                pass
+
+    editor_task = asyncio.create_task(progress_editor())
+
     try:
-        data = await run_scan(uid, _payload_sync, url)
+        data = await run_scan(uid, _payload_sync, url, progress_cb)
     except asyncio.CancelledError:
+        await progress_queue.put(None)   # stop editor
+        editor_task.cancel()
         await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
         return
     except Exception as e:
+        await progress_queue.put(None)   # stop editor
+        editor_task.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(str(e))}`", parse_mode='Markdown')
         return
+    finally:
+        # Signal editor task to stop and show all phases complete
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+
+    # Wait for editor to finish (max 2s)
+    try:
+        await asyncio.wait_for(editor_task, timeout=2.0)
+    except Exception:
+        editor_task.cancel()
+
+    # ── Show all-done bar before report ────────────────────────
+    try:
+        done_lines = [f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n"]
+        for i, (icon, label, _) in enumerate(_PAYLOAD_PHASES):
+            done_lines.append(f"✅ {icon} Phase {i+1}: {label}")
+        done_lines.append(f"\n`[{'█' * TOTAL_PHASES}]` 100% — Done\!")
+        await msg.edit_text("\n".join(done_lines), parse_mode='MarkdownV2')
+    except Exception:
+        pass
 
     # ── Markdown report ────────────────────────────────────────
     report = _format_payload_report(data)
@@ -25162,7 +25357,8 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
         lines.append(f"\n💳 *Card Fields* ({len(card_f)}):")
         card_lines = ["{"]
         for f in card_f:
-            val = f['value'][:40] if f.get('value') else f['field_label']
+            val = (f['value'][:40] if f.get('value')
+                   else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
             comment = " // required" if f.get('required') else ""
             card_lines.append(f'  "{f["name"]}": "{val}",{comment}')
         card_lines.append("}")
@@ -25172,7 +25368,8 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
         lines.append(f"💰 *Payment Info* ({len(pay_f)}):")
         pay_lines = ["{"]
         for f in pay_f:
-            val = f['value'][:40] if f.get('value') else f['field_label']
+            val = (f['value'][:40] if f.get('value')
+                   else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
             pay_lines.append(f'  "{f["name"]}": "{val}",')
         pay_lines.append("}")
         lines.append("```\n" + "\n".join(pay_lines) + "\n```")
@@ -25181,8 +25378,8 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
         lines.append(f"✏️ *User Fields* ({len(user_f)}):")
         user_lines = ["{"]
         for f in user_f:
-            ftype   = f.get('type', 'text')
-            val     = f['value'][:40] if f.get('value') else ftype
+            val     = (f['value'][:40] if f.get('value')
+                       else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
             comment = " // required" if f.get('required') else ""
             user_lines.append(f'  "{f["name"]}": "{val}",{comment}')
         user_lines.append("}")
@@ -25216,8 +25413,22 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
         on_request_cb(f"🚫 {reason}")
         return
 
-    counter    = [0]      # POST request counter
+    counter    = [0]      # intercepted request counter
     seen_keys  = set()    # deduplicate sitekeys already reported
+    seen_reqs  = set()    # deduplicate identical requests
+
+    # ── Static asset filter (skip these for GET) ──────────────
+    _STATIC_EXT = re.compile(
+        r'\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|mp4|mp3|webp|avif)'
+        r'(?:\?|$)', re.I)
+
+    # ── API-like path pattern — GET requests worth showing ──────
+    _API_PATH = re.compile(
+        r'/(?:api|ajax|graphql|rest|v\d+|data|service|endpoint|query|fetch|rpc'
+        r'|checkout|payment|cart|order|auth|login|session|token|user|account'
+        r'|verify|validate|submit|process|search|config|setting|profile'
+        r'|transaction|billing|invoice|product|catalog|price)(?:[/?]|$)',
+        re.I)
 
     try:
         from playwright.sync_api import sync_playwright
@@ -25296,16 +25507,54 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
             def on_req(request):
                 if stop_event.is_set():
                     return
-                if request.method not in ('POST', 'PUT', 'PATCH'):
-                    return
-                try:
-                    from urllib.parse import parse_qs
-                    body     = request.post_data or ''
-                    ct       = request.headers.get('content-type', '')
-                    endpoint = request.url
-                    fields   = []
 
-                    if 'json' in ct:
+                method   = request.method
+                endpoint = request.url
+
+                # ── Decide whether to capture this request ──────────
+                is_write = method in ('POST', 'PUT', 'PATCH', 'DELETE')
+                is_get   = method == 'GET'
+
+                if not is_write and not is_get:
+                    return
+
+                if is_get:
+                    # Skip static assets
+                    if _STATIC_EXT.search(endpoint):
+                        return
+                    # Skip non-API GET unless it's XHR (Accept: application/json)
+                    accept = request.headers.get('accept', '')
+                    is_xhr = 'json' in accept or 'xml' in accept
+                    if not is_xhr and not _API_PATH.search(endpoint):
+                        return
+
+                # ── Dedup — skip identical endpoint+method combos ───
+                dedup_key = f"{method}:{endpoint[:120]}"
+                if dedup_key in seen_reqs:
+                    return
+                seen_reqs.add(dedup_key)
+
+                try:
+                    from urllib.parse import parse_qs, parse_qsl, urlparse as _up_live
+                    body = request.post_data or ''
+                    ct   = request.headers.get('content-type', '')
+                    fields = []
+
+                    if is_get:
+                        # Extract query params as fields
+                        qs = _up_live(endpoint).query
+                        if not qs:
+                            return   # GET with no query params — skip
+                        for k, v in parse_qsl(qs):
+                            label, icon, is_dyn, card_type = _classify_field(k, v)
+                            fields.append({
+                                'name': k, 'type': 'query_param', 'value': v[:80],
+                                'required': False, 'field_label': label, 'icon': icon,
+                                'is_dynamic': is_dyn,
+                                'is_card': card_type is not None,
+                                'card_type': card_type,
+                            })
+                    elif 'json' in ct:
                         try:
                             data = json.loads(body)
                             if isinstance(data, dict):
@@ -25346,23 +25595,31 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                                 'card_type': card_type,
                             })
 
-                    if not fields and not body:
+                    # For write methods: show even if no fields (raw body)
+                    # For GET: must have at least 1 field (query param)
+                    if is_get and not fields:
+                        return
+                    if not is_get and not fields and not body:
                         return
 
                     counter[0] += 1
-                    # Detect tokenization gateway from endpoint URL
-                    tok = None
+
+                    # ── Tokenization gateway detection ──────────────
+                    tok    = None
                     ep_low = endpoint.lower()
-                    if 'stripe' in ep_low:
-                        tok = ('Stripe', '🟣')
-                    elif 'braintree' in ep_low or 'paypal' in ep_low:
-                        tok = ('Braintree/PayPal', '🔵')
-                    elif 'adyen' in ep_low:
-                        tok = ('Adyen', '🟢')
-                    elif 'square' in ep_low:
-                        tok = ('Square', '⬛')
+                    for tok_pat, tok_name, tok_icon in _TOKENIZATION_ENDPOINTS:
+                        if tok_pat.search(endpoint):
+                            tok = (tok_name, tok_icon)
+                            break
+
+                    # Method icon
+                    method_icon = {
+                        'POST': '📤', 'PUT': '🔄', 'PATCH': '✏️',
+                        'DELETE': '🗑️', 'GET': '📥',
+                    }.get(method, '📡')
+
                     entry_text = _format_live_entry(
-                        counter[0], endpoint, request.method, ct, fields, tok, body)
+                        counter[0], endpoint, f"{method_icon} {method}", ct, fields, tok, body)
                     on_request_cb(entry_text)
                 except Exception:
                     pass
