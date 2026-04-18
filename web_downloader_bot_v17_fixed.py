@@ -24063,6 +24063,122 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
 
 
 # ══════════════════════════════════════════════════════════════
+# ── Token Source Detection  (Phase 6) ─────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+_TOKEN_FIELD_PATTERNS = [
+    # name pattern, source_type, location label, field label
+    (re.compile(r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']', re.I | re.S),
+     'hidden_input', 'HTML <input type="hidden">',  'Hidden form field — injected by server per-request'),
+    (re.compile(r'<input[^>]*name=["\']([^"\']*(?:csrf|token|nonce|_token|authenticity)[^"\']*)["\'][^>]*value=["\']([^"\']*)["\']', re.I | re.S),
+     'hidden_input', 'HTML <input type="hidden">',  'CSRF / Auth token — hidden input'),
+    (re.compile(r'<meta[^>]+name=["\']([^"\']*(?:csrf|token|_token)[^"\']*)["\'][^>]*content=["\']([^"\']*)["\']', re.I | re.S),
+     'meta_tag',     'HTML <meta> tag',              'CSRF meta tag — read by JS before POST'),
+    (re.compile(r'<meta[^>]+content=["\']([^"\']*)["\'][^>]*name=["\']([^"\']*(?:csrf|token)[^"\']*)["\']', re.I | re.S),
+     'meta_tag',     'HTML <meta> tag',              'CSRF meta tag — read by JS before POST'),
+]
+
+_TOKEN_JS_PATTERNS = [
+    # js_text pattern, source_type, location, label
+    (re.compile(r'(?:csrf[_\-]?token|_token|csrfmiddlewaretoken|authenticity_token|nonce)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+     'js_variable', 'Inline JS / <script> block', 'CSRF/Auth token assigned in JavaScript'),
+    (re.compile(r'(?:access[_\-]?token|auth[_\-]?token|bearer[_\-]?token|id[_\-]?token|api[_\-]?key)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+     'js_variable', 'Inline JS / <script> block', 'Auth token stored in JS variable'),
+    (re.compile(r'(?:stripe\.setPublishableKey|stripe\(|pk_(?:live|test)_\w{10,})', re.I),
+     'js_variable', 'Stripe JS SDK',              'Stripe publishable key — used for card tokenization'),
+    (re.compile(r'braintree\.client\.create\s*\(\s*\{[^}]*authorization\s*:\s*["\']([^"\']+)["\']', re.I | re.S),
+     'js_variable', 'Braintree JS SDK',           'Braintree client token — used for card tokenization'),
+    (re.compile(r'localStorage\.(?:getItem|setItem)\s*\(\s*["\']([^"\']*(?:token|auth|session|jwt)[^"\']*)["\']', re.I),
+     'js_variable', 'localStorage (JS)',          'Token stored / retrieved from localStorage'),
+    (re.compile(r'sessionStorage\.(?:getItem|setItem)\s*\(\s*["\']([^"\']*(?:token|auth|session|jwt)[^"\']*)["\']', re.I),
+     'js_variable', 'sessionStorage (JS)',        'Token stored / retrieved from sessionStorage'),
+    (re.compile(r'document\.cookie\s*=.*?(["\'](?:[^"\']*(?:token|auth|session|jwt)[^"\']*)["\'])', re.I),
+     'cookie',      'document.cookie (JS)',       'Token written to cookie via JS'),
+]
+
+_KNOWN_CSRF_NAMES = {
+    '_token', 'csrf_token', 'csrfmiddlewaretoken', 'authenticity_token',
+    '_csrf', 'csrf', '__requestverificationtoken', 'xsrf-token',
+    '_wpnonce', 'nonce', 'woocommerce-process-checkout-nonce',
+}
+
+def _find_token_sources(html: str, js_text: str) -> list:
+    """
+    Scan HTML + JS text for dynamic token sources.
+    Returns list of dicts:
+      name, value_preview, source_type, location, label
+    """
+    results = []
+    seen    = set()
+
+    # ── 1. HTML hidden inputs + meta tags ─────────────────────
+    for pat, src_type, location, label in _TOKEN_FIELD_PATTERNS:
+        for m in pat.finditer(html):
+            grps = m.groups()
+            name  = grps[0].strip()
+            value = grps[1].strip() if len(grps) > 1 else ''
+            key   = (src_type, name.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            # Only include if name looks token-like or matches known names
+            name_l = name.lower()
+            if not (any(kw in name_l for kw in ('token','csrf','nonce','auth','key','secret','verify','hash'))
+                    or name_l in _KNOWN_CSRF_NAMES):
+                continue
+            results.append({
+                'name':          name,
+                'value_preview': (value[:40] + '…') if len(value) > 40 else (value or '(empty)'),
+                'source_type':   src_type,
+                'location':      location,
+                'label':         label,
+            })
+
+    # ── 2. Hidden inputs by name heuristic (broad scan) ────────
+    for m in re.finditer(
+        r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+        html, re.I | re.S
+    ):
+        name  = m.group(1).strip()
+        value = m.group(2).strip()
+        key   = ('hidden_input', name.lower())
+        if key in seen:
+            continue
+        name_l = name.lower()
+        if not (any(kw in name_l for kw in ('token','csrf','nonce','auth','key','verify','hash','secret'))
+                or name_l in _KNOWN_CSRF_NAMES):
+            continue
+        seen.add(key)
+        results.append({
+            'name':          name,
+            'value_preview': (value[:40] + '…') if len(value) > 40 else (value or '(empty — runtime)'),
+            'source_type':   'hidden_input',
+            'location':      'HTML <input type="hidden">',
+            'label':         'Hidden form field — injected by server per-request',
+        })
+
+    # ── 3. JS text patterns ─────────────────────────────────────
+    combined_js = html + '\n' + js_text
+    for pat, src_type, location, label in _TOKEN_JS_PATTERNS:
+        for m in pat.finditer(combined_js):
+            grps = m.groups()
+            name  = grps[0].strip() if grps else m.group(0)[:60]
+            key   = (src_type, name.lower()[:30])
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                'name':          name,
+                'value_preview': '(runtime value)',
+                'source_type':   src_type,
+                'location':      location,
+                'label':         label,
+            })
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
 # ── Header Requirement Detection  (Phase 5) ───────────────────
 # ══════════════════════════════════════════════════════════════
 
@@ -25176,6 +25292,80 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         f"📍 *Source:* {escape_md(src_loc)}"
                     )
                     on_request_cb(msg_text)
+
+            def on_req(request):
+                if stop_event.is_set():
+                    return
+                if request.method not in ('POST', 'PUT', 'PATCH'):
+                    return
+                try:
+                    from urllib.parse import parse_qs
+                    body     = request.post_data or ''
+                    ct       = request.headers.get('content-type', '')
+                    endpoint = request.url
+                    fields   = []
+
+                    if 'json' in ct:
+                        try:
+                            data = json.loads(body)
+                            if isinstance(data, dict):
+                                for k, v in data.items():
+                                    label, icon, is_dyn, card_type = _classify_field(k, str(v))
+                                    fields.append({
+                                        'name': k, 'type': 'json', 'value': str(v)[:80],
+                                        'required': True, 'field_label': label, 'icon': icon,
+                                        'is_dynamic': is_dyn,
+                                        'is_card': card_type is not None,
+                                        'card_type': card_type,
+                                    })
+                        except Exception:
+                            pass
+                    elif 'urlencoded' in ct or 'form' in ct:
+                        try:
+                            for k, vals in parse_qs(body).items():
+                                v = vals[0] if vals else ''
+                                label, icon, is_dyn, card_type = _classify_field(k, v)
+                                fields.append({
+                                    'name': k, 'type': 'form', 'value': v[:80],
+                                    'required': True, 'field_label': label, 'icon': icon,
+                                    'is_dynamic': is_dyn,
+                                    'is_card': card_type is not None,
+                                    'card_type': card_type,
+                                })
+                        except Exception:
+                            pass
+                    elif 'multipart' in ct:
+                        for match in re.finditer(r'name="([^"]+)"', body):
+                            k = match.group(1)
+                            label, icon, is_dyn, card_type = _classify_field(k, '')
+                            fields.append({
+                                'name': k, 'type': 'multipart', 'value': '',
+                                'required': False, 'field_label': label, 'icon': icon,
+                                'is_dynamic': is_dyn,
+                                'is_card': card_type is not None,
+                                'card_type': card_type,
+                            })
+
+                    if not fields and not body:
+                        return
+
+                    counter[0] += 1
+                    # Detect tokenization gateway from endpoint URL
+                    tok = None
+                    ep_low = endpoint.lower()
+                    if 'stripe' in ep_low:
+                        tok = ('Stripe', '🟣')
+                    elif 'braintree' in ep_low or 'paypal' in ep_low:
+                        tok = ('Braintree/PayPal', '🔵')
+                    elif 'adyen' in ep_low:
+                        tok = ('Adyen', '🟢')
+                    elif 'square' in ep_low:
+                        tok = ('Square', '⬛')
+                    entry_text = _format_live_entry(
+                        counter[0], endpoint, request.method, ct, fields, tok, body)
+                    on_request_cb(entry_text)
+                except Exception:
+                    pass
 
             page.on('response', on_resp)
             page.on('request',  on_req)
