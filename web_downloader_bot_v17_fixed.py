@@ -15606,7 +15606,7 @@ async def sitekey_verify_callback(update: Update, context: ContextTypes.DEFAULT_
         f"```\n{token_preview}\n```\n"
         + (f"💰 Cost: `{cost}`\n" if cost else "")
         + f"\n📌 *Solver Params:*\n"
-        f"```json\n{{\n"
+        f"```\n{{\n"
         + "\n".join(sp_parts)
         + f"\n}}\n```\n"
         f"⚠️ _Authorized testing only_",
@@ -24535,13 +24535,13 @@ def _format_payload_report(data: dict) -> str:
             lines.append(f"💳 *Card Fields* ({len(card_strict)}):")
             card_json_lines = ["{"]
             for f in card_strict:
-                req  = " /*required*/" if f.get('required') else ""
-                val  = f['value'][:40] if f.get('value') else ""
+                val     = f['value'][:40] if f.get('value') else ""
+                comment = " // required" if f.get('required') else ""
                 card_json_lines.append(
-                    f'  "{f["name"]}": "{val or f["field_label"]}"{req},'
+                    f'  "{f["name"]}": "{val or f["field_label"]}",{comment}'
                 )
             card_json_lines.append("}")
-            lines.append("```json\n" + "\n".join(card_json_lines) + "\n```")
+            lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
 
         # ── Payment info — compact ──────────────────────────────
         if pay_info:
@@ -24551,21 +24551,21 @@ def _format_payload_report(data: dict) -> str:
                 val = f['value'][:40] if f.get('value') else f['field_label']
                 pay_json_lines.append(f'  "{f["name"]}": "{val}",')
             pay_json_lines.append("}")
-            lines.append("```json\n" + "\n".join(pay_json_lines) + "\n```")
+            lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
 
         # ── User fields — JSON code block (ALL, no truncation) ──
         if user_f:
             lines.append(f"✏️ *User Fields* ({len(user_f)}):")
             user_json_lines = ["{"]
             for f in user_f:
-                req   = " /*required*/" if f.get('required') else ""
-                ftype = f.get('type', 'text')
-                val   = f['value'][:40] if f.get('value') else ftype
+                ftype   = f.get('type', 'text')
+                val     = f['value'][:40] if f.get('value') else ftype
+                comment = " // required" if f.get('required') else ""
                 user_json_lines.append(
-                    f'  "{f["name"]}": "{val}"{req},'
+                    f'  "{f["name"]}": "{val}",{comment}'
                 )
             user_json_lines.append("}")
-            lines.append("```json\n" + "\n".join(user_json_lines) + "\n```")
+            lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
 
         # ── Dynamic fields — compact list ───────────────────────
         if dyn_f:
@@ -24901,7 +24901,53 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Markdown report ────────────────────────────────────────
     report = _format_payload_report(data)
-    await msg.edit_text(report, parse_mode='Markdown')
+
+    # ── Smart chunk splitter — code block aware ────────────────
+    MAX_LEN = 4000
+
+    def _smart_chunks(text: str) -> list:
+        """
+        4000 char ကျော်ရင် ``` code block အလယ်ဝင်မဖြတ်ဘဲ
+        block boundary မှာပဲ ခွဲသည်။
+        """
+        if len(text) <= MAX_LEN:
+            return [text]
+        chunks   = []
+        current  = []
+        cur_len  = 0
+        in_block = False
+        for line in text.splitlines(keepends=True):
+            if line.strip().startswith("```"):
+                in_block = not in_block
+            line_len = len(line)
+            # If adding this line would exceed limit AND we're not inside a code block
+            if cur_len + line_len > MAX_LEN and not in_block and current:
+                chunks.append("".join(current))
+                current  = []
+                cur_len  = 0
+            current.append(line)
+            cur_len += line_len
+        if current:
+            chunks.append("".join(current))
+        return chunks
+
+    async def _safe_send_report(text: str):
+        parts = _smart_chunks(text)
+        # First chunk replaces status msg
+        try:
+            await msg.edit_text(parts[0], parse_mode='Markdown')
+        except Exception:
+            try:
+                await msg.edit_text(parts[0])
+            except Exception:
+                pass
+        for part in parts[1:]:
+            try:
+                await update.effective_message.reply_text(part, parse_mode='Markdown')
+            except Exception:
+                await update.effective_message.reply_text(part)
+
+    await _safe_send_report(report)
 
     # ── JSON file export ───────────────────────────────────────
     try:
@@ -25000,11 +25046,11 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
         lines.append(f"\n💳 *Card Fields* ({len(card_f)}):")
         card_lines = ["{"]
         for f in card_f:
-            req = " /*required*/" if f.get('required') else ""
             val = f['value'][:40] if f.get('value') else f['field_label']
-            card_lines.append(f'  "{f["name"]}": "{val}"{req},')
+            comment = " // required" if f.get('required') else ""
+            card_lines.append(f'  "{f["name"]}": "{val}",{comment}')
         card_lines.append("}")
-        lines.append("```json\n" + "\n".join(card_lines) + "\n```")
+        lines.append("```\n" + "\n".join(card_lines) + "\n```")
 
     if pay_f:
         lines.append(f"💰 *Payment Info* ({len(pay_f)}):")
@@ -25013,18 +25059,18 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
             val = f['value'][:40] if f.get('value') else f['field_label']
             pay_lines.append(f'  "{f["name"]}": "{val}",')
         pay_lines.append("}")
-        lines.append("```json\n" + "\n".join(pay_lines) + "\n```")
+        lines.append("```\n" + "\n".join(pay_lines) + "\n```")
 
     if user_f:
         lines.append(f"✏️ *User Fields* ({len(user_f)}):")
         user_lines = ["{"]
         for f in user_f:
-            req   = " /*required*/" if f.get('required') else ""
-            ftype = f.get('type', 'text')
-            val   = f['value'][:40] if f.get('value') else ftype
-            user_lines.append(f'  "{f["name"]}": "{val}"{req},')
+            ftype   = f.get('type', 'text')
+            val     = f['value'][:40] if f.get('value') else ftype
+            comment = " // required" if f.get('required') else ""
+            user_lines.append(f'  "{f["name"]}": "{val}",{comment}')
         user_lines.append("}")
-        lines.append("```json\n" + "\n".join(user_lines) + "\n```")
+        lines.append("```\n" + "\n".join(user_lines) + "\n```")
 
     if dyn_f:
         dyn_names = ", ".join(f"`{escape_md(f['name'])}`" for f in dyn_f)
@@ -29381,7 +29427,7 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"```\n{token_preview}\n```\n"
                 + (f"💰 Cost: `{cost}`\n" if cost else "")
                 + f"\n📌 *Solver Params:*\n"
-                f"```json\n{{\n"
+                f"```\n{{\n"
                 + "\n".join(sp_parts)
                 + f"\n}}\n```\n"
                 f"⚠️ _Authorized testing only_",
@@ -31013,6 +31059,8 @@ def main():
                     BotCommand("oauthscan",   "OAuth config scanner"),
                     BotCommand("subdomains",  "Subdomain enumeration"),
                     BotCommand("bypass403",   "403 bypass tester"),
+                    BotCommand("payload",     "Request payload structure extractor"),
+                    BotCommand("payloadlive", "Realtime network request stream"),
                     BotCommand("fuzz",        "Path & param fuzzer"),
                     BotCommand("smartfuzz",   "Context-aware smart fuzzer"),
                     BotCommand("monitor",     "Page change alert monitor"),
