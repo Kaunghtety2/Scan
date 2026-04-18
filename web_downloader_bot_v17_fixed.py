@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║       Website Downloader Bot  v17.0  (Secure+Full Edition)  ║
+# ║       Website Downloader Bot  v18.0  (Secure+Full Edition)  ║
 # ║  ✅ SSRF Protection       ✅ Path Traversal Fix             ║
 # ║  ✅ DB Race Condition Fix  ✅ Rate Limiting                  ║
 # ║  ✅ Subprocess Injection   ✅ Log Sanitization              ║
@@ -10,6 +10,10 @@
 # ║  ✅ Proxy Rotation         ✅ Health Check + Auto-Failover  ║
 # ║  ✅ Timeout/Retry Fix      ✅ Termux Network Stable         ║
 # ║  ✅ /tech Fingerprint       ✅ /extract Secret Scanner      ║
+# ║  ✅ Dual-probe Catchall     ✅ difflib Similarity Filter    ║
+# ║  ✅ Shared Session Scan     ✅ Content-Type Confidence      ║
+# ║  ✅ requestfinished Hook    ✅ Set-Cookie JWT Capture       ║
+# ║  ✅ Binary WS ASCIIExtract  ✅ JWT Phase-2 Intercept       ║
 # ║  ✅ /monitor Alerts         ✅ /bypass403 Bypass Tester     ║
 # ║  ✅ /subdomains Enum        ✅ /fuzz Path+Param Fuzzer      ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -1954,73 +1958,165 @@ def _get_page_fingerprint(url: str, timeout: int = 6) -> tuple:
 
 def _detect_catchall(base_url: str) -> tuple:
     """
-    Request a random non-existent path — if it returns 200,
-    the server has a catch-all (Cloudflare, custom 404 as 200).
-    Returns (is_catchall: bool, baseline_hash: str, baseline_len: int)
+    Dual-probe catch-all detection with difflib similarity check.
+    Uses two independent random paths to cross-confirm catch-all behaviour,
+    and stores the baseline body bytes for per-probe similarity comparison.
+
+    Returns (is_catchall: bool, baseline_hash: str, baseline_len: int,
+             baseline_body: bytes)
+    The 4th element (baseline_body) is used by _probe_one for difflib ratio.
     """
-    rand_path = '/' + ''.join(random.choices(string.ascii_lowercase, k=16)) + '.html'
-    status, body_hash, ct_len, ct = _get_page_fingerprint(base_url.rstrip('/') + rand_path)
-    if status == 200:
-        return True, body_hash, ct_len   # catch-all confirmed
-    return False, '', 0
+    import string as _str
+    def _rand_path():
+        name = ''.join(random.choices(_str.ascii_lowercase, k=18))
+        return '/' + name + random.choice(['.html', '.php', '.json', ''])
+
+    base = base_url.rstrip('/')
+    path1 = _rand_path()
+    path2 = _rand_path()
+
+    try:
+        r1 = requests.get(base + path1, headers=_get_headers(), timeout=7,
+                          stream=True, allow_redirects=True, verify=False,
+                          proxies=proxy_manager.get_proxy())
+        s1 = r1.status_code
+        body1 = b''.join(list(r1.iter_content(2048))[:2])
+        r1.close()
+    except Exception:
+        s1, body1 = 0, b''
+
+    if s1 != 200:
+        return False, '', 0, b''
+
+    # Second probe — confirms first isn't a coincidental 200
+    try:
+        r2 = requests.get(base + path2, headers=_get_headers(), timeout=7,
+                          stream=True, allow_redirects=True, verify=False,
+                          proxies=proxy_manager.get_proxy())
+        s2 = r2.status_code
+        body2 = b''.join(list(r2.iter_content(2048))[:2])
+        r2.close()
+    except Exception:
+        s2, body2 = 0, b''
+
+    if s2 != 200:
+        # Only first path returned 200 — could be coincidence, not a true catch-all
+        return False, '', 0, b''
+
+    # Both random paths return 200 → confirmed catch-all
+    baseline_body = body1[:1024]
+    baseline_hash = hashlib.md5(baseline_body[:512]).hexdigest()
+    baseline_len  = len(baseline_body)
+    return True, baseline_hash, baseline_len, baseline_body
 
 
 def _is_fake_200_content(body: bytes, ct: str) -> bool:
     if 'html' not in ct.lower():
         return False
-    snippet = body[:800].lower()
+    # Check first 2 KB instead of 800 bytes — some sites embed 404 signals deeper
+    snippet = body[:2048].lower()
     return any(s in snippet for s in _FAKE_SIGS)
 
 
 def _probe_one(
     base_url: str, path: str, label: str, severity: str,
     catchall: bool, baseline_hash: str, baseline_len: int,
-    delay: float = 0.0
+    delay: float = 0.0,
+    baseline_body: bytes = b'',
+    session: "requests.Session | None" = None,
 ) -> dict | None:
     """
     Probe one path — GET + stream.
-    Compares against baseline to filter catch-all false positives.
+    Improvements over v17:
+      • difflib.SequenceMatcher similarity check (catch-all resilience)
+      • Reads 4 KB instead of 1 KB for better fake-200 detection
+      • Content-type based confidence: JSON/XML/plain on .env/.git = auto-CRITICAL
+      • Accepts optional pre-built requests.Session (connection reuse)
+      • Retry once on Timeout before giving up
     """
     if delay > 0:
         time.sleep(delay)
 
     full_url = base_url.rstrip('/') + path
-    try:
-        resp = requests.get(
+    _req = session if session is not None else requests
+
+    def _do_get():
+        return _req.get(
             full_url, headers=_get_headers(),
-            timeout=8, stream=True,
+            timeout=9, stream=True,
             allow_redirects=True, verify=False,
-            proxies=proxy_manager.get_proxy(),
+            proxies=proxy_manager.get_proxy() if session is None else None,
         )
+
+    try:
+        resp = _do_get()
+    except requests.exceptions.Timeout:
+        # Single retry on timeout
+        try:
+            resp = _do_get()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    try:
         status = resp.status_code
         ct     = resp.headers.get('Content-Type', '')
 
         if status == 200:
+            # Read up to 4 KB for better fake-200 / similarity detection
             chunk = b''
-            for part in resp.iter_content(1024):
+            for part in resp.iter_content(512):
                 chunk += part
-                if len(chunk) >= 1024: break
+                if len(chunk) >= 4096: break
             resp.close()
 
-            # ── Catch-all filter ──────────────────
+            # ── Catch-all filter — triple-check ──
             if catchall:
                 page_hash = hashlib.md5(chunk[:512]).hexdigest()
-                page_len  = int(resp.headers.get('Content-Length', len(chunk)))
-                # Same hash or very similar length = catch-all page
+                page_len  = len(chunk)
+
+                # 1. Exact hash match
                 if page_hash == baseline_hash:
                     return None
-                if baseline_len > 0 and abs(page_len - baseline_len) < 50:
-                    return None
+
+                # 2. Length within ±5 % of baseline (handles gzip variance)
+                if baseline_len > 0:
+                    ratio = abs(page_len - baseline_len) / max(baseline_len, 1)
+                    if ratio < 0.05:
+                        return None
+
+                # 3. difflib content similarity > 0.92 → same page with tiny variation
+                if baseline_body:
+                    sim = difflib.SequenceMatcher(
+                        None, baseline_body[:512], chunk[:512], autojunk=False
+                    ).ratio()
+                    if sim > 0.92:
+                        return None
 
             # ── Fake 200 (custom 404 HTML) ────────
             if _is_fake_200_content(chunk, ct):
                 return None
+
+            # ── Content-type confidence boost ─────
+            ct_lower = ct.lower()
+            _is_data_ct = any(x in ct_lower for x in (
+                'json', 'xml', 'plain', 'yaml', 'toml', 'env', 'ini', 'text'
+            ))
+            _is_sensitive_path = any(x in path.lower() for x in (
+                '.env', '.git', 'config', 'backup', 'dump', 'secret', 'key',
+                'passwd', 'shadow', 'db', 'sql', 'log', 'admin', 'credential'
+            ))
+            # Non-HTML data response on a sensitive path → escalate to CRITICAL
+            if _is_data_ct and _is_sensitive_path and severity not in ("CRITICAL",):
+                severity = "CRITICAL"
 
             size = int(resp.headers.get('Content-Length', len(chunk)))
             return {
                 "path": path, "full_url": full_url,
                 "label": label, "severity": severity,
                 "status": 200, "protected": False, "size": size,
+                "content_type": ct[:60],
             }
 
         elif status == 403 and severity in ("CRITICAL","HIGH"):
@@ -2052,10 +2148,10 @@ def _probe_one(
             try: resp.close()
             except: pass
 
-    except requests.exceptions.Timeout:
-        pass
     except Exception:
-        pass
+        try: resp.close()
+        except: pass
+
     return None
 
 
@@ -2094,30 +2190,50 @@ def _verify_subdomain_real(sub_url: str) -> bool:
 def _scan_target_sync(
     target_url: str, delay_per_req: float = 0.3
 ) -> tuple:
-    """Scan one URL with catch-all detection and delays."""
+    """
+    Scan one URL with catch-all detection and delays.
+    v18 improvements:
+      • Shared requests.Session per scan (TCP connection reuse, ~30% faster)
+      • baseline_body passed to _probe_one for difflib similarity check
+      • _detect_catchall now returns 4-tuple (unpack safely)
+    """
     exposed   = []
     protected = []
 
-    # Detect catch-all first
-    catchall, baseline_hash, baseline_len = _detect_catchall(target_url)
+    # Detect catch-all first — v18 returns 4-tuple
+    _catchall_result = _detect_catchall(target_url)
+    if len(_catchall_result) == 4:
+        catchall, baseline_hash, baseline_len, baseline_body = _catchall_result
+    else:
+        catchall, baseline_hash, baseline_len = _catchall_result
+        baseline_body = b''
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+    # Shared session — one TCP handshake per host, reused across all probes
+    _session = requests.Session()
+    _session.headers.update(_get_headers())
+    _session.proxies = proxy_manager.get_proxy() or {}
+    _session.verify  = False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         fmap = {
             ex.submit(
                 _probe_one, target_url, path, label, sev,
                 catchall, baseline_hash, baseline_len,
-                delay_per_req * (i % 5)   # stagger delays 0/0.3/0.6/0.9/1.2s
+                delay_per_req * (i % 5),   # stagger 0/0.3/0.6/0.9/1.2s
+                baseline_body,
+                _session,
             ): (path, label, sev)
             for i, (path, label, sev) in enumerate(_VULN_PATHS)
         }
-        for fut in concurrent.futures.as_completed(fmap, timeout=120):
+        for fut in concurrent.futures.as_completed(fmap, timeout=150):
             try:
-                f = fut.result(timeout=15)
+                f = fut.result(timeout=18)
                 if f:
                     (protected if f["protected"] else exposed).append(f)
             except Exception:
                 pass
 
+    _session.close()
     exposed.sort(key=lambda x: _SEV_ORDER.get(x["severity"],9))
     protected.sort(key=lambda x: _SEV_ORDER.get(x["severity"],9))
     return exposed, protected, catchall
@@ -8004,14 +8120,14 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📌 *Usage:* `/sitekey https://example.com`\n\n"
             "🔑 *Extracts:*\n"
             "  • `site_key` — Captcha public key\n"
-            "  • `page_url` — Final URL (after redirects)\n"
+            "  • `page_url` — Final URL\n"
             "  • `action`   — reCAPTCHA v3 action name\n\n"
-            "🛡️ *Supported Captcha Types:*\n"
-            "  • reCAPTCHA v2 _(data-sitekey / grecaptcha.render)_\n"
-            "  • reCAPTCHA v3 _(grecaptcha.execute + action)_\n"
+            "🛡 *Supported Captcha Types:*\n"
+            "  • reCAPTCHA v2 `data-sitekey / grecaptcha.render`\n"
+            "  • reCAPTCHA v3 `grecaptcha.execute + action`\n"
             "  • reCAPTCHA Enterprise\n"
-            "  • hCaptcha _(UUID format key)_\n"
-            "  • Cloudflare Turnstile _(0x4A... / 1x00...)_\n"
+            "  • hCaptcha `UUID format key`\n"
+            "  • Cloudflare Turnstile `0x4A / 1x00`\n"
             "  • FunCaptcha / Arkose Labs\n"
             "  • GeeTest\n"
             "  • AWS WAF Captcha\n\n"
@@ -9467,18 +9583,29 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
 
             def _on_response(resp):
                 try:
-                    ct = (resp.headers.get("content-type") or "").lower()
-                    st = resp.status
-                    # Capture matching content-type OR any 2xx/3xx API response
+                    ct  = (resp.headers.get("content-type") or "").lower()
+                    st  = resp.status
+                    hdrs_lower = {k.lower(): v for k, v in resp.headers.items()}
+
+                    # Always capture response headers (Set-Cookie, Authorization, etc.)
+                    _plw_response_meta[resp.url] = {
+                        "status":       st,
+                        "content_type": ct,
+                        "headers":      hdrs_lower,
+                    }
+
+                    # Capture body for matching content-types OR 2xx/3xx API responses
                     if any(x in ct for x in _CAPTURE_CT) or (200 <= st < 400 and ct):
-                        body = resp.body()
-                        text = body.decode("utf-8", errors="replace")[:8000]
-                        _plw_response_bodies[resp.url] = text
-                        _plw_response_meta[resp.url] = {
-                            "status":       st,
-                            "content_type": ct,
-                            "headers":      {k.lower(): v for k, v in resp.headers.items()},
-                        }
+                        # Content-Length guard — skip huge binary downloads
+                        cl = int(resp.headers.get("content-length") or 0)
+                        if cl > 2_000_000:   # skip if >2 MB
+                            return
+                        try:
+                            body = resp.body()
+                            text = body.decode("utf-8", errors="replace")[:8000]
+                            _plw_response_bodies[resp.url] = text
+                        except Exception:
+                            pass   # streaming/chunked — JS hook will cover it
                 except Exception:
                     pass
 
@@ -9498,19 +9625,51 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     _ws_frames.append({"dir": "sent", "url": ws_url, "payload": text})
                 def _on_frame_recv(payload):
                     if isinstance(payload, (bytes, bytearray)):
+                        # Try UTF-8 first; for binary (protobuf/msgpack), extract
+                        # printable ASCII sequences that look like secrets/tokens
+                        raw = bytes(payload)
                         try:
-                            text = payload.decode("utf-8", errors="replace")[:4000]
-                        except Exception:
-                            text = repr(payload[:200])
+                            text = raw.decode("utf-8", errors="strict")[:4000]
+                        except UnicodeDecodeError:
+                            # Binary frame — extract ASCII token candidates (16+ chars)
+                            ascii_tokens = re.findall(rb'[\x20-\x7e]{16,}', raw)
+                            text = " ".join(t.decode("ascii", errors="replace")
+                                           for t in ascii_tokens[:50])[:4000]
                     else:
                         text = str(payload)[:4000]
                     _ws_frames.append({"dir": "recv", "url": ws_url, "payload": text})
                 ws.on("framesent",    _on_frame_sent)
                 ws.on("framereceived", _on_frame_recv)
 
-            page.on("request",   _on_request_headers)
-            page.on("response",  _on_response)
-            page.on("websocket", _on_websocket)
+            # requestfinished fires after response body is fully received —
+            # catches late/chunked responses that _on_response might miss
+            def _on_request_finished(req):
+                try:
+                    resp_f = req.response()
+                    if resp_f and resp_f.url not in _plw_response_bodies:
+                        ct_f = (resp_f.headers.get("content-type") or "").lower()
+                        st_f = resp_f.status
+                        if any(x in ct_f for x in _CAPTURE_CT) or (200 <= st_f < 400 and ct_f):
+                            cl = int(resp_f.headers.get("content-length") or 0)
+                            if 0 < cl <= 2_000_000 or cl == 0:
+                                try:
+                                    body_f = resp_f.body()
+                                    text_f = body_f.decode("utf-8", errors="replace")[:8000]
+                                    _plw_response_bodies[resp_f.url] = text_f
+                                    if resp_f.url not in _plw_response_meta:
+                                        _plw_response_meta[resp_f.url] = {
+                                            "status": st_f, "content_type": ct_f,
+                                            "headers": {k.lower(): v for k, v in resp_f.headers.items()},
+                                        }
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+            page.on("request",          _on_request_headers)
+            page.on("response",         _on_response)
+            page.on("requestfinished",  _on_request_finished)
+            page.on("websocket",        _on_websocket)
 
             # ── Load page ──────────────────────────────────────────────────
             try:
@@ -9561,13 +9720,20 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 except Exception:
                     pass
 
-            # Wait for async API calls and async fetch .then() to settle
+            # Wait for async API calls to settle — networkidle then short fixed flush
             try:
-                page.wait_for_load_state("networkidle", timeout=8_000)
+                page.wait_for_load_state("networkidle", timeout=6_000)
             except Exception:
                 pass
-            # Extra wait so fetch_response async .then() callbacks flush to __streamLog
-            page.wait_for_timeout(3000)
+            # Short flush — lets fetch .then() / XHR onload callbacks write to __streamLog
+            # 1.5s is enough for 99% of SPAs; saves 1.5s per scan vs old 3s
+            page.wait_for_timeout(1500)
+            # Trigger any deferred API calls via focus/blur cycle (auth token refresh)
+            try:
+                page.evaluate("() => { document.dispatchEvent(new Event('visibilitychange')); }")
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
 
             # ── Read JS hook log ───────────────────────────────────────────
             try:
@@ -9637,7 +9803,7 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 "confidence": confidence,
             })
 
-        # 1. Sensitive headers → always HIGH confidence
+        # 1. Sensitive REQUEST headers → always HIGH confidence
         for req in live_requests:
             hdrs = req.get("headers", {})
             u    = req.get("url", "")[:80]
@@ -9658,6 +9824,28 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 elif hn in _SENSITIVE_HEADERS:
                     _add_live(f"{hdr_name} header (live)", hdr_val.strip()[:200],
                               f"Header → {u}")
+
+        # 1b. RESPONSE headers (Set-Cookie session tokens, auth cookies)
+        for u_key, meta in _plw_response_meta.items():
+            u_short = u_key[:80]
+            resp_hdrs = meta.get("headers", {})
+            # Set-Cookie — extract session/auth token values
+            set_cookie = resp_hdrs.get("set-cookie", "")
+            if set_cookie:
+                # Look for session/auth cookie values
+                for ck_pat, ck_label in [
+                    (re.compile(r'(?i)(?:session|sess|sid|auth|token|jwt|access)[^=]*=([^;,\s]{16,})'), "Session Cookie"),
+                    (re.compile(r'(?i)(?:csrf|xsrf)[^=]*=([^;,\s]{16,})'),                             "CSRF Cookie"),
+                    (re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'),      "JWT in Set-Cookie"),
+                ]:
+                    for m in ck_pat.finditer(set_cookie):
+                        val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                        _add_live(ck_label, val, f"Set-Cookie ← {u_short}", confidence="HIGH")
+            # X-Auth-Token, X-API-Key in response
+            for rh in ("x-auth-token", "x-api-key", "x-access-token", "x-session-id"):
+                rv = resp_hdrs.get(rh, "")
+                if rv and len(rv) >= 8:
+                    _add_live(f"Response {rh}", rv.strip()[:200], f"Resp-Hdr ← {u_short}", confidence="HIGH")
 
         # 2. Request bodies + response bodies
         for req in live_requests:
@@ -19140,34 +19328,98 @@ _JWT_LIVE_JS_EVAL = """() => {
 }"""
 
 def _jwtlive_sync(url: str, progress_cb=None) -> dict:
+    """
+    v18: also runs _stream_intercept_sync to capture JWTs from:
+      - Authorization: Bearer <jwt> request headers (live intercept)
+      - Set-Cookie response headers containing JWT values
+      - WebSocket frames carrying JWT payloads
+      - Playwright-level response bodies (most reliable)
+    """
+    import base64 as _b64
+
+    def _decode_jwt(t: str) -> dict:
+        try:
+            b64 = t.split(".")[1] + "=="
+            return json.loads(_b64.b64decode(b64.replace("-","+").replace("_","/")))
+        except Exception:
+            return {}
+
+    _JWT_RE = re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')
+
+    # Phase 1: DOM / storage scan (existing)
     data = _extract_run(url, _JWT_LIVE_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
+
     findings = []
+    seen_net  = set()
+
     dr = data.get("dom_result") or {}
     for tok in dr.get("tokens", []):
-        findings.append(tok)
-    # Also scan network responses for Bearer tokens
-    seen_net = set()
+        t = tok.get("token","")
+        if t and t not in seen_net:
+            seen_net.add(t)
+            findings.append(tok)
+
+    # Phase 1b: legacy network_log
     for entry in data.get("network_log", []):
         for text in [entry.get("response_body",""), entry.get("post_data","")]:
-            for m in re.finditer(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', text):
+            for m in _JWT_RE.finditer(text):
                 t = m.group(0)
                 if t not in seen_net:
                     seen_net.add(t)
-                    payload = {}
-                    try:
-                        import base64
-                        b64 = t.split(".")[1] + "=="
-                        payload = json.loads(base64.b64decode(b64.replace("-","+").replace("_","/")))
-                    except Exception:
-                        pass
-                    findings.append({"token": t, "source": f"Network: {entry['url'][:80]}",
+                    payload = _decode_jwt(t)
+                    findings.append({"token": t, "source": f"Network: {entry.get('url','')[:80]}",
                                      "payload": payload,
                                      "exp": payload.get("exp",""), "sub": payload.get("sub",""),
                                      "iss": payload.get("iss",""), "aud": payload.get("aud","")})
+
+    # Phase 2: Real-time stream intercept — catches Bearer headers, Set-Cookie JWTs, WS
+    if progress_cb:
+        progress_cb("🔴 Phase 2: real-time JWT intercept (headers + WS + response bodies)...")
+    live = _stream_intercept_sync(url, progress_cb)
+    if not live.get("error"):
+        # 2a. Authorization Bearer headers in live requests
+        for req in live.get("live_requests", []):
+            hdrs = req.get("headers", {})
+            auth = hdrs.get("authorization", "")
+            for m in _JWT_RE.finditer(auth):
+                t = m.group(0)
+                if t not in seen_net:
+                    seen_net.add(t)
+                    payload = _decode_jwt(t)
+                    findings.append({"token": t, "source": f"Bearer Header → {req.get('url','')[:70]}",
+                                     "payload": payload,
+                                     "exp": payload.get("exp",""), "sub": payload.get("sub",""),
+                                     "iss": payload.get("iss",""), "aud": payload.get("aud","")})
+
+        # 2b. Response bodies (Playwright-level — most reliable)
+        for req in live.get("live_requests", []):
+            for field in ("body",):
+                for m in _JWT_RE.finditer(req.get(field,"")):
+                    t = m.group(0)
+                    if t not in seen_net:
+                        seen_net.add(t)
+                        payload = _decode_jwt(t)
+                        findings.append({"token": t, "source": f"Live body → {req.get('url','')[:70]}",
+                                         "payload": payload,
+                                         "exp": payload.get("exp",""), "sub": payload.get("sub",""),
+                                         "iss": payload.get("iss",""), "aud": payload.get("aud","")})
+
+        # 2c. WebSocket frames
+        for wsf in live.get("ws_frames", []):
+            for m in _JWT_RE.finditer(wsf.get("payload","")):
+                t = m.group(0)
+                if t not in seen_net:
+                    seen_net.add(t)
+                    payload = _decode_jwt(t)
+                    findings.append({"token": t, "source": f"WebSocket ({wsf.get('dir','')}) → {wsf.get('url','')[:60]}",
+                                     "payload": payload,
+                                     "exp": payload.get("exp",""), "sub": payload.get("sub",""),
+                                     "iss": payload.get("iss",""), "aud": payload.get("aud","")})
+
     return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+            "requests": len(data.get("network_log", [])) + len(live.get("live_requests", []))}
 
 
 async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -21961,73 +22213,165 @@ def _get_page_fingerprint(url: str, timeout: int = 6) -> tuple:
 
 def _detect_catchall(base_url: str) -> tuple:
     """
-    Request a random non-existent path — if it returns 200,
-    the server has a catch-all (Cloudflare, custom 404 as 200).
-    Returns (is_catchall: bool, baseline_hash: str, baseline_len: int)
+    Dual-probe catch-all detection with difflib similarity check.
+    Uses two independent random paths to cross-confirm catch-all behaviour,
+    and stores the baseline body bytes for per-probe similarity comparison.
+
+    Returns (is_catchall: bool, baseline_hash: str, baseline_len: int,
+             baseline_body: bytes)
+    The 4th element (baseline_body) is used by _probe_one for difflib ratio.
     """
-    rand_path = '/' + ''.join(random.choices(string.ascii_lowercase, k=16)) + '.html'
-    status, body_hash, ct_len, ct = _get_page_fingerprint(base_url.rstrip('/') + rand_path)
-    if status == 200:
-        return True, body_hash, ct_len   # catch-all confirmed
-    return False, '', 0
+    import string as _str
+    def _rand_path():
+        name = ''.join(random.choices(_str.ascii_lowercase, k=18))
+        return '/' + name + random.choice(['.html', '.php', '.json', ''])
+
+    base = base_url.rstrip('/')
+    path1 = _rand_path()
+    path2 = _rand_path()
+
+    try:
+        r1 = requests.get(base + path1, headers=_get_headers(), timeout=7,
+                          stream=True, allow_redirects=True, verify=False,
+                          proxies=proxy_manager.get_proxy())
+        s1 = r1.status_code
+        body1 = b''.join(list(r1.iter_content(2048))[:2])
+        r1.close()
+    except Exception:
+        s1, body1 = 0, b''
+
+    if s1 != 200:
+        return False, '', 0, b''
+
+    # Second probe — confirms first isn't a coincidental 200
+    try:
+        r2 = requests.get(base + path2, headers=_get_headers(), timeout=7,
+                          stream=True, allow_redirects=True, verify=False,
+                          proxies=proxy_manager.get_proxy())
+        s2 = r2.status_code
+        body2 = b''.join(list(r2.iter_content(2048))[:2])
+        r2.close()
+    except Exception:
+        s2, body2 = 0, b''
+
+    if s2 != 200:
+        # Only first path returned 200 — could be coincidence, not a true catch-all
+        return False, '', 0, b''
+
+    # Both random paths return 200 → confirmed catch-all
+    baseline_body = body1[:1024]
+    baseline_hash = hashlib.md5(baseline_body[:512]).hexdigest()
+    baseline_len  = len(baseline_body)
+    return True, baseline_hash, baseline_len, baseline_body
 
 
 def _is_fake_200_content(body: bytes, ct: str) -> bool:
     if 'html' not in ct.lower():
         return False
-    snippet = body[:800].lower()
+    # Check first 2 KB instead of 800 bytes — some sites embed 404 signals deeper
+    snippet = body[:2048].lower()
     return any(s in snippet for s in _FAKE_SIGS)
 
 
 def _probe_one(
     base_url: str, path: str, label: str, severity: str,
     catchall: bool, baseline_hash: str, baseline_len: int,
-    delay: float = 0.0
+    delay: float = 0.0,
+    baseline_body: bytes = b'',
+    session: "requests.Session | None" = None,
 ) -> dict | None:
     """
     Probe one path — GET + stream.
-    Compares against baseline to filter catch-all false positives.
+    Improvements over v17:
+      • difflib.SequenceMatcher similarity check (catch-all resilience)
+      • Reads 4 KB instead of 1 KB for better fake-200 detection
+      • Content-type based confidence: JSON/XML/plain on .env/.git = auto-CRITICAL
+      • Accepts optional pre-built requests.Session (connection reuse)
+      • Retry once on Timeout before giving up
     """
     if delay > 0:
         time.sleep(delay)
 
     full_url = base_url.rstrip('/') + path
-    try:
-        resp = requests.get(
+    _req = session if session is not None else requests
+
+    def _do_get():
+        return _req.get(
             full_url, headers=_get_headers(),
-            timeout=8, stream=True,
+            timeout=9, stream=True,
             allow_redirects=True, verify=False,
-            proxies=proxy_manager.get_proxy(),
+            proxies=proxy_manager.get_proxy() if session is None else None,
         )
+
+    try:
+        resp = _do_get()
+    except requests.exceptions.Timeout:
+        # Single retry on timeout
+        try:
+            resp = _do_get()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    try:
         status = resp.status_code
         ct     = resp.headers.get('Content-Type', '')
 
         if status == 200:
+            # Read up to 4 KB for better fake-200 / similarity detection
             chunk = b''
-            for part in resp.iter_content(1024):
+            for part in resp.iter_content(512):
                 chunk += part
-                if len(chunk) >= 1024: break
+                if len(chunk) >= 4096: break
             resp.close()
 
-            # ── Catch-all filter ──────────────────
+            # ── Catch-all filter — triple-check ──
             if catchall:
                 page_hash = hashlib.md5(chunk[:512]).hexdigest()
-                page_len  = int(resp.headers.get('Content-Length', len(chunk)))
-                # Same hash or very similar length = catch-all page
+                page_len  = len(chunk)
+
+                # 1. Exact hash match
                 if page_hash == baseline_hash:
                     return None
-                if baseline_len > 0 and abs(page_len - baseline_len) < 50:
-                    return None
+
+                # 2. Length within ±5 % of baseline (handles gzip variance)
+                if baseline_len > 0:
+                    ratio = abs(page_len - baseline_len) / max(baseline_len, 1)
+                    if ratio < 0.05:
+                        return None
+
+                # 3. difflib content similarity > 0.92 → same page with tiny variation
+                if baseline_body:
+                    sim = difflib.SequenceMatcher(
+                        None, baseline_body[:512], chunk[:512], autojunk=False
+                    ).ratio()
+                    if sim > 0.92:
+                        return None
 
             # ── Fake 200 (custom 404 HTML) ────────
             if _is_fake_200_content(chunk, ct):
                 return None
+
+            # ── Content-type confidence boost ─────
+            ct_lower = ct.lower()
+            _is_data_ct = any(x in ct_lower for x in (
+                'json', 'xml', 'plain', 'yaml', 'toml', 'env', 'ini', 'text'
+            ))
+            _is_sensitive_path = any(x in path.lower() for x in (
+                '.env', '.git', 'config', 'backup', 'dump', 'secret', 'key',
+                'passwd', 'shadow', 'db', 'sql', 'log', 'admin', 'credential'
+            ))
+            # Non-HTML data response on a sensitive path → escalate to CRITICAL
+            if _is_data_ct and _is_sensitive_path and severity not in ("CRITICAL",):
+                severity = "CRITICAL"
 
             size = int(resp.headers.get('Content-Length', len(chunk)))
             return {
                 "path": path, "full_url": full_url,
                 "label": label, "severity": severity,
                 "status": 200, "protected": False, "size": size,
+                "content_type": ct[:60],
             }
 
         elif status == 403 and severity in ("CRITICAL","HIGH"):
@@ -22059,10 +22403,10 @@ def _probe_one(
             try: resp.close()
             except: pass
 
-    except requests.exceptions.Timeout:
-        pass
     except Exception:
-        pass
+        try: resp.close()
+        except: pass
+
     return None
 
 
@@ -22101,30 +22445,50 @@ def _verify_subdomain_real(sub_url: str) -> bool:
 def _scan_target_sync(
     target_url: str, delay_per_req: float = 0.3
 ) -> tuple:
-    """Scan one URL with catch-all detection and delays."""
+    """
+    Scan one URL with catch-all detection and delays.
+    v18 improvements:
+      • Shared requests.Session per scan (TCP connection reuse, ~30% faster)
+      • baseline_body passed to _probe_one for difflib similarity check
+      • _detect_catchall now returns 4-tuple (unpack safely)
+    """
     exposed   = []
     protected = []
 
-    # Detect catch-all first
-    catchall, baseline_hash, baseline_len = _detect_catchall(target_url)
+    # Detect catch-all first — v18 returns 4-tuple
+    _catchall_result = _detect_catchall(target_url)
+    if len(_catchall_result) == 4:
+        catchall, baseline_hash, baseline_len, baseline_body = _catchall_result
+    else:
+        catchall, baseline_hash, baseline_len = _catchall_result
+        baseline_body = b''
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+    # Shared session — one TCP handshake per host, reused across all probes
+    _session = requests.Session()
+    _session.headers.update(_get_headers())
+    _session.proxies = proxy_manager.get_proxy() or {}
+    _session.verify  = False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         fmap = {
             ex.submit(
                 _probe_one, target_url, path, label, sev,
                 catchall, baseline_hash, baseline_len,
-                delay_per_req * (i % 5)   # stagger delays 0/0.3/0.6/0.9/1.2s
+                delay_per_req * (i % 5),   # stagger 0/0.3/0.6/0.9/1.2s
+                baseline_body,
+                _session,
             ): (path, label, sev)
             for i, (path, label, sev) in enumerate(_VULN_PATHS)
         }
-        for fut in concurrent.futures.as_completed(fmap, timeout=120):
+        for fut in concurrent.futures.as_completed(fmap, timeout=150):
             try:
-                f = fut.result(timeout=15)
+                f = fut.result(timeout=18)
                 if f:
                     (protected if f["protected"] else exposed).append(f)
             except Exception:
                 pass
 
+    _session.close()
     exposed.sort(key=lambda x: _SEV_ORDER.get(x["severity"],9))
     protected.sort(key=lambda x: _SEV_ORDER.get(x["severity"],9))
     return exposed, protected, catchall
@@ -23422,6 +23786,626 @@ def _bypass_sync(url: str) -> list:
     return results
 
 
+
+# ══════════════════════════════════════════════════════════════
+# /payload — Request Payload Structure Extractor (Patterns + Helpers)
+# ══════════════════════════════════════════════════════════════
+_PAYMENT_GATEWAYS = [
+    ("Stripe",       re.compile(r'stripe\.com/v\d|Stripe\.js|stripe\.createToken|stripe\.confirmCard', re.I),
+                     re.compile(r'api\.stripe\.com', re.I), "💳"),
+    ("PayPal",       re.compile(r'paypal\.com/sdk|paypal\.Buttons|PAYPAL', re.I),
+                     re.compile(r'paypal\.com/v\d|paypalobjects', re.I), "🅿️"),
+    ("Braintree",    re.compile(r'braintree|braintreepayments|braintree\.setup', re.I),
+                     re.compile(r'braintreegateway\.com|payments\.braintree', re.I), "🌿"),
+    ("Square",       re.compile(r'squareup\.com|Square\.payments|sq-payment', re.I),
+                     re.compile(r'squareup\.com/v\d', re.I), "⬛"),
+    ("Adyen",        re.compile(r'adyen\.com|AdyenCheckout|adyen\.encrypt', re.I),
+                     re.compile(r'adyen\.com/v\d|checkout\.adyen', re.I), "🔷"),
+    ("Razorpay",     re.compile(r'razorpay\.com|Razorpay\(', re.I),
+                     re.compile(r'api\.razorpay\.com', re.I), "🇮🇳"),
+    ("2Checkout",    re.compile(r'2checkout|TCO\.loadCart|avangate', re.I),
+                     re.compile(r'2co\.com|2checkout\.com', re.I), "2️⃣"),
+    ("Authorize.Net",re.compile(r'authorize\.net|Accept\.js|authorizenet', re.I),
+                     re.compile(r'api\.authorize\.net|accept\.authorize', re.I), "🏦"),
+    ("Klarna",       re.compile(r'klarna\.com|KlarnaCheckout|klarna\.load', re.I),
+                     re.compile(r'klarna\.com/v\d|api\.klarna', re.I), "🟢"),
+    ("Mollie",       re.compile(r'mollie\.com|Mollie\.createPayment', re.I),
+                     re.compile(r'api\.mollie\.com', re.I), "🟡"),
+    ("WooCommerce",  re.compile(r'woocommerce|wc_checkout|wc-checkout', re.I),
+                     re.compile(r'/wc-api/|wc/v\d/orders', re.I), "🛒"),
+    ("Shopify",      re.compile(r'shopify\.com|Shopify\.checkout|shopify_checkout', re.I),
+                     re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "🛍️"),
+]
+
+# ── Card Field Patterns ────────────────────────────────────────
+_CARD_FIELDS = [
+    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|card$', re.I),
+     "Card Number", "💳", True),
+    (re.compile(r'cvv|cvc|csc|card.?code|security.?code|cvv2', re.I),
+     "CVV/CVC", "🔐", True),
+    (re.compile(r'exp.?date|expiry|exp.?month|exp.?year|card.?exp|mm.?yy|valid.?thru', re.I),
+     "Expiry", "📅", True),
+    (re.compile(r'card.?holder|cardholder|name.?on.?card|billing.?name', re.I),
+     "Cardholder Name", "👤", False),
+    (re.compile(r'billing.?zip|billing.?postal|billing.?address|billing.?city', re.I),
+     "Billing Address", "🏠", False),
+    (re.compile(r'amount|total|price|subtotal|grand.?total', re.I),
+     "Amount", "💰", False),
+    (re.compile(r'currency|cur$', re.I),
+     "Currency", "💱", False),
+    (re.compile(r'order.?id|transaction.?id|payment.?id|invoice', re.I),
+     "Order/Txn ID", "🧾", True),
+]
+
+# ── Dynamic field patterns ─────────────────────────────────────
+_DYNAMIC_PATTERNS = [
+    (re.compile(r'csrf', re.I),                        "CSRF Token",   "🔄"),
+    (re.compile(r'nonce', re.I),                       "Nonce",        "🔄"),
+    (re.compile(r'_token$', re.I),                     "CSRF Token",   "🔄"),
+    (re.compile(r'authenticity_token', re.I),          "Rails CSRF",   "🔄"),
+    (re.compile(r'__requestverification', re.I),       "ASP.NET CSRF", "🔄"),
+    (re.compile(r'session', re.I),                     "Session ID",   "🔑"),
+    (re.compile(r'sess_?id', re.I),                    "Session ID",   "🔑"),
+    (re.compile(r'phpsessid', re.I),                   "PHP Session",  "🔑"),
+    (re.compile(r'timestamp|expires?_?at|exp$', re.I), "Timestamp",    "⏱️"),
+    (re.compile(r'otp|verification_?code|pin$', re.I), "OTP/Code",     "📟"),
+    (re.compile(r'captcha|recaptcha|h-captcha', re.I), "Captcha",      "🤖"),
+    (re.compile(r'sig(nature)?$|hmac|checksum', re.I), "Signature",    "🔏"),
+    (re.compile(r'payment.?token|pay.?token|pm_', re.I),"Pay Token",   "🔄"),
+    (re.compile(r'client.?secret|publishable.?key', re.I),"PK/Secret", "🔑"),
+]
+
+_STATIC_KEYWORDS = re.compile(
+    r'redirect_?uri|client_id|app_?id|return_?url|'
+    r'action|method|lang|locale|country|currency|'
+    r'product_id|item_id|plan|tier|version',
+    re.I
+)
+
+
+# ══════════════════════════════════════════════════════════════
+# ── Helpers ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def _classify_field(name: str, value: str) -> tuple:
+    """Returns: (label, icon, is_dynamic, card_type_or_None)"""
+    for pattern, label, icon, sensitive in _CARD_FIELDS:
+        if pattern.search(name):
+            return label, icon, sensitive, label
+    for pattern, label, icon in _DYNAMIC_PATTERNS:
+        if pattern.search(name):
+            return label, icon, True, None
+    if value and len(value) > 20 and re.match(r'^[A-Za-z0-9+/=_\-]+$', value):
+        return "Dynamic Token", "🔄", True, None
+    if _STATIC_KEYWORDS.search(name):
+        return "Static Param", "📌", False, None
+    return "User Input", "✏️", False, None
+
+
+def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
+    """HTML + JS မှ payment gateway detect လုပ်သည်။"""
+    combined   = html + js_sources
+    tokenized  = bool(re.search(
+        r'createToken|createPaymentMethod|tokenize|\.token\b|paymentIntent|'
+        r'stripe\.js|braintree\.js|accept\.js', combined, re.I))
+    iframe_based = bool(re.search(
+        r'stripe\.elements|paypal\.Buttons|dropin\.create|<iframe[^>]+(stripe|paypal|braintree)',
+        combined, re.I))
+    raw_post = not tokenized and not iframe_based
+
+    found = []
+    for name, js_pat, ep_pat, icon in _PAYMENT_GATEWAYS:
+        confidence = 0
+        if js_pat.search(combined):  confidence += 2
+        if ep_pat.search(combined):  confidence += 2
+        if confidence > 0:
+            if iframe_based:
+                tok = "🔒 iframe/Hosted Fields (card data never touches server)"
+            elif tokenized:
+                tok = "🔐 JS Tokenization (card → token before POST)"
+            else:
+                tok = "⚠️ Possibly Raw POST (card data may reach server)"
+            found.append({
+                'name': name, 'icon': icon,
+                'confidence': confidence,
+                'tokenization': tok,
+                'raw_post_risk': raw_post,
+            })
+    return sorted(found, key=lambda x: -x['confidence'])
+
+
+def _extract_forms_static(html: str, page_url: str) -> list:
+    """BeautifulSoup ဖြင့် <form> မှ payload structure ထုတ်သည်။"""
+    from bs4 import BeautifulSoup
+    soup    = BeautifulSoup(html, 'html.parser')
+    results = []
+    for idx, form in enumerate(soup.find_all('form')):
+        action  = form.get('action', '')
+        method  = form.get('method', 'GET').upper()
+        enctype = form.get('enctype', 'application/x-www-form-urlencoded')
+        endpoint = (urljoin(page_url, action)
+                    if action and not action.startswith('http') else (action or page_url))
+        fields = []
+        for inp in form.find_all(['input', 'textarea', 'select']):
+            name  = inp.get('name') or inp.get('id') or ''
+            if not name: continue
+            ftype = inp.get('type', 'text').lower()
+            value = inp.get('value', '')
+            req   = inp.has_attr('required')
+            label, icon, is_dyn, card_type = _classify_field(name, value)
+            fields.append({
+                'name': name, 'type': ftype, 'value': value[:80],
+                'required': req, 'field_label': label, 'icon': icon,
+                'is_dynamic': is_dyn, 'is_card': card_type is not None,
+                'card_type': card_type,
+            })
+        card_fields = [f for f in fields if f.get('is_card')]
+        results.append({
+            'source': 'static', 'form_idx': idx + 1,
+            'endpoint': endpoint, 'method': method, 'enctype': enctype,
+            'fields': fields, 'card_fields': card_fields,
+            'is_payment': len(card_fields) > 0,
+        })
+    return results
+
+
+def _extract_requests_playwright(url: str, progress_cb=None) -> list:
+    """Playwright network intercept — fetch/XHR POST ဖမ်းသည်။"""
+    if not PLAYWRIGHT_OK:
+        return []
+    safe, _ = is_safe_url(url)
+    if not safe:
+        return []
+
+    captured = []
+    js_text  = ''
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled","--disable-gpu"])
+            ctx = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/122.0.0.0 Safari/537.36"),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True)
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            page = ctx.new_page()
+
+            def on_request(request):
+                if request.method not in ('POST','PUT','PATCH'): return
+                try:
+                    body     = request.post_data or ''
+                    ct       = request.headers.get('content-type','')
+                    endpoint = request.url
+                    fields   = []
+
+                    if 'json' in ct:
+                        try:
+                            data = json.loads(body)
+                            if isinstance(data, dict):
+                                for k, v in data.items():
+                                    label,icon,is_dyn,card_type = _classify_field(k,str(v))
+                                    fields.append({'name':k,'type':'json','value':str(v)[:80],
+                                        'required':True,'field_label':label,'icon':icon,
+                                        'is_dynamic':is_dyn,'is_card':card_type is not None,
+                                        'card_type':card_type})
+                        except Exception: pass
+                    elif 'urlencoded' in ct or 'form' in ct:
+                        try:
+                            for k,vals in parse_qs(body).items():
+                                v = vals[0] if vals else ''
+                                label,icon,is_dyn,card_type = _classify_field(k,v)
+                                fields.append({'name':k,'type':'form','value':v[:80],
+                                    'required':True,'field_label':label,'icon':icon,
+                                    'is_dynamic':is_dyn,'is_card':card_type is not None,
+                                    'card_type':card_type})
+                        except Exception: pass
+                    elif 'multipart' in ct:
+                        for match in re.finditer(r'name="([^"]+)"', body):
+                            k = match.group(1)
+                            label,icon,is_dyn,card_type = _classify_field(k,'')
+                            fields.append({'name':k,'type':'multipart','value':'',
+                                'required':False,'field_label':label,'icon':icon,
+                                'is_dynamic':is_dyn,'is_card':card_type is not None,
+                                'card_type':card_type})
+
+                    card_fields = [f for f in fields if f.get('is_card')]
+                    if fields or body:
+                        captured.append({
+                            'source':'playwright','form_idx':len(captured)+1,
+                            'endpoint':endpoint,'method':request.method,'enctype':ct or 'unknown',
+                            'fields':fields,'card_fields':card_fields,
+                            'is_payment':len(card_fields)>0,
+                            'raw_body': body[:200] if not fields else '',
+                        })
+                except Exception: pass
+
+            page.on('request', on_request)
+            if progress_cb: progress_cb("🌐 Playwright loading + intercepting...")
+
+            try: page.goto(url, wait_until="networkidle", timeout=40_000)
+            except Exception:
+                try: page.goto(url, wait_until="load", timeout=25_000)
+                except Exception: pass
+            try: page.wait_for_timeout(3000)
+            except Exception: pass
+
+            # Grab JS source for gateway detection
+            try:
+                for s in page.query_selector_all('script[src]'):
+                    src = s.get_attribute('src') or ''
+                    if src:
+                        full = urljoin(url,src) if not src.startswith('http') else src
+                        try:
+                            r = requests.get(full, timeout=5, verify=False, headers=_get_headers())
+                            if r.status_code == 200: js_text += r.text[:50000]
+                        except Exception: pass
+            except Exception: pass
+
+            browser.close()
+    except Exception as e:
+        logger.warning(f"Playwright payload intercept error: {e}")
+
+    # Attach js_text to first captured item for gateway detection
+    if captured:
+        captured[0]['_js_text'] = js_text
+    elif js_text:
+        captured.append({'_js_text': js_text, '_js_only': True})
+
+    return captured
+
+
+
+# ══════════════════════════════════════════════════════════════
+# ── Header Requirement Detection  (Phase 5) ───────────────────
+# ══════════════════════════════════════════════════════════════
+
+_PROBE_HEADERS = [
+    ("X-CSRF-Token",      "CSRF protection token",       "🛡️",
+     "Anti-CSRF — server rejects requests without valid token"),
+    ("X-Requested-With",  "XMLHttpRequest marker",       "📡",
+     "Marks request as AJAX — required by WP/Laravel/Django"),
+    ("Referer",           "Request origin URL",          "🔗",
+     "Origin check — missing Referer may trigger 403/block"),
+    ("User-Agent",        "Browser identity string",     "🌐",
+     "Bot detection — missing/generic UA triggers WAF block"),
+    ("Origin",            "Cross-origin source",         "🌍",
+     "CORS enforcement — required for cross-origin POST"),
+    ("Accept",            "Accepted response types",     "📥",
+     "Content negotiation — some APIs require specific Accept"),
+    ("Accept-Language",   "Language preference",         "🗣️",
+     "Locale enforcement — some sites geo-block without it"),
+    ("Cookie",            "Session / auth cookies",      "🍪",
+     "Session state — required for authenticated endpoints"),
+    ("Authorization",     "Bearer / Basic auth token",   "🔐",
+     "API auth — required for protected REST endpoints"),
+    ("Content-Type",      "Request body format",         "📦",
+     "Body parsing — server needs this to decode POST payload"),
+]
+
+_HDR_STATUS = {
+    "required":    ("🔴 Required",  "Request fails/blocked without this header"),
+    "important":   ("🟡 Important", "Affects behavior — may cause 403 or partial response"),
+    "optional":    ("🟢 Optional",  "Server accepts without it"),
+    "not_checked": ("⚪ Unknown",   "Could not determine — test manually"),
+}
+
+
+def _probe_header_requirement(url: str, progress_cb=None) -> list:
+    """
+    Each header ကို ဖြုတ်ပြီး request ပို့引 response ကွာခြားမှု စစ်ဆေးသည်။
+    Returns: list of header result dicts
+    """
+    base_headers = {
+        "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/122.0.0.0 Safari/537.36"),
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":         url,
+        "Origin":          f"{urlparse(url).scheme}://{urlparse(url).netloc}",
+        "X-Requested-With":"XMLHttpRequest",
+        "X-CSRF-Token":    "probe-token-value",
+        "Content-Type":    "application/x-www-form-urlencoded",
+    }
+
+    try:
+        base_resp   = requests.get(url, headers=base_headers,
+                                   timeout=TIMEOUT, verify=False, allow_redirects=True)
+        base_status = base_resp.status_code
+        base_len    = len(base_resp.content)
+    except Exception:
+        return []
+
+    if progress_cb:
+        progress_cb(f"📋 Baseline {base_status} ({base_len}B) — probing headers...")
+
+    results = []
+    for hdr_name, description, icon, reason in _PROBE_HEADERS:
+        probe_hdrs = {k: v for k, v in base_headers.items()
+                      if k.lower() != hdr_name.lower()}
+        status_key   = "not_checked"
+        probe_status = None
+        probe_len    = None
+        notes        = ""
+
+        try:
+            r            = requests.get(url, headers=probe_hdrs,
+                                        timeout=TIMEOUT, verify=False, allow_redirects=True)
+            probe_status = r.status_code
+            probe_len    = len(r.content)
+
+            if probe_status in (400, 401, 403, 405, 419, 422, 429):
+                status_key = "required"
+                notes      = f"Without header → {probe_status}"
+            elif probe_status != base_status:
+                status_key = "important"
+                notes      = f"Status changed: {base_status} → {probe_status}"
+            elif probe_len < base_len * 0.7:
+                status_key = "important"
+                notes      = f"Body shrank: {base_len}B → {probe_len}B"
+            else:
+                status_key = "optional"
+                notes      = f"No change ({probe_status}, {probe_len}B)"
+        except Exception as e:
+            status_key = "not_checked"
+            notes      = str(e)[:60]
+
+        label, meaning = _HDR_STATUS[status_key]
+        results.append({
+            "header":       hdr_name,
+            "description":  description,
+            "icon":         icon,
+            "reason":       reason,
+            "status_key":   status_key,
+            "status_label": label,
+            "meaning":      meaning,
+            "base_status":  base_status,
+            "probe_status": probe_status,
+            "probe_len":    probe_len,
+            "notes":        notes,
+        })
+
+    return results
+
+def _payload_sync(url: str, progress_cb=None) -> dict:
+    """Main sync — static + playwright + payment + header detection."""
+    if progress_cb: progress_cb("⬇️ Fetching HTML...")
+
+    static_html = ''
+    try:
+        resp = requests.get(url, headers=_get_headers(),
+                            timeout=TIMEOUT, verify=False, allow_redirects=True)
+        static_html = resp.text
+    except Exception: pass
+
+    static_forms = _extract_forms_static(static_html, url) if static_html else []
+    if progress_cb: progress_cb(f"📋 {len(static_forms)} form(s) — Playwright launching...")
+
+    pw_requests = _extract_requests_playwright(url, progress_cb)
+
+    js_html  = fetch_with_playwright(url) or ''
+    js_forms = []
+    if js_html and js_html != static_html:
+        js_forms = _extract_forms_static(js_html, url)
+        existing = {(f['endpoint'],f['method']) for f in static_forms}
+        js_forms = [f for f in js_forms if (f['endpoint'],f['method']) not in existing]
+        for f in js_forms: f['source'] = 'js_render'
+
+    # Extract js_text & clean internal entries
+    js_text = ''
+    real_requests = []
+    for r in pw_requests:
+        if r.pop('_js_only', False):
+            js_text = r.pop('_js_text','')
+        else:
+            js_text += r.pop('_js_text','')
+            real_requests.append(r)
+
+    gateways = _detect_payment_gateway(static_html + js_html, js_text)
+    if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
+
+    # Phase 5: Header requirement probing
+    if progress_cb: progress_cb("🔍 Probing header requirements...")
+    headers_result = _probe_header_requirement(url, progress_cb)
+
+    return {
+        'url':      url,
+        'forms':    static_forms + js_forms,
+        'requests': real_requests,
+        'gateways': gateways,
+        'headers':  headers_result,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# ── Formatters ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def _format_payload_report(data: dict) -> str:
+    url       = data.get('url','')
+    domain    = urlparse(url).hostname or url
+    forms     = data.get('forms',[])
+    requests_ = data.get('requests',[])
+    gateways  = data.get('gateways',[])
+
+    lines = [
+        f"🧩 *Payload Structure — `{escape_md(domain)}`*",
+        f"🔗 `{escape_md(url[:80])}`\n",
+    ]
+
+    # ── Payment Gateway Section ──────────────────────────────
+    if gateways:
+        lines.append("━━━ 💳 Payment Gateways ━━━")
+        for gw in gateways:
+            lines.append(f"{gw['icon']} *{escape_md(gw['name'])}* (conf: {'⭐'*gw['confidence']})")
+            lines.append(f"   {escape_md(gw['tokenization'])}")
+            if gw.get('raw_post_risk'):
+                lines.append("   🚨 *Raw POST risk* — card data may be sent unmasked")
+        lines.append("")
+
+    total    = len(forms) + len(requests_)
+    pay_cnt  = sum(1 for e in forms + requests_ if e.get('is_payment'))
+
+    if total == 0:
+        lines.append("ℹ️ No forms or intercepted requests found.")
+        return '\n'.join(lines)
+
+    lines.append(
+        f"📊 `{len(forms)}` form(s) + `{len(requests_)}` XHR — "
+        f"💳 `{pay_cnt}` payment endpoint(s)\n")
+
+    for f in forms:    f['_label'] = '📋 Form'
+    for r in requests_: r['_label'] = '🌐 XHR/Fetch'
+
+    # Payment endpoints first
+    all_entries = forms + requests_
+    ordered = ([e for e in all_entries if e.get('is_payment')] +
+               [e for e in all_entries if not e.get('is_payment')])
+
+    for entry in ordered[:8]:
+        src    = entry.get('_label','📋')
+        ep     = entry.get('endpoint','')
+        method = entry.get('method','POST')
+        ct     = entry.get('enctype','')
+        fields = entry.get('fields',[])
+        is_pay = entry.get('is_payment', False)
+
+        pay_badge = " 💳" if is_pay else ""
+        lines.append(f"{'─'*32}")
+        lines.append(f"{src}{pay_badge} `{escape_md(method)}` → `{escape_md(ep[:68])}`")
+        lines.append(f"📦 `{escape_md(ct[:50])}`")
+
+        if not fields:
+            rb = entry.get('raw_body','')
+            lines.append(f"📝 `{escape_md(rb[:100])}`" if rb else "⚠️ No extractable fields")
+            continue
+
+        card_f = [f for f in fields if f.get('is_card')]
+        dyn_f  = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
+        stat_f = [f for f in fields if not f.get('is_dynamic') and not f.get('is_card')]
+
+        if card_f:
+            lines.append(f"\n💳 *Card Fields* ({len(card_f)}):")
+            for f in card_f:
+                req = "\\*" if f.get('required') else ""
+                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req} [{escape_md(f['field_label'])}]")
+
+        if dyn_f:
+            lines.append(f"\n🔄 *Dynamic Fields* ({len(dyn_f)}):")
+            for f in dyn_f[:8]:
+                req = "\\*" if f.get('required') else ""
+                val = f"`{escape_md(f['value'][:30])}`" if f['value'] else "_auto_"
+                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req} [{escape_md(f['field_label'])}] = {val}")
+
+        if stat_f:
+            lines.append(f"\n📌 *Static Fields* ({len(stat_f)}):")
+            for f in stat_f[:8]:
+                req = "\\*" if f.get('required') else ""
+                val = f"`{escape_md(f['value'][:30])}`" if f['value'] else "_empty_"
+                lines.append(f"  {f['icon']} `{escape_md(f['name'])}`{req} [{escape_md(f['field_label'])}] = {val}")
+
+    if total > 8:
+        lines.append(f"\n_... +{total-8} more — see JSON file_")
+
+    # ── Header Requirements Section ──────────────────────────
+    headers_result = data.get('headers', [])
+    if headers_result:
+        lines.append(f"\n{'━'*32}")
+        lines.append("🔍 *Header Requirements*")
+        req  = [h for h in headers_result if h['status_key'] == 'required']
+        imp  = [h for h in headers_result if h['status_key'] == 'important']
+        opt  = [h for h in headers_result if h['status_key'] == 'optional']
+        unk  = [h for h in headers_result if h['status_key'] == 'not_checked']
+
+        for group, label in [(req, "🔴 Required"), (imp, "🟡 Important"),
+                              (opt, "🟢 Optional"), (unk, "⚪ Unknown")]:
+            if not group: continue
+            lines.append(f"\n*{label}* ({len(group)}):")
+            for h in group:
+                lines.append(
+                    f"  {h['icon']} `{escape_md(h['header'])}` — "
+                    f"_{escape_md(h['notes'])}_"
+                )
+
+    lines.append(f"\n{'─'*32}")
+    lines.append("🔑 Legend: 💳 Card  🔄 Dynamic  📌 Static  ✏️ User  🔑 Session  ⏱️ Time  📟 OTP  🤖 Captcha")
+    lines.append("⚠️ _For authorized security testing only._")
+    return '\n'.join(lines)
+
+
+def _build_json_export(data: dict) -> str:
+    """Full JSON export — clean version."""
+    clean = {
+        'url':      data.get('url'),
+        'gateways': data.get('gateways',[]),
+        'forms':    [],
+        'requests': [],
+    }
+    for entry in data.get('forms',[]):
+        clean['forms'].append({
+            'source':     entry.get('source'),
+            'endpoint':   entry.get('endpoint'),
+            'method':     entry.get('method'),
+            'enctype':    entry.get('enctype'),
+            'is_payment': entry.get('is_payment', False),
+            'fields': [{
+                'name':        f['name'],
+                'type':        f['type'],
+                'value':       f['value'],
+                'required':    f['required'],
+                'field_label': f['field_label'],
+                'is_dynamic':  f['is_dynamic'],
+                'is_card':     f.get('is_card', False),
+                'card_type':   f.get('card_type'),
+            } for f in entry.get('fields', [])]
+        })
+    for entry in data.get('requests',[]):
+        clean['requests'].append({
+            'endpoint':   entry.get('endpoint'),
+            'method':     entry.get('method'),
+            'enctype':    entry.get('enctype'),
+            'is_payment': entry.get('is_payment', False),
+            'raw_body':   entry.get('raw_body',''),
+            'fields': [{
+                'name':        f['name'],
+                'type':        f['type'],
+                'value':       f['value'],
+                'required':    f['required'],
+                'field_label': f['field_label'],
+                'is_dynamic':  f['is_dynamic'],
+                'is_card':     f.get('is_card', False),
+                'card_type':   f.get('card_type'),
+            } for f in entry.get('fields', [])]
+        })
+    # Headers
+    clean['headers'] = [
+        {
+            'header':       h['header'],
+            'description':  h['description'],
+            'status':       h['status_key'],
+            'status_label': h['status_label'],
+            'reason':       h['reason'],
+            'base_status':  h['base_status'],
+            'probe_status': h['probe_status'],
+            'notes':        h['notes'],
+        }
+        for h in data.get('headers', [])
+    ]
+    return json.dumps(clean, indent=2, ensure_ascii=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# ── CMD HANDLER ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+
 async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/bypass403 <url> — Test 403 Forbidden bypass techniques"""
     if not context.args:
@@ -23540,6 +24524,97 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
 
+
+
+
+async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payload <url> — Extract request payload + payment structure (JSON export)"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/payload https://example.com`\n\n"
+            "🧩 *Extracts:*\n"
+            "  • Form endpoints + HTTP methods\n"
+            "  • All fields (name, type, value)\n"
+            "  • 💳 Card fields (number, CVV, expiry)\n"
+            "  • 🔄 Dynamic fields (CSRF, Nonce, Session, OTP)\n"
+            "  • 📌 Static fields (IDs, redirect URLs)\n"
+            "  • 💳 Payment gateway detection\n"
+            "     (Stripe / PayPal / Braintree / Square / Adyen…)\n"
+            "  • Tokenization method analysis\n\n"
+            "🔬 *Methods:* Static HTML + Playwright JS render + XHR intercept\n"
+            "  • 🔍 Header requirements\n"
+            "     (X-CSRF-Token, Referer, User-Agent, X-Requested-With…)\n\n"
+            "📄 *Exports full JSON file*\n\n"
+            "⚠️ _For authorized security testing only._",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).hostname or url
+
+    msg = await update.effective_message.reply_text(
+        f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n\n"
+        "⬇️ Phase 1: Static HTML parse\n"
+        "🌐 Phase 2: Playwright JS render\n"
+        "📡 Phase 3: Network intercept (XHR/fetch)\n"
+        "💳 Phase 4: Payment gateway detection\n"
+        "🔍 Phase 5: Header requirement probing\n\n⏳",
+        parse_mode='Markdown'
+    )
+
+    try:
+        data = await run_scan(uid, _payload_sync, url)
+    except asyncio.CancelledError:
+        await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
+        return
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+
+    # ── Markdown report ────────────────────────────────────────
+    report = _format_payload_report(data)
+    await msg.edit_text(report, parse_mode='Markdown')
+
+    # ── JSON file export ───────────────────────────────────────
+    try:
+        json_str = _build_json_export(data)
+        safe_dom = re.sub(r'[^\w\-]', '_', domain)[:40]
+        fname    = f"payload_{safe_dom}.json"
+        tmp_path = os.path.join(tempfile.gettempdir(), fname)
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(json_str)
+        with open(tmp_path, 'rb') as f:
+            await update.effective_message.reply_document(
+                document=f, filename=fname,
+                caption=(
+                    f"📄 *Payload JSON — `{escape_md(domain)}`*\n"
+                    f"Forms: `{len(data['forms'])}` | "
+                    f"XHR: `{len(data['requests'])}` | "
+                    f"Gateways: `{len(data['gateways'])}`"
+                ),
+                parse_mode='Markdown'
+            )
+        os.unlink(tmp_path)
+    except Exception as e:
+        logger.warning(f"payload JSON export error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════
 # 📡  /subdomains — Advanced Subdomain Enumerator
@@ -29125,6 +30200,7 @@ def main():
     app.add_handler(CommandHandler("deobfuscate",     cmd_deobfuscate))
     app.add_handler(CommandHandler("payconfig",       cmd_payconfig))
     app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
+    app.add_handler(CommandHandler("payload",         cmd_payload))
     app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
@@ -29167,7 +30243,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print("╔══════════════════════════════════════╗")
-    print("║  Website Downloader Bot v17.0        ║")
+    print("║  Website Downloader Bot v18.0        ║")
     print(f"║  SSRF Protection:     ✅             ║")
     print(f"║  Path Traversal:      ✅             ║")
     print(f"║  Rate Limiting:       ✅ ({RATE_LIMIT_SEC}s)     ║")
