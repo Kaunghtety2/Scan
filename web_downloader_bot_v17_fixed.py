@@ -8406,8 +8406,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kb_rows:
             await update.effective_message.reply_text(
                 f"🔍 *Verify Sitekeys — {len(verifiable_findings)} found*\n"
-                f"_2captcha / CapSolver API key လိုအပ်သည်_\n"
-                f"_မရှိသေးလျှင်: /setapikey 2captcha YOUR\\_KEY_",
+                f"2captcha / CapSolver API key လိုအပ်သည်\n"
+                f"မရှိသေးလျှင်: `/setapikey 2captcha YOUR_KEY`",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb_rows)
             )
@@ -24223,6 +24223,128 @@ _RECAPTCHA_SITEKEY_PATTERNS = [
     re.compile(r'(?:recaptcha|captcha|siteKey|site_key)\w*\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
 ]
 
+def _find_token_sources(html: str, js_text: str) -> list:
+    """
+    HTML + JS မှ dynamic token sources (CSRF, session, anti-replay) ကို ဖမ်းသည်။
+    Returns list of {name, value_preview, source_type, location, label}
+    """
+    found = []
+    seen  = set()
+
+    def _add(name, value_preview, source_type, location, label):
+        key = (name.lower(), source_type)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append({
+            'name':          name,
+            'value_preview': value_preview,
+            'source_type':   source_type,
+            'location':      location,
+            'label':         label,
+        })
+
+    TOKEN_NAMES = re.compile(
+        r'csrf|xsrf|token|nonce|authenticity|_token|__token|verify|secret|state|anti.?forgery',
+        re.I
+    )
+
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+    except Exception:
+        soup = None
+
+    # ── 1. Hidden input fields ─────────────────────────────────────────
+    if soup:
+        for inp in soup.find_all('input', {'type': 'hidden'}):
+            name = inp.get('name', '')
+            val  = inp.get('value', '')
+            if name and TOKEN_NAMES.search(name):
+                _add(
+                    name          = name,
+                    value_preview = (val[:40] if val else '(empty)'),
+                    source_type   = 'hidden_input',
+                    location      = 'HTML Hidden Input',
+                    label         = 'CSRF / form token injected into hidden field',
+                )
+
+    # ── 2. Meta tags ────────────────────────────────────────────────────
+    if soup:
+        for meta in soup.find_all('meta'):
+            name    = meta.get('name', '') or meta.get('property', '')
+            content = meta.get('content', '')
+            if name and TOKEN_NAMES.search(name):
+                _add(
+                    name          = name,
+                    value_preview = (content[:40] if content else '(empty)'),
+                    source_type   = 'meta_tag',
+                    location      = 'HTML <meta> Tag',
+                    label         = 'Token in meta tag (Laravel / Rails / Django pattern)',
+                )
+
+    # ── 3. JS variable assignments ──────────────────────────────────────
+    JS_VAR_PAT = re.compile(
+        r'''(?:var|let|const|window|self)\s*[\.\[]?\s*['"]?'''
+        r'''(csrf[\w\-]*|xsrf[\w\-]*|_token|csrfmiddlewaretoken|'''
+        r'''authToken|accessToken|__RequestVerificationToken|nonce)['"]?'''
+        r'''\s*[=:]\s*['"]([^'"]{6,80})['"]\s*''',
+        re.I
+    )
+    for m in JS_VAR_PAT.finditer(js_text):
+        _add(
+            name          = m.group(1),
+            value_preview = m.group(2)[:40],
+            source_type   = 'js_variable',
+            location      = 'JavaScript Source',
+            label         = 'Token hardcoded or templated into JS variable',
+        )
+
+    # ── 4. Cookie-based token reads ─────────────────────────────────────
+    COOKIE_PAT = re.compile(
+        r'''(?:getCookie|readCookie|Cookies\.get|cookie\.get|cookieStore\.get)\s*\(\s*['"]'''
+        r'''([^'"]*(?:csrf|xsrf|token|session)[^'"]*)''',
+        re.I
+    )
+    for m in COOKIE_PAT.finditer(js_text):
+        _add(
+            name          = m.group(1),
+            value_preview = '(runtime value)',
+            source_type   = 'cookie',
+            location      = 'Browser Cookie (JS read)',
+            label         = 'Token read from cookie at runtime',
+        )
+
+    # ── 5. Axios / fetch CSRF header injection ──────────────────────────
+    HEADER_PAT = re.compile(
+        r'''headers\s*[\[.]\s*['"]([^'"]*(?:csrf|xsrf|x-token)[^'"]*)['"]\s*\]\s*=\s*([^\n;,]{1,80})''',
+        re.I
+    )
+    for m in HEADER_PAT.finditer(js_text):
+        raw_val = m.group(2).strip().strip('"\'')[:40]
+        _add(
+            name          = m.group(1),
+            value_preview = raw_val if raw_val else '(runtime value)',
+            source_type   = 'js_variable',
+            location      = 'JS Request Header Assignment',
+            label         = 'CSRF token injected into request headers via JS',
+        )
+
+    # ── 6. Server-injected script blocks ────────────────────────────────
+    if soup:
+        for tag in soup.find_all('script'):
+            text = tag.string or ''
+            for m in JS_VAR_PAT.finditer(text):
+                _add(
+                    name          = m.group(1),
+                    value_preview = m.group(2)[:40],
+                    source_type   = 'server_response',
+                    location      = 'Inline <script> Block',
+                    label         = 'Server-injected token inside inline script',
+                )
+
+    return found
+
+
 def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | None:
     """
     HTML + JS မှ reCAPTCHA / hCaptcha / Turnstile site key ဖမ်းသည်။
@@ -24923,112 +25045,174 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════
-# 🔴 /payloadlive — Realtime Network Request Stream
+# 🔴 /payloadlive — Realtime Network Request Stream  (v2 improved)
 # ══════════════════════════════════════════════════════════════
 
-# Known tokenization endpoints — request ဒီ URLs တွေ သွားရင် tokenize လုပ်တယ်
+# Known tokenization + payment gateway endpoints
 _TOKENIZATION_ENDPOINTS = [
-    (re.compile(r'api\.stripe\.com', re.I),                    "Stripe",      "💳"),
+    # ── Major payment processors ────────────────────────────────
+    (re.compile(r'api\.stripe\.com', re.I),                        "Stripe",           "💳"),
+    (re.compile(r'js\.stripe\.com/v\d', re.I),                     "Stripe JS",        "💳"),
     (re.compile(r'payments\.braintree-api\.com|braintreepayments', re.I), "Braintree", "🌿"),
-    (re.compile(r'api\.paypal\.com|paypalobjects', re.I),      "PayPal",      "🅿️"),
-    (re.compile(r'accept\.authorize\.net', re.I),              "Authorize.Net","🏦"),
-    (re.compile(r'checkout\.adyen\.com|adyen\.com/v\d', re.I), "Adyen",       "🔷"),
-    (re.compile(r'api\.squareup\.com|squareup\.com/v\d', re.I),"Square",      "⬛"),
-    (re.compile(r'api\.razorpay\.com', re.I),                  "Razorpay",    "🇮🇳"),
-    (re.compile(r'api\.klarna\.com|klarna\.com/v\d', re.I),    "Klarna",      "🟢"),
-    (re.compile(r'api\.mollie\.com', re.I),                    "Mollie",      "🟡"),
-    (re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "Shopify", "🛍️"),
-    (re.compile(r'js\.stripe\.com/v\d', re.I),                 "Stripe JS",   "💳"),
-    (re.compile(r'token|tokenize|createToken|paymentMethod', re.I), "Token Endpoint", "🔐"),
+    (re.compile(r'api\.paypal\.com|paypalobjects\.com', re.I),     "PayPal",           "🅿️"),
+    (re.compile(r'accept\.authorize\.net|api2\.authorize\.net', re.I), "Authorize.Net","🏦"),
+    (re.compile(r'checkout\.adyen\.com|adyen\.com/v\d', re.I),     "Adyen",            "🔷"),
+    (re.compile(r'api\.squareup\.com|squareup\.com/v\d', re.I),    "Square",           "⬛"),
+    (re.compile(r'api\.razorpay\.com', re.I),                      "Razorpay",         "🇮🇳"),
+    (re.compile(r'api\.klarna\.com|klarna\.com/v\d', re.I),        "Klarna",           "🟢"),
+    (re.compile(r'api\.mollie\.com', re.I),                        "Mollie",           "🟡"),
+    (re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "Shopify",          "🛍️"),
+    # ── Regional / other ────────────────────────────────────────
+    (re.compile(r'cardpointe\.com|cardconnect\.com', re.I),        "CardPointe",       "🔵"),
+    (re.compile(r'api\.checkout\.com|checkout\.com/v\d', re.I),    "Checkout.com",     "💜"),
+    (re.compile(r'cybersource\.com', re.I),                        "CyberSource",      "🔒"),
+    (re.compile(r'nmi\.com|gateway\.nmi\.', re.I),                 "NMI",              "🏧"),
+    (re.compile(r'secure\.payway\.com|paysimple\.com', re.I),      "PaySimple",        "💰"),
+    (re.compile(r'sift\.com|siftscience\.com', re.I),              "Sift (Fraud)",     "🚨"),
+    (re.compile(r'signifyd\.com', re.I),                           "Signifyd (Fraud)", "🛡️"),
+    (re.compile(r'affirm\.com/api', re.I),                         "Affirm (BNPL)",    "🟣"),
+    (re.compile(r'afterpay|clearpay', re.I),                       "Afterpay",         "🖤"),
+    # ── Generic token endpoints ──────────────────────────────────
+    (re.compile(r'token|tokenize|createToken|paymentMethod|payment-method', re.I), "Token EP", "🔐"),
+]
+
+# Payment gateway body-level patterns (detect even if URL is custom)
+_GW_BODY_PATTERNS = [
+    (re.compile(r'"cardNumber"|card_number|cardnumber|cc_number', re.I),      "Card Number field",  "💳"),
+    (re.compile(r'"cvv"|"cvc"|"securityCode"|"cardCode"', re.I),               "CVV/CVC field",      "🔐"),
+    (re.compile(r'"expiryMonth"|expiry_month|exp_month|"cardExpiry"', re.I),   "Expiry field",       "📅"),
+    (re.compile(r'"paymentMethod"|"paymentToken"|"nonce"|"payment_nonce"', re.I), "Payment Token",  "🔑"),
+    (re.compile(r'"amount"|"total"|"orderAmount"', re.I),                      "Amount field",       "💰"),
+    (re.compile(r'"billingAddress"|billing_address|"billingPostal"', re.I),    "Billing Address",    "📮"),
+]
+
+# Captcha body-level patterns
+_CAPTCHA_BODY_PATTERNS = [
+    (re.compile(r'"g-recaptcha-response"|g_recaptcha_response', re.I), "reCAPTCHA token",    "🤖"),
+    (re.compile(r'"h-captcha-response"|hcaptcha', re.I),               "hCaptcha token",     "🟡"),
+    (re.compile(r'cf-turnstile-response|turnstile', re.I),             "Turnstile token",    "🟠"),
+    (re.compile(r'"captchaToken"|captcha_token|captcha_code', re.I),   "Captcha token",      "🔒"),
 ]
 
 def _detect_tokenization_url(url: str) -> tuple | None:
-    """Request URL ကို tokenization endpoint ဆိုး စစ်သည်။ Returns (name, icon) or None."""
+    """Request URL ကို tokenization/payment endpoint စစ်သည်。Returns (name, icon) or None."""
     for pattern, name, icon in _TOKENIZATION_ENDPOINTS:
         if pattern.search(url):
             return name, icon
     return None
 
+def _detect_gw_in_body(body: str) -> list:
+    """Request body ထဲမှ payment/captcha field patterns စစ်သည်。"""
+    hits = []
+    for pat, label, icon in _GW_BODY_PATTERNS:
+        if pat.search(body):
+            hits.append((label, icon))
+    for pat, label, icon in _CAPTCHA_BODY_PATTERNS:
+        if pat.search(body):
+            hits.append((label, icon))
+    return hits
+
+def _pbar(elapsed: int, total: int, width: int = 12) -> str:
+    """Text-based progress bar — e.g. [████████░░░░] 67%"""
+    pct  = min(elapsed / max(total, 1), 1.0)
+    filled = int(pct * width)
+    bar  = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {int(pct*100)}%"
 
 def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
                         fields: list, tokenization: tuple | None,
-                        raw_body: str = '') -> str:
-    """Single intercepted request ကို Telegram message format ထုတ်သည်။"""
-    ep_short = endpoint[:70]
-    ct_short = (ct.replace('application/', '')
-                  .replace('x-www-form-urlencoded', 'urlencoded')
-                  .replace('; charset=utf-8', '').strip()[:35])
+                        raw_body: str = '',
+                        body_gw_hits: list | None = None) -> str:
+    """Single intercepted request → Telegram Markdown block。"""
+    ep_short = endpoint[:80]
+    ct_label = (ct.replace('application/', '')
+                  .replace('x-www-form-urlencoded', 'form-urlencoded')
+                  .replace('; charset=utf-8', '').strip()[:40])
 
-    lines = [f"{'─'*34}"]
+    lines = [f"{'━'*34}"]
 
-    # Tokenization badge
+    # ── Gateway / Tokenization badge ────────────────────────────
     if tokenization:
         tok_name, tok_icon = tokenization
-        lines.append(f"🔐 *Tokenization → {tok_icon} {escape_md(tok_name)}*")
+        lines.append(f"🔐 *Gateway → {tok_icon} {escape_md(tok_name)}*")
 
-    lines.append(f"📡 *#{idx}* `{escape_md(method)}` → `{escape_md(ep_short)}`")
-    lines.append(f"📦 `{escape_md(ct_short)}`")
+    lines.append(f"📡 *#{idx}* `{escape_md(method)}` `{escape_md(ep_short)}`")
+    lines.append(f"📦 Content-Type: `{escape_md(ct_label)}`")
+
+    # ── Body-level gateway/captcha hits ────────────────────────
+    if body_gw_hits:
+        hit_str = '  '.join(f"{ic} {escape_md(lb)}" for lb, ic in body_gw_hits[:4])
+        lines.append(f"🎯 *Detected:* {hit_str}")
 
     if not fields:
         if raw_body:
-            lines.append(f"📝 `{escape_md(raw_body[:120])}`")
+            rb_safe = raw_body[:150].replace('`', "'")
+            lines.append(f"📝 Raw:\n`{rb_safe}`")
         else:
             lines.append("⚠️ No parseable fields")
         return '\n'.join(lines)
 
-    # Classify fields
+    # ── Classify fields ─────────────────────────────────────────
     card_f   = [f for f in fields if f.get('card_type') in
                 ('Card Number', 'CVV/CVC', 'Expiry', 'Cardholder Name')]
     pay_f    = [f for f in fields if f.get('card_type') in
                 ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')]
+    dyn_f    = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
+    hidden_f = [f for f in fields
+                if not f.get('is_card') and not f.get('is_dynamic')
+                and f.get('type') in ('hidden',)]
     user_f   = [f for f in fields
                 if not f.get('is_card') and not f.get('is_dynamic')
                 and f.get('type') not in ('hidden', 'submit', 'button', 'reset')
                 and f not in pay_f]
-    dyn_f    = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
-    hidden_f = [f for f in fields
-                if not f.get('is_card') and not f.get('is_dynamic')
-                and f.get('type') in ('hidden', 'submit', 'button')
-                and f not in pay_f]
 
+    # 💳 Card fields
     if card_f:
-        lines.append(f"\n💳 *Card* ({len(card_f)}):")
+        lines.append(f"\n💳 *Card Fields* ({len(card_f)}):")
         for f in card_f:
-            val = f"`{escape_md(f['value'][:20])}`" if f.get('value') else '_—_'
-            lines.append(f"  {f['icon']} `{escape_md(f['name'])}` → {escape_md(f['field_label'])} {val}")
+            val  = f['value'][:24] if f.get('value') else ''
+            vstr = f" = `{escape_md(val)}`" if val else ''
+            lines.append(f"  {f.get('icon','💳')} `{escape_md(f['name'])}` — {escape_md(f['field_label'])}{vstr}")
 
+    # 💰 Payment info
     if pay_f:
         lines.append(f"💰 *Payment Info* ({len(pay_f)}):")
         for f in pay_f:
-            val = f"`{escape_md(f['value'][:25])}`" if f.get('value') else '_—_'
-            lines.append(f"  {f['icon']} `{escape_md(f['name'])}` = {val}")
+            val  = f['value'][:30] if f.get('value') else ''
+            vstr = f" = `{escape_md(val)}`" if val else ''
+            lines.append(f"  {f.get('icon','💰')} `{escape_md(f['name'])}`{vstr}")
 
+    # ✏️ User-input fields
     if user_f:
         lines.append(f"✏️ *User Fields* ({len(user_f)}):")
-        for f in user_f[:8]:
-            val = f"`{escape_md(f['value'][:25])}`" if f.get('value') else f"_{escape_md(f.get('type','text'))}_"
-            lines.append(f"  ✏️ `{escape_md(f['name'])}` = {val}")
-        if len(user_f) > 8:
-            lines.append(f"  _... +{len(user_f)-8} more_")
+        for f in user_f[:6]:
+            val  = f['value'][:30] if f.get('value') else ''
+            vstr = f" = `{escape_md(val)}`" if val else f" ({escape_md(f.get('type','text'))})"
+            lines.append(f"  ✏️ `{escape_md(f['name'])}`{vstr}")
+        if len(user_f) > 6:
+            lines.append(f"  ... +{len(user_f)-6} more fields")
 
+    # 🔄 Dynamic/auto tokens
     if dyn_f:
-        lines.append(f"🔄 *Auto* ({len(dyn_f)}):")
+        lines.append(f"🔄 *Auto Tokens* ({len(dyn_f)}):")
         for f in dyn_f[:4]:
-            lines.append(f"  {f['icon']} `{escape_md(f['name'])}` → {escape_md(f['field_label'])}")
+            lines.append(f"  {f.get('icon','🔄')} `{escape_md(f['name'])}` — {escape_md(f['field_label'])}")
 
+    # 📌 Hidden fields (collapsed)
     if hidden_f:
-        names = ', '.join(f"`{escape_md(f['name'])}`" for f in hidden_f[:5])
-        extra = f" +{len(hidden_f)-5}" if len(hidden_f) > 5 else ""
-        lines.append(f"📌 *Hidden:* {names}{escape_md(extra)}")
+        names = '  '.join(f"`{escape_md(f['name'])}`" for f in hidden_f[:6])
+        extra = f" +{len(hidden_f)-6}" if len(hidden_f) > 6 else ""
+        lines.append(f"📌 *Hidden:* {names}{extra}")
 
     return '\n'.join(lines)
 
 
 def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 180):
     """
-    Playwright realtime intercept.
-    on_request_cb(entry_text: str) — ဒါကို main thread safe queue ထဲ ထည့်မယ်
-    stop_event: threading.Event — set() ဖြစ်ရင် ရပ်မယ်
+    Playwright realtime intercept — improved v2.
+    on_request_cb(entry_text | dict) — thread-safe queue ထဲ ထည့်မည်
+    Dict items: {'type': 'stat', ...} for live stat updates
+    stop_event: threading.Event
     """
     if not PLAYWRIGHT_OK:
         on_request_cb("❌ Playwright မရှိ — `pip install playwright && playwright install chromium`")
@@ -25040,8 +25224,45 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
         on_request_cb(f"🚫 {reason}")
         return
 
-    counter    = [0]      # POST request counter
-    seen_keys  = set()    # deduplicate sitekeys already reported
+    counter     = [0]      # POST/PUT/PATCH request counter
+    seen_keys   = set()    # deduplicate sitekeys
+    stats       = {        # live stats dict — updated per request
+        'total': 0, 'card': 0, 'gateway': 0, 'token': 0,
+        'captcha': 0, 'user': 0,
+    }
+
+    # ── Enhanced reCAPTCHA/Captcha detection patterns ─────────────
+    _CAPTCHA_PATTERNS_V2 = [
+        # reCAPTCHA v3 (execute)
+        (re.compile(r'grecaptcha\.execute\(["\']([A-Za-z0-9_\-]{20,})["\']', re.I), 'reCAPTCHA v3'),
+        # reCAPTCHA v2 render
+        (re.compile(r'grecaptcha\.render\([^)]*["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I), 'reCAPTCHA v2'),
+        # data-sitekey attribute (HTML)
+        (re.compile(r'data-sitekey=["\']([A-Za-z0-9_\-]{20,})["\']', re.I), None),
+        # sitekey in JS objects
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I), None),
+        # hCaptcha
+        (re.compile(r'hcaptcha\.com.*?sitekey=["\']([A-Za-z0-9_\-]{8,})["\']', re.I), 'hCaptcha'),
+        # Turnstile
+        (re.compile(r'turnstile\..*?sitekey=["\']([A-Za-z0-9_\-]{20,})["\']', re.I), 'Cloudflare Turnstile'),
+        # Generic captcha key assignment
+        (re.compile(r'(?:captchaSiteKey|siteKey|site_key|SITE_KEY)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I), None),
+    ]
+
+    def _detect_captcha_type(body_text: str, hint: str | None = None) -> str:
+        if hint:
+            return hint
+        if re.search(r'grecaptcha\.execute', body_text, re.I):
+            return 'reCAPTCHA v3'
+        if re.search(r'h-captcha|hcaptcha\.com', body_text, re.I):
+            return 'hCaptcha'
+        if re.search(r'cf-turnstile|turnstile\.render', body_text, re.I):
+            return 'Cloudflare Turnstile'
+        if re.search(r'FunCaptcha|arkose', body_text, re.I):
+            return 'FunCaptcha'
+        if re.search(r'geetest', body_text, re.I):
+            return 'GeeTest'
+        return 'reCAPTCHA v2'
 
     try:
         from playwright.sync_api import sync_playwright
@@ -25049,24 +25270,26 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
             browser = pw.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled", "--disable-gpu"])
+                      "--disable-blink-features=AutomationControlled",
+                      "--disable-gpu", "--disable-extensions"])
             ctx = browser.new_context(
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/122.0.0.0 Safari/537.36"),
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"),
                 viewport={"width": 1366, "height": 768},
                 ignore_https_errors=True)
             ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};")
             page = ctx.new_page()
 
-            # ── Response hook — scan JS files for sitekeys ──────
+            # ── Response hook — JS/HTML scan for captcha sitekeys ──────
             def on_resp(response):
                 if stop_event.is_set():
                     return
                 resp_url = response.url
                 ct       = response.headers.get('content-type', '')
-                # Only scan JS / HTML responses
                 if not any(x in ct for x in ('javascript', 'html', 'text')):
                     return
                 try:
@@ -25074,51 +25297,63 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 except Exception:
                     return
 
-                for pat in _RECAPTCHA_SITEKEY_PATTERNS:
+                for pat, type_hint in _CAPTCHA_PATTERNS_V2:
                     m = pat.search(body_text)
                     if not m:
                         continue
                     key = m.group(1)
-                    if key in seen_keys:
+                    if key in seen_keys or len(key) < 10:
                         continue
                     seen_keys.add(key)
 
-                    # Detect type
-                    captcha_type = 'reCAPTCHA v2'
-                    if re.search(r'grecaptcha\.execute', body_text, re.I):
-                        captcha_type = 'reCAPTCHA v3'
-                    elif re.search(r'h-captcha|hcaptcha', body_text, re.I):
-                        captcha_type = 'hCaptcha'
-                    elif re.search(r'cf-turnstile|turnstile', body_text, re.I):
-                        captcha_type = 'Cloudflare Turnstile'
+                    captcha_type = _detect_captcha_type(body_text, type_hint)
+                    parsed       = urlparse(url)
+                    base_url     = f"{parsed.scheme}://{parsed.netloc}"
+                    src_loc      = (f"External JS: {resp_url[:60]}"
+                                    if 'javascript' in ct else "Inline HTML / <script>")
 
-                    parsed   = urlparse(url)
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
+                    # action (reCAPTCHA v3)
+                    action_m = re.search(r'action\s*:\s*["\']([A-Za-z0-9_/\-]+)["\']', body_text)
+                    action   = action_m.group(1) if action_m else ''
 
-                    # Source location
-                    if 'javascript' in ct:
-                        src_loc = f"External JS — `{resp_url[:60]}`"
-                    else:
-                        src_loc = "Inline HTML / <script> tag"
-
-                    msg_text = (
-                        f"{'─'*34}\n"
+                    stats['captcha'] += 1
+                    msg = (
+                        f"{'━'*34}\n"
                         f"🤖 *{escape_md(captcha_type)} — Site Key Found*\n\n"
                         f"  `RECAPTCHA_SITE_KEY` = `{escape_md(key)}`\n"
                         f"  `RECAPTCHA_PAGE_URL` = `{escape_md(url)}`\n"
-                        f"  `BASE_URL`           = `{escape_md(base_url)}`\n\n"
-                        f"📍 *Source:* {escape_md(src_loc)}"
+                        f"  `BASE_URL`           = `{escape_md(base_url)}`\n"
                     )
-                    on_request_cb(msg_text)
+                    if action:
+                        msg += f"  `ACTION`             = `{escape_md(action)}`\n"
+                    msg += f"\n📍 *Source:* {escape_md(src_loc)}"
+
+                    captcha_structured = {
+                        'idx':          f"captcha_{stats['captcha']}",
+                        'timestamp':    datetime.now().isoformat(),
+                        'type':         'captcha',
+                        'captcha_type': captcha_type,
+                        'site_key':     key,
+                        'page_url':     url,
+                        'base_url':     base_url,
+                        'action':       action,
+                        'source':       src_loc,
+                    }
+                    on_request_cb({
+                        'type': 'captcha_entry',
+                        'text': msg,
+                        'data': captcha_structured,
+                    })
+                    on_request_cb({'type': 'stat', **stats})
 
             page.on('response', on_resp)
 
+            # ── Request hook — POST/PUT/PATCH intercept ────────────────
             def on_req(request):
                 if stop_event.is_set():
                     return
                 if request.method not in ('POST', 'PUT', 'PATCH'):
                     return
-
                 try:
                     endpoint = request.url
                     method   = request.method
@@ -25126,24 +25361,38 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                     body     = request.post_data or ''
                     fields   = []
 
-                    # Parse fields
+                    # ── Parse fields by content type ──────────────────
                     if 'json' in ct:
                         try:
                             d = json.loads(body)
                             if isinstance(d, dict):
-                                for k, v in d.items():
-                                    lb, ic, dyn, card = _classify_field(k, str(v))
+                                def _flatten_json(obj, prefix=''):
+                                    items = []
+                                    if isinstance(obj, dict):
+                                        for k, v in obj.items():
+                                            key = f"{prefix}.{k}" if prefix else k
+                                            if isinstance(v, (dict, list)):
+                                                items.extend(_flatten_json(v, key))
+                                            else:
+                                                items.append((key, str(v)[:120]))
+                                    elif isinstance(obj, list):
+                                        for i, v in enumerate(obj[:5]):
+                                            items.extend(_flatten_json(v, f"{prefix}[{i}]"))
+                                    return items
+                                for k, v in _flatten_json(d):
+                                    lb, ic, dyn, card = _classify_field(k, v)
                                     fields.append({'name': k, 'type': 'json',
-                                        'value': str(v)[:80], 'required': True,
+                                        'value': v[:80], 'required': True,
                                         'field_label': lb, 'icon': ic,
                                         'is_dynamic': dyn,
                                         'is_card': card is not None, 'card_type': card})
                         except Exception:
                             pass
+
                     elif 'urlencoded' in ct or 'form' in ct:
                         from urllib.parse import parse_qs
                         try:
-                            for k, vals in parse_qs(body).items():
+                            for k, vals in parse_qs(body, keep_blank_values=True).items():
                                 v = vals[0] if vals else ''
                                 lb, ic, dyn, card = _classify_field(k, v)
                                 fields.append({'name': k, 'type': 'form',
@@ -25153,6 +25402,7 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                                     'is_card': card is not None, 'card_type': card})
                         except Exception:
                             pass
+
                     elif 'multipart' in ct:
                         for m in re.finditer(r'name="([^"]+)"', body):
                             k = m.group(1)
@@ -25163,24 +25413,79 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                                 'is_dynamic': dyn,
                                 'is_card': card is not None, 'card_type': card})
 
-                    # Tokenization URL check
+                    # ── Tokenization / gateway URL detection ──────────
                     tokenization = _detect_tokenization_url(endpoint)
 
-                    # Skip if no fields and no body (GET-like noise)
+                    # ── Body-level payment/captcha pattern scan ────────
+                    body_hits = _detect_gw_in_body(body) if body else []
+
+                    # ── Stats update ──────────────────────────────────
+                    has_card    = any(f.get('is_card') for f in fields)
+                    has_user    = any(not f.get('is_card') and not f.get('is_dynamic')
+                                      and f.get('type') not in ('hidden',) for f in fields)
+                    has_token   = any(f.get('is_dynamic') for f in fields)
+                    has_captcha = any('captcha' in (f.get('field_label') or '').lower() for f in fields)
+
+                    if has_card:    stats['card'] += 1
+                    if tokenization or body_hits: stats['gateway'] += 1
+                    if has_token:   stats['token'] += 1
+                    if has_captcha: stats['captcha'] += 1
+                    if has_user:    stats['user'] += 1
+
+                    # Skip empty requests (GET-like noise)
                     if not fields and not body.strip():
                         return
 
                     counter[0] += 1
+                    stats['total'] = counter[0]
+
+                    # Structured entry for file export
+                    structured = {
+                        'idx':          counter[0],
+                        'timestamp':    datetime.now().isoformat(),
+                        'endpoint':     endpoint,
+                        'method':       method,
+                        'content_type': ct,
+                        'gateway':      tokenization[0] if tokenization else None,
+                        'body_hits':    [lb for lb, _ in body_hits],
+                        'raw_body':     body[:500] if not fields else '',
+                        'fields': [
+                            {
+                                'name':        f['name'],
+                                'value':       f.get('value', ''),
+                                'type':        f.get('type', ''),
+                                'field_label': f.get('field_label', ''),
+                                'is_card':     f.get('is_card', False),
+                                'card_type':   f.get('card_type'),
+                                'is_dynamic':  f.get('is_dynamic', False),
+                            }
+                            for f in fields
+                        ],
+                        'has_card':    has_card,
+                        'has_gateway': bool(tokenization or body_hits),
+                        'has_token':   has_token,
+                    }
+
                     entry_text = _format_live_entry(
                         counter[0], endpoint, method, ct,
-                        fields, tokenization, body if not fields else '')
-                    on_request_cb(entry_text)
+                        fields, tokenization,
+                        body if not fields else '',
+                        body_hits)
+
+                    on_request_cb({
+                        'type': 'entry',
+                        'text': entry_text,
+                        'data': structured,
+                    })
+                    on_request_cb({'type': 'stat', **stats})
 
                 except Exception as e:
                     logger.debug(f"payloadlive on_req error: {e}")
 
             page.on('request', on_req)
 
+            # ── Phase 1: Navigate ──────────────────────────────────────
+            on_request_cb({'type': 'phase', 'phase': 1, 'label': 'Loading page...'})
             try:
                 page.goto(url, wait_until="networkidle", timeout=40_000)
             except Exception:
@@ -25189,14 +25494,21 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 except Exception:
                     pass
 
-            # Keep monitoring until stop or timeout
-            elapsed = 0
+            on_request_cb({'type': 'phase', 'phase': 2, 'label': 'Monitoring requests...'})
+
+            # ── Keep monitoring until stop or timeout ──────────────────
+            elapsed  = 0
             interval = 0.5
             while not stop_event.is_set() and elapsed < timeout_sec:
                 import time as _t
                 _t.sleep(interval)
                 elapsed += interval
+                # Periodic stat ping every 10s
+                if int(elapsed) % 10 == 0:
+                    on_request_cb({'type': 'tick', 'elapsed': int(elapsed),
+                                   'total_sec': timeout_sec, **stats})
 
+            on_request_cb({'type': 'phase', 'phase': 3, 'label': 'Wrapping up...'})
             browser.close()
 
     except Exception as e:
@@ -25204,18 +25516,19 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
 
 
 async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/payloadlive <url> — Realtime network request stream + tokenization detection"""
+    """/payloadlive <url> — Realtime network request stream + phase bar + JSON export"""
     if not context.args:
         await update.effective_message.reply_text(
             "📌 *Usage:* `/payloadlive https://example.com`\n\n"
             "🔴 *Realtime intercepts:*\n"
-            "  • POST/PUT/PATCH requests ဝင်တိုင်း ချက်ချင်း ပြသည်\n"
+            "  • POST / PUT / PATCH requests ဝင်တိုင်း ချက်ချင်း ပြသည်\n"
             "  • 💳 Card fields, 💰 Payment info, ✏️ User fields\n"
-            "  • 🔐 Tokenization URL detection\n"
-            "     (Stripe / Braintree / PayPal / Adyen…)\n"
+            "  • 🔐 Payment gateway detection (Stripe / CardPointe / Adyen…)\n"
+            "  • 🤖 reCAPTCHA v2/v3 / hCaptcha / Turnstile site key\n"
             "  • 🔄 CSRF / Nonce / Session tokens\n\n"
-            "⏱️ Max 3 minutes — `/stop` နှိပ်ရင် ချက်ချင်း ရပ်သည်\n\n"
-            "⚠️ _Authorized testing only._",
+            "📊 *Phase progress bar + live stats + JSON export*\n\n"
+            "⏱️ Max 3 min — `/stop` နှိပ်ရင် ချက်ချင်း ရပ်သည်\n"
+            "⚠️ Authorized testing only.",
             parse_mode='Markdown'
         )
         return
@@ -25239,54 +25552,205 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domain = urlparse(url).hostname or url
 
-    # ── Cancel flag ────────────────────────────────────────────
-    import threading
+    # ── Cancel flag ────────────────────────────────────────────────
+    import threading, io as _io
     stop_event = threading.Event()
-
-    # Register in _cancel_flags so /stop works
     _cancel_flags[uid] = asyncio.Event()
     old_task = _user_tasks.get(uid)
     if old_task and not old_task.done():
         old_task.cancel()
 
-    # ── Async queue for thread-safe Telegram sends ─────────────
+    # ── Async queue (thread → coroutine) ───────────────────────────
     send_queue: asyncio.Queue = asyncio.Queue()
 
-    def on_request_cb(text: str):
-        """Called from Playwright thread → put into async queue."""
+    def on_request_cb(item):
         try:
             loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(send_queue.put_nowait, text)
+            loop.call_soon_threadsafe(send_queue.put_nowait, item)
         except Exception:
             pass
 
-    # ── Status message ─────────────────────────────────────────
+    # ── Phase labels ───────────────────────────────────────────────
+    _PHASES = {
+        1: "🌐 Loading page",
+        2: "📡 Intercepting requests",
+        3: "🏁 Wrapping up",
+    }
+
+    # ── Status message ─────────────────────────────────────────────
+    def _build_status(phase: int, elapsed: int, total_sec: int,
+                      stats: dict, first: bool = False) -> str:
+        bar   = _pbar(elapsed, total_sec)
+        ph_lb = _PHASES.get(phase, "")
+        lines = [
+            f"🔴 *PayloadLive — `{escape_md(domain)}`*",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Phase {phase}/3: {ph_lb}",
+            f"`{bar}` {elapsed}s / {total_sec}s",
+            "",
+            f"📡 Requests: `{stats['total']}`  "
+            f"💳 Card: `{stats['card']}`  "
+            f"🔐 GW: `{stats['gateway']}`",
+            f"🤖 Captcha: `{stats['captcha']}`  "
+            f"🔄 Token: `{stats['token']}`  "
+            f"✏️ User: `{stats['user']}`",
+        ]
+        if first:
+            lines.append("")
+            lines.append("⏳ Waiting for first request...")
+        lines.append(f"\n`/stop` နှိပ်ရင် ရပ်မည်")
+        return '\n'.join(lines)
+
     status_msg = await update.effective_message.reply_text(
-        f"🔴 *PayloadLive — `{escape_md(domain)}`*\n\n"
-        f"🌐 Intercepting requests...\n"
-        f"⏱️ Max 3 min — `/stop` နှိပ်ရင် ရပ်မည်\n\n"
-        f"⏳ Waiting for first request...",
+        _build_status(1, 0, 180, {'total':0,'card':0,'gateway':0,
+                                   'token':0,'captcha':0,'user':0}, first=True),
         parse_mode='Markdown'
     )
 
-    # ── Run Playwright in thread ───────────────────────────────
+    # ── Run Playwright thread ──────────────────────────────────────
     loop    = asyncio.get_event_loop()
-    TIMEOUT = 180  # 3 minutes
+    PL_TIMEOUT = 180
 
     def run_thread():
-        _payloadlive_sync(url, on_request_cb, stop_event, timeout_sec=TIMEOUT)
+        _payloadlive_sync(url, on_request_cb, stop_event, timeout_sec=PL_TIMEOUT)
         loop.call_soon_threadsafe(send_queue.put_nowait, "__DONE__")
 
     thread = threading.Thread(target=run_thread, daemon=True)
     thread.start()
 
-    request_count = 0
-    first_received = False
+    # ── Sender loop state ──────────────────────────────────────────
+    request_count    = 0
+    cur_phase        = 1
+    cur_elapsed      = 0
+    cur_stats        = {'total':0,'card':0,'gateway':0,'token':0,'captcha':0,'user':0}
+    structured_log   = []   # list of structured dicts — for file export
+    last_file_msg_id = None # track last rolling-file message_id for deletion
+    last_status_edit = time.time()
+    STATUS_EDIT_INTERVAL  = 5   # edit status bar every 5s
+    ROLLING_FILE_EVERY    = 5   # send updated file every N new entries
+
+    # ── File generation helpers ─────────────────────────────────────
+    def _make_txt_report(entries: list, meta: dict) -> str:
+        lines = [
+            "=" * 60,
+            f"  PayloadLive Report — {meta['domain']}",
+            f"  URL      : {meta['url']}",
+            f"  Captured : {meta['scanned_at']}",
+            f"  Elapsed  : {meta['elapsed_sec']}s",
+            "=" * 60,
+            "",
+            f"SUMMARY",
+            f"  Total intercepted : {meta['summary']['total']}",
+            f"  Card fields       : {meta['summary']['card']}",
+            f"  Payment gateways  : {meta['summary']['gateway']}",
+            f"  Captcha keys      : {meta['summary']['captcha']}",
+            f"  Token fields      : {meta['summary']['token']}",
+            f"  User form fields  : {meta['summary']['user']}",
+            "",
+            "=" * 60,
+            "",
+        ]
+        for e in entries:
+            if e.get('type') == 'captcha':
+                lines += [
+                    f"[CAPTCHA #{e.get('idx','')}]  {e.get('timestamp','')}",
+                    f"  Type     : {e.get('captcha_type','')}",
+                    f"  Site Key : {e.get('site_key','')}",
+                    f"  Page URL : {e.get('page_url','')}",
+                    f"  Action   : {e.get('action','')}",
+                    f"  Source   : {e.get('source','')}",
+                    "",
+                ]
+            else:
+                lines += [
+                    f"[REQ #{e.get('idx','')}]  {e.get('timestamp','')}",
+                    f"  {e.get('method','')}  {e.get('endpoint','')}",
+                    f"  Content-Type : {e.get('content_type','')}",
+                    f"  Gateway      : {e.get('gateway') or '—'}",
+                ]
+                if e.get('body_hits'):
+                    lines.append(f"  Body hits    : {', '.join(e['body_hits'])}")
+                if e.get('fields'):
+                    lines.append("  Fields:")
+                    for f in e['fields']:
+                        val  = f.get('value','')
+                        tag  = ' [CARD]' if f.get('is_card') else (' [TOKEN]' if f.get('is_dynamic') else '')
+                        lines.append(f"    {f['name']:<30} = {val[:60]}{tag}")
+                if e.get('raw_body'):
+                    lines.append(f"  Raw body     : {e['raw_body'][:200]}")
+                lines.append("")
+        lines += ["=" * 60, "  Authorized testing only.", "=" * 60]
+        return "\n".join(lines)
+
+    async def _send_rolling_files(final: bool = False):
+        nonlocal last_file_msg_id
+        if not structured_log:
+            return
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = re.sub(r'[^\w\-]', '_', domain)
+        meta = {
+            'domain':      domain,
+            'url':         url,
+            'scanned_at':  datetime.now().isoformat(),
+            'elapsed_sec': cur_elapsed,
+            'summary':     dict(cur_stats),
+        }
+
+        # JSON file
+        json_data  = {**meta, 'entries': structured_log}
+        json_bytes = json.dumps(json_data, indent=2, ensure_ascii=False).encode('utf-8')
+        json_buf   = _io.BytesIO(json_bytes)
+        json_buf.name = f"payloadlive_{safe}_{ts}.json"
+
+        # TXT report
+        txt_bytes = _make_txt_report(structured_log, meta).encode('utf-8')
+        txt_buf   = _io.BytesIO(txt_bytes)
+        txt_buf.name  = f"payloadlive_{safe}_{ts}.txt"
+
+        label = "✅ Final" if final else "🔄 Rolling update"
+        cap   = (
+            f"📦 *PayloadLive — {label}*\n"
+            f"`{escape_md(domain)}`\n"
+            f"Entries: `{len(structured_log)}` | Elapsed: `{cur_elapsed}s`"
+        )
+
+        # Try delete previous rolling file message
+        if last_file_msg_id and not final:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=last_file_msg_id)
+            except Exception:
+                pass
+            last_file_msg_id = None
+
+        # Send JSON
+        try:
+            jmsg = await update.effective_message.reply_document(
+                document=json_buf,
+                filename=json_buf.name,
+                caption=cap + "\n📄 JSON",
+                parse_mode='Markdown')
+            if not final:
+                last_file_msg_id = jmsg.message_id
+        except Exception as e:
+            logger.warning(f"payloadlive JSON send error: {e}")
+
+        # Send TXT
+        try:
+            await update.effective_message.reply_document(
+                document=txt_buf,
+                filename=txt_buf.name,
+                caption=cap + "\n📝 TXT Report",
+                parse_mode='Markdown')
+        except Exception as e:
+            logger.warning(f"payloadlive TXT send error: {e}")
 
     async def sender_loop():
-        nonlocal request_count, first_received
+        nonlocal request_count, cur_phase, cur_elapsed, cur_stats, last_status_edit
+
         while True:
-            # Also watch for /stop
+            # /stop check
             if _cancel_flags.get(uid) and _cancel_flags[uid].is_set():
                 stop_event.set()
                 break
@@ -25294,60 +25758,146 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 item = await asyncio.wait_for(send_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
+                now = time.time()
+                if now - last_status_edit >= STATUS_EDIT_INTERVAL:
+                    last_status_edit = now
+                    try:
+                        await status_msg.edit_text(
+                            _build_status(cur_phase, cur_elapsed, PL_TIMEOUT, cur_stats),
+                            parse_mode='Markdown')
+                    except Exception:
+                        pass
                 continue
 
             if item == "__DONE__":
                 break
 
-            request_count += 1
+            # ── Control dict messages ──────────────────────────────
+            if isinstance(item, dict):
+                t = item.get('type')
 
-            # Edit status on first request
-            if not first_received:
-                first_received = True
-                try:
-                    await status_msg.edit_text(
-                        f"🔴 *PayloadLive — `{escape_md(domain)}`*\n"
-                        f"📡 Streaming... `/stop` နှိပ်ရင် ရပ်မည်",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
+                if t == 'phase':
+                    cur_phase = item.get('phase', cur_phase)
 
-            # Send each intercepted request as new message
-            try:
-                await update.effective_message.reply_text(
-                    item, parse_mode='Markdown')
-            except Exception:
-                # Markdown parse error fallback
-                try:
-                    await update.effective_message.reply_text(item)
-                except Exception:
-                    pass
+                elif t in ('stat', 'tick'):
+                    cur_elapsed = item.get('elapsed', cur_elapsed)
+                    for k in ('total','card','gateway','token','captcha','user'):
+                        if k in item:
+                            cur_stats[k] = item[k]
+                    request_count = cur_stats['total']
+
+                elif t == 'entry':
+                    # ── Intercepted request ────────────────────────
+                    request_count += 1
+                    cur_stats['total'] = request_count
+                    structured_log.append(item['data'])
+
+                    # Status bar refresh
+                    now = time.time()
+                    if now - last_status_edit >= 2:
+                        last_status_edit = now
+                        try:
+                            await status_msg.edit_text(
+                                _build_status(cur_phase, cur_elapsed, PL_TIMEOUT, cur_stats),
+                                parse_mode='Markdown')
+                        except Exception:
+                            pass
+
+                    # Send Telegram entry message
+                    try:
+                        await update.effective_message.reply_text(
+                            item['text'], parse_mode='Markdown')
+                    except BadRequest:
+                        try:
+                            await update.effective_message.reply_text(item['text'])
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                    # Rolling file: every N entries
+                    if request_count % ROLLING_FILE_EVERY == 0:
+                        await _send_rolling_files(final=False)
+                    continue
+
+                elif t == 'captcha_entry':
+                    # ── Captcha key found ──────────────────────────
+                    structured_log.append(item['data'])
+                    try:
+                        await update.effective_message.reply_text(
+                            item['text'], parse_mode='Markdown')
+                    except Exception:
+                        try:
+                            await update.effective_message.reply_text(item['text'])
+                        except Exception:
+                            pass
+                    # Also trigger rolling file update
+                    if len(structured_log) % ROLLING_FILE_EVERY == 0:
+                        await _send_rolling_files(final=False)
+                    continue
+
+                # Status bar refresh for control messages
+                now = time.time()
+                if now - last_status_edit >= STATUS_EDIT_INTERVAL:
+                    last_status_edit = now
+                    try:
+                        await status_msg.edit_text(
+                            _build_status(cur_phase, cur_elapsed, PL_TIMEOUT, cur_stats),
+                            parse_mode='Markdown')
+                    except Exception:
+                        pass
 
     task = asyncio.create_task(sender_loop())
     _user_tasks[uid] = task
 
     try:
-        await asyncio.wait_for(task, timeout=TIMEOUT + 10)
+        await asyncio.wait_for(task, timeout=PL_TIMEOUT + 15)
     except asyncio.TimeoutError:
         stop_event.set()
         task.cancel()
     except asyncio.CancelledError:
         stop_event.set()
 
-    # ── Final summary ──────────────────────────────────────────
-    stop_reason = "🛑 Stopped" if (_cancel_flags.get(uid) and
-                                    _cancel_flags[uid].is_set()) else "⏱️ Timeout (3 min)"
-    summary = (
-        f"{'─'*34}\n"
-        f"📊 *Summary — `{escape_md(domain)}`*\n"
-        f"📡 Total intercepted: `{request_count}`\n"
-        f"{stop_reason}"
-    )
+    # ── Detailed Summary ───────────────────────────────────────────
+    stopped_by_user = (_cancel_flags.get(uid) and _cancel_flags[uid].is_set())
+    stop_reason     = "🛑 /stop ဖြင့် ရပ်လိုက်သည်" if stopped_by_user else "⏱️ Timeout (3 min)"
+
+    summary_lines = [
+        f"{'━'*34}",
+        f"📊 *Summary — `{escape_md(domain)}`*",
+        f"{'━'*34}",
+        "",
+        f"📡 Total intercepted:   `{cur_stats['total']}`",
+        f"💳 Card field requests: `{cur_stats['card']}`",
+        f"🔐 Payment gateway:     `{cur_stats['gateway']}`",
+        f"🤖 Captcha keys found:  `{cur_stats['captcha']}`",
+        f"🔄 Token fields:        `{cur_stats['token']}`",
+        f"✏️  User form fields:    `{cur_stats['user']}`",
+        "",
+        f"⏱️  Elapsed: `{cur_elapsed}s` / `{PL_TIMEOUT}s`",
+        stop_reason,
+        "",
+        f"📦 JSON + TXT file ကို အောက်မှာ ပို့ပေးမည်...",
+    ]
+    if cur_stats['card'] > 0:
+        summary_lines.append("")
+        summary_lines.append("⚠️ *Card data intercepted — authorized testing only*")
+
     try:
-        await update.effective_message.reply_text(summary, parse_mode='Markdown')
+        await update.effective_message.reply_text(
+            '\n'.join(summary_lines), parse_mode='Markdown')
     except Exception:
         pass
+
+    # ── Final JSON + TXT Export ────────────────────────────────────
+    if structured_log:
+        await _send_rolling_files(final=True)
+    else:
+        try:
+            await update.effective_message.reply_text(
+                "📭 Intercepted requests မရှိပါ — file export မလုပ်ပါ")
+        except Exception:
+            pass
 
     _cancel_flags.pop(uid, None)
     _user_tasks.pop(uid, None)
