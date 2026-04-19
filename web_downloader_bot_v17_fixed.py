@@ -23815,6 +23815,15 @@ _PAYMENT_GATEWAYS = [
                      re.compile(r'/wc-api/|wc/v\d/orders', re.I), "🛒"),
     ("Shopify",      re.compile(r'shopify\.com|Shopify\.checkout|shopify_checkout', re.I),
                      re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "🛍️"),
+    # ── Newly added ────────────────────────────────────────────
+    ("CardPointe",   re.compile(r'cardpointe\.com|cardconnect\.com|CardPointeExt', re.I),
+                     re.compile(r'cardpointe\.com/api|fts\.cardconnect\.com', re.I), "🔵"),
+    ("NMI",          re.compile(r'securenettech\.com|nmi\.com|CollectJS|collect\.js', re.I),
+                     re.compile(r'secure\.nmi\.com|gateway\.perpetualpayments', re.I), "🏧"),
+    ("Cybersource",  re.compile(r'cybersource\.com|CyberSource|flex\.cybersource', re.I),
+                     re.compile(r'api\.cybersource\.com|testflex\.cybersource', re.I), "🔒"),
+    ("Heartland",    re.compile(r'heartlandpaymentsystems|heartlandpayment|SecureSubmit', re.I),
+                     re.compile(r'api2\.heartlandportico\.com', re.I), "❤️"),
 ]
 
 # ── Card Field Patterns ────────────────────────────────────────
@@ -23853,21 +23862,29 @@ _CARD_FIELDS = [
     (re.compile(r'customer.?id|cust.?id|merchant.?id|client.?id$'
                 r'|buyer.?id|payer.?id|shopper.?id', re.I),
      "Customer ID", "🆔", False),
-    # ── Billing address fields ─────────────────────────────────
-    (re.compile(r'billing.?zip|billing.?postal|bill.?zip|bill.?postal'
-                r'|post.?code|zip.?code', re.I),
+    # ── Billing address fields — SPECIFIC first, generic last ──
+    # (wpfs-billing-address-city style: use .* for multi-segment names)
+    (re.compile(r'billing.*zip|billing.*postal|bill.*zip|bill.*postal'
+                r'|post.?code|zip.?code|address.*zip|address.*postal', re.I),
      "Billing Zip", "🏠", False),
-    (re.compile(r'billing.?address|billing.?addr|bill.?addr|bill.?address'
-                r'|bill.?street|billing.?street|billing.?line', re.I),
-     "Billing Address", "🏠", False),
-    (re.compile(r'billing.?city|bill.?city', re.I),
+    (re.compile(r'billing.*city|bill.*city|address.*city', re.I),
      "Billing City", "🏠", False),
-    (re.compile(r'billing.?state|bill.?state|tempBillState', re.I),
+    (re.compile(r'billing.*state|bill.*state|address.*state|tempBillState', re.I),
      "Billing State", "🏠", False),
-    (re.compile(r'billing.?country|bill.?country', re.I),
+    (re.compile(r'billing.*country|bill.*country|address.*country', re.I),
      "Billing Country", "🏠", False),
-    (re.compile(r'billing.?province|bill.?province|tempBillProvince', re.I),
+    (re.compile(r'billing.*province|bill.*province|address.*province|tempBillProvince', re.I),
      "Billing Province", "🏠", False),
+    (re.compile(r'billing.*line.?2|bill.*line.?2|address.*line.?2'
+                r'|address2|addr2|apt|suite|unit', re.I),
+     "Address Line 2", "🏠", False),
+    (re.compile(r'billing.*line.?1|bill.*line.?1|address.*line.?1'
+                r'|address1|addr1|street', re.I),
+     "Address Line 1", "🏠", False),
+    # Generic billing address (fallback — must stay AFTER specific sub-types above)
+    (re.compile(r'billing.?address|billing.?addr|bill.?addr|bill.?address'
+                r'|bill.?street|billing.?street', re.I),
+     "Billing Address", "🏠", False),
     (re.compile(r'bill.?fname|bill.?first|billing.?first', re.I),
      "Billing First Name", "👤", False),
     (re.compile(r'bill.?lname|bill.?last|billing.?last', re.I),
@@ -24098,6 +24115,26 @@ def _classify_field(name: str, value: str,
     # Combined hint: name + placeholder + aria-label + visible label
     hint = ' '.join(filter(None, [name, placeholder, aria_label, label_text]))
 
+    # ── ⓪ Early-exit for unambiguous field types ──────────────
+    # These must win BEFORE _CARD_FIELDS (e.g. "card-holder-email" is an
+    # email field, not a cardholder-name field).
+    if ftype == 'email' or re.search(r'\bemail\b|e[-_]mail', hint, re.I):
+        return "Email", "📧", False, None
+    if ftype == 'tel' or re.search(r'\bphone\b|\btelephone\b|\bmobile\b|\bcell\b', hint, re.I):
+        return "Phone", "📞", False, None
+    if ftype == 'password' or re.search(r'\bpassword\b|\bpasswd\b|\bpwd\b', hint, re.I):
+        return "Password", "🔒", False, None
+    # First/Last name (explicit — avoid "card-holder" collision)
+    if re.search(r'\bfirst.?name\b|\bfirstname\b|\bfname\b|\bgiven.?name\b', hint, re.I):
+        return "First Name", "👤", False, None
+    if re.search(r'\blast.?name\b|\blastname\b|\blname\b|\bsurname\b|\bfamily.?name\b', hint, re.I):
+        return "Last Name", "👤", False, None
+    # Invoice / Customer reference
+    if re.search(r'\binvoice.?num|\binvoice.?id|\binvoice.?no\b|\binvoicenumber\b', hint, re.I):
+        return "Invoice Number", "🧾", False, None
+    if re.search(r'\bcustomer.?#|\bcustomer.?num|\bcust.?#|\bcustomer.?no\b|\bcustomernumber\b', hint, re.I):
+        return "Customer Number", "🆔", False, None
+
     # ── ① Card / Payment fields ───────────────────────────────
     for pattern, label, icon, _ in _CARD_FIELDS:
         if pattern.search(hint):
@@ -24234,6 +24271,41 @@ def _extract_forms_static(html: str, page_url: str) -> list:
         if for_id:
             label_map[for_id] = lbl.get_text(strip=True)
 
+    # ── Detect payment iframes (CardPointe, Stripe Elements, etc.) ──
+    _IFRAME_GW = re.compile(
+        r'cardpointe\.com|cardconnect\.com|'
+        r'stripe\.com/v\d|js\.stripe\.com|'
+        r'paypal\.com|braintreegateway\.com|'
+        r'squareup\.com|adyen\.com|'
+        r'secure\.nmi\.com|heartlandportico\.com|'
+        r'cybersource\.com',
+        re.I
+    )
+    iframe_payment_fields = []
+    for iframe in soup.find_all('iframe'):
+        src = iframe.get('src', '') or iframe.get('data-src', '')
+        if src and _IFRAME_GW.search(src):
+            parsed_src = urlparse(src)
+            gw_host = parsed_src.netloc
+            # Infer standard card fields for known hosted-iframe gateways
+            _IFRAME_CARD_DEFAULTS = [
+                {'name': 'account',    'type': 'text',   'field_label': 'Card Number',  'icon': '💳', 'is_card': True,  'card_type': 'Card Number',  'is_dynamic': False, 'required': True,  'value': '', 'placeholder': ''},
+                {'name': 'expiry',     'type': 'text',   'field_label': 'Expiry Date',  'icon': '📅', 'is_card': True,  'card_type': 'Expiry',       'is_dynamic': False, 'required': True,  'value': '', 'placeholder': 'MM/YYYY'},
+                {'name': 'cvv2',       'type': 'text',   'field_label': 'CVV/CVC',      'icon': '🔐', 'is_card': True,  'card_type': 'CVV/CVC',      'is_dynamic': False, 'required': True,  'value': '', 'placeholder': ''},
+            ]
+            iframe_payment_fields.append({
+                'source': 'iframe_hosted',
+                'form_idx': 0,
+                'endpoint': src,
+                'method': 'POST',
+                'enctype': 'hosted-iframe',
+                'gateway_host': gw_host,
+                'note': f'⚠️ Card fields inside hosted iframe — card data goes directly to {gw_host}',
+                'fields': _IFRAME_CARD_DEFAULTS,
+                'card_fields': _IFRAME_CARD_DEFAULTS,
+                'is_payment': True,
+            })
+
     results = []
     for idx, form in enumerate(soup.find_all('form')):
         action  = form.get('action', '')
@@ -24270,7 +24342,8 @@ def _extract_forms_static(html: str, page_url: str) -> list:
             'fields': fields, 'card_fields': card_fields,
             'is_payment': len(card_fields) > 0,
         })
-    return results
+    # Prepend iframe forms so they appear first in report
+    return iframe_payment_fields + results
 
 
 def _extract_requests_playwright(url: str, progress_cb=None) -> list:
@@ -25296,12 +25369,27 @@ def _format_payload_report(data: dict) -> str:
         dup_note   = f" _(×{dup_n} identical)_" if dup_n > 1 else ""
         sub_note   = f" · `{escape_md(entry.get('_subpage',''))}`" if entry.get('_subpage') else ""
 
+        if entry.get('source') == 'iframe_hosted':
+            src = '🖼️ Iframe'
+        elif entry.get('source') == 'playwright':
+            src = '🌐 XHR'
+        else:
+            src = '📋 Form'
+
         lines.append(f"\n{'━'*34}")
         lines.append(f"{src}{pay_badge} *#{idx}*{dup_note}{sub_note}")
-        lines.append(
-            f"┌ 📡 `{escape_md(method)}`  →  `{escape_md(ep[:80])}`\n"
-            f"└ 📦 `{escape_md(ct_short) if ct_short else 'application/x-www-form-urlencoded'}`"
-        )
+
+        if entry.get('source') == 'iframe_hosted':
+            gw_host = entry.get('gateway_host', ep)
+            lines.append(
+                f"┌ 🖼️ *Hosted Iframe* → `{escape_md(gw_host)}`\n"
+                f"└ ⚠️ {escape_md(entry.get('note', 'Card data sent directly to gateway'))}"
+            )
+        else:
+            lines.append(
+                f"┌ 📡 `{escape_md(method)}`  →  `{escape_md(ep[:80])}`\n"
+                f"└ 📦 `{escape_md(ct_short) if ct_short else 'application/x-www-form-urlencoded'}`"
+            )
 
         if not fields:
             rb = entry.get('raw_body', '')
@@ -26097,13 +26185,246 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
     return '\n'.join(lines)
 
 
+# ── Auto-submit simulation test data ──────────────────────────
+_AUTOSUBMIT_TEST_DATA = {
+    'card_number': '4111111111111111',   # Visa test card (universally safe)
+    'cvv':         '123',
+    'exp_month':   '12',
+    'exp_year':    '2025',
+    'expiry':      '1225',              # MMYY combined
+    'expiry_full': '12/2025',           # MM/YYYY
+    'first_name':  'Test',
+    'last_name':   'User',
+    'full_name':   'Test User',
+    'email':       'test@example.com',
+    'phone':       '5555555555',
+    'company':     'Test Company',
+    'address1':    '123 Test Street',
+    'address2':    'Suite 100',
+    'city':        'Los Angeles',
+    'state':       'CA',
+    'zip':         '90210',
+    'country':     'US',
+    'amount':      '1.00',
+    'invoice':     'TEST-INV-001',
+    'customer':    'CUST-001',
+    'username':    'testuser',
+    'password':    'TestPass123!',
+    'generic':     'test_value',
+}
+
+# JS — page ထဲ inject လုပ်၍ form fields fill + submit intercept ──
+_JS_FILL_AND_INTERCEPT = r"""
+(testData) => {
+    // ① Override fetch + XHR to capture payload WITHOUT sending
+    const _captured = [];
+    const _origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        if (init && (init.method || '').toUpperCase() === 'POST') {
+            _captured.push({
+                type: 'fetch',
+                url: typeof input === 'string' ? input : input.url,
+                body: init.body || '',
+                ct:   (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || ''
+            });
+        }
+        return _origFetch.apply(this, arguments);
+    };
+    const _origOpen = XMLHttpRequest.prototype.open;
+    const _origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._xhrMethod = method;
+        this._xhrUrl    = url;
+        return _origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+        if ((this._xhrMethod || '').toUpperCase() === 'POST') {
+            _captured.push({type:'xhr', url: this._xhrUrl, body: body || '', ct: ''});
+        }
+        return _origSend.apply(this, arguments);
+    };
+
+    // ② Fill all form fields with test data
+    const forms = document.querySelectorAll('form');
+    const fillLog = [];
+
+    forms.forEach((form, fi) => {
+        const fields = form.querySelectorAll('input, select, textarea');
+        const filled = [];
+
+        fields.forEach(field => {
+            const name  = (field.name || field.id || '').toLowerCase();
+            const ftype = (field.type || 'text').toLowerCase();
+            if (ftype === 'submit' || ftype === 'button' || ftype === 'reset') return;
+
+            let val = null;
+
+            if (/card.?num|cardnum|ccnum|accountno|pan$|^number$/.test(name))    val = testData.card_number;
+            else if (/cvv|cvc|csc|security.?code|cardverif/.test(name))           val = testData.cvv;
+            else if (/exp.*month|month.*exp|expmonth|expirationdatemonth/.test(name)) val = testData.exp_month;
+            else if (/exp.*year|year.*exp|expyear|expirationdateyear/.test(name)) val = testData.exp_year;
+            else if (/exp|expiry|expiration|mmyy|mmyyyy/.test(name))              val = testData.expiry_full;
+            else if (ftype === 'email' || /email/.test(name))                     val = testData.email;
+            else if (ftype === 'tel' || /phone|mobile|tel/.test(name))            val = testData.phone;
+            else if (/first.?name|fname|billing.*first/.test(name))               val = testData.first_name;
+            else if (/last.?name|lname|surname|billing.*last/.test(name))         val = testData.last_name;
+            else if (/card.?holder|cardholder|full.?name|name.?on.?card|billing.*name/.test(name)) val = testData.full_name;
+            else if (/company|corp|organisation/.test(name))                      val = testData.company;
+            else if (/address.*2|addr.*2|apt|suite|unit/.test(name))              val = testData.address2;
+            else if (/address|street|addr/.test(name))                            val = testData.address1;
+            else if (/city/.test(name))                                            val = testData.city;
+            else if (/state|province/.test(name))                                  val = testData.state;
+            else if (/zip|postal/.test(name))                                      val = testData.zip;
+            else if (/country/.test(name))                                         val = testData.country;
+            else if (/amount|total|price|due/.test(name))                         val = testData.amount;
+            else if (/invoice/.test(name))                                         val = testData.invoice;
+            else if (/customer.?#|customer.?num|cust.?#/.test(name))             val = testData.customer;
+            else if (/username|user.?name/.test(name))                            val = testData.username;
+            else if (ftype === 'password' || /password/.test(name))              val = testData.password;
+            else if (ftype === 'hidden') return;  // never touch hidden fields
+
+            if (val !== null) {
+                if (field.tagName === 'SELECT') {
+                    let matched = false;
+                    for (let opt of field.options) {
+                        const ov = opt.value.toLowerCase();
+                        const ot = opt.text.toLowerCase();
+                        if (ov === val.toLowerCase() || ot.includes(val.toLowerCase())) {
+                            field.value = opt.value;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched && field.options.length > 1) {
+                        field.selectedIndex = 1;
+                    }
+                } else {
+                    field.value = val;
+                }
+                field.dispatchEvent(new Event('input',  {bubbles: true}));
+                field.dispatchEvent(new Event('change', {bubbles: true}));
+                filled.push({name: field.name || field.id, value: val});
+            }
+        });
+
+        // ③ Intercept submit — prevent navigation, let JS handlers run
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        }, true);
+
+        fillLog.push({formIdx: fi, filled: filled, action: form.action || '', method: form.method || 'GET'});
+    });
+
+    return {fillLog, captured: _captured};
+}
+"""
+
+_JS_CLICK_SUBMITS = r"""
+() => {
+    // Click all submit buttons (after fill)
+    const btns = document.querySelectorAll(
+        'input[type=submit], button[type=submit], button:not([type]), .submit, [id*=submit], [id*=pay], [class*=submit], [class*=pay-btn]'
+    );
+    const clicked = [];
+    btns.forEach(btn => {
+        try { btn.click(); clicked.push(btn.innerText || btn.value || btn.id); } catch(e) {}
+    });
+    return clicked;
+}
+"""
+
+_JS_GET_CAPTURED = r"""
+() => {
+    // Retrieve anything fetch/XHR captured after submit clicks
+    return window._xhrCapture || [];
+}
+"""
+
+
+def _autosubmit_forms_playwright(page, url: str, on_request_cb, stop_event) -> int:
+    """
+    Form field auto-fill + safe submit simulation.
+    - Fills fields with test data via JS injection
+    - Prevents page navigation (e.preventDefault on submit)
+    - Clicks submit buttons — triggers JS validation + real network requests
+    - page.route() (registered by caller) aborts outgoing POSTs after on_req captures them
+    Returns number of forms found.
+    """
+    if stop_event.is_set():
+        return 0
+
+    try:
+        on_request_cb(
+            f"{'─'*34}\n"
+            f"🤖 *Auto-Submit Simulation Starting...*\n"
+            f"  📝 Filling fields with test data\n"
+            f"  🚫 Navigation & real transactions blocked\n"
+            f"  📡 POST body will be intercepted"
+        )
+
+        # ① Inject fill + intercept script
+        try:
+            result = page.evaluate(_JS_FILL_AND_INTERCEPT, _AUTOSUBMIT_TEST_DATA)
+            fill_log = result.get('fillLog', []) if isinstance(result, dict) else []
+        except Exception as e:
+            on_request_cb(f"⚠️ Fill inject error: `{escape_md(str(e)[:80])}`")
+            fill_log = []
+
+        if not fill_log:
+            on_request_cb("ℹ️ No forms found on page for auto-submit.")
+            return 0
+
+        # Report what was filled
+        for fi, entry in enumerate(fill_log):
+            filled = entry.get('filled', [])
+            if filled:
+                fnames = ", ".join(f"`{escape_md(f['name'])}`" for f in filled[:8])
+                extra  = f" +{len(filled)-8}" if len(filled) > 8 else ""
+                on_request_cb(
+                    f"✅ *Form #{fi+1}* — filled {len(filled)} field(s):\n  {fnames}{escape_md(extra)}"
+                )
+
+        if stop_event.is_set():
+            return len(fill_log)
+
+        # ② Short pause — let JS frameworks react to field changes
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # ③ Click submit buttons — triggers validation + POST (aborted by route)
+        try:
+            clicked = page.evaluate(_JS_CLICK_SUBMITS)
+            if clicked:
+                btn_labels = ", ".join(f"`{escape_md(str(b)[:20])}`" for b in clicked[:5])
+                on_request_cb(f"🖱️ *Clicked:* {btn_labels}")
+        except Exception as e:
+            on_request_cb(f"⚠️ Click error: `{escape_md(str(e)[:80])}`")
+
+        # ④ Wait for network requests triggered by click
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:
+            pass
+
+        on_request_cb("✅ *Auto-Submit Simulation Complete* — see intercepted requests above.")
+        return len(fill_log)
+
+    except Exception as e:
+        on_request_cb(f"❌ Auto-submit error: `{escape_md(str(e)[:100])}`")
+        return 0
+
+
 def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 180,
-                      on_file_cb=None):
+                      on_file_cb=None, auto_submit: bool = False):
     """
     Playwright realtime intercept.
     on_request_cb(entry_text: str) — ဒါကို main thread safe queue ထဲ ထည့်မယ်
     on_file_cb(filename, content_bytes) — PHP/JSON response body file ဖြစ် ပို့မည်
     stop_event: threading.Event — set() ဖြစ်ရင် ရပ်မယ်
+    auto_submit: bool — form fill + submit simulation ထည့်ချင်ရင် True
     """
     if not PLAYWRIGHT_OK:
         on_request_cb("❌ Playwright မရှိ — `pip install playwright && playwright install chromium`")
@@ -26149,12 +26470,99 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
             page = ctx.new_page()
 
-            # ── Response hook — scan JS files for sitekeys ──────
-            # ── + capture PHP/API response bodies as files ───────
+            # ── Response hook — smart pattern-based capture ──────
             _SCRIPT_EXTS    = re.compile(r'\.(php\d?|asp|aspx|cfm|jsp|py|rb|cgi)(\?|$)', re.I)
             _API_RESP_TYPES = ('application/json', 'application/xml', 'text/xml',
                                'application/javascript', 'text/javascript')
             _seen_file_urls: set = set()
+            _file_count     = [0]       # captured file counter
+            MAX_FILES       = 12        # hard cap — ဒီထက်မပိုဘဲ file ပို့မည်
+
+            # ── Skip CDN / analytics / framework hosts ─────────────
+            _SKIP_HOSTS = re.compile(
+                r'google-analytics\.com|googletagmanager\.com|doubleclick\.net|'
+                r'facebook\.net|fbcdn\.net|twitter\.com|linkedin\.com|'
+                r'cloudflare\.com(?!/cdn-cgi/scripts)|'   # allow CF challenge scripts
+                r'bootstrapcdn\.com|jsdelivr\.net|unpkg\.com|'
+                r'fonts\.googleapis\.com|fonts\.gstatic\.com|'
+                r'hotjar\.com|segment\.com|mixpanel\.com|'
+                r'zendesk\.com|intercom\.io|crisp\.chat',
+                re.I
+            )
+
+            # ── Skip generic framework/vendor JS filenames ─────────
+            _SKIP_FILENAMES = re.compile(
+                r'(?:^|/)(jquery|bootstrap|react|vue|angular|ember|backbone|'
+                r'lodash|underscore|moment|axios|polyfill|chunk|runtime|'
+                r'vendor|framework|gtag|fbevents|analytics|hotjar|'
+                r'recaptcha|hcaptcha|turnstile\.js)[\.\-]',
+                re.I
+            )
+
+            # ── HIGH-VALUE content patterns (score system) ─────────
+            # Each match adds to score. score ≥ 3 → capture file.
+            # score 1-2 → text-only notification.
+            _SCORE_PATTERNS = [
+                # Payment / checkout (weight 3 — almost always capture)
+                (re.compile(
+                    r'stripe\.|braintree\.|paypal\.|adyen\.|cardpointe\.|cardconnect\.|'
+                    r'squareup\.|klarna\.|razorpay\.|authorize\.net|cybersource\.|'
+                    r'checkout\.|payment_intent|createPaymentMethod|createToken|'
+                    r'tokenize|encryptedCard|encryptedCardNumber',
+                    re.I), 3, "💳 Payment SDK"),
+                # API / secret keys
+                (re.compile(
+                    r'publishableKey|publishable_key|apiKey|api_key|secretKey|secret_key|'
+                    r'clientSecret|client_secret|merchantId|merchant_id|'
+                    r'"key"\s*:\s*"[A-Za-z0-9_\-]{20,}"',
+                    re.I), 3, "🔑 API Key"),
+                # Auth / session tokens
+                (re.compile(
+                    r'access_token|accessToken|bearer|jwt|id_token|refresh_token|'
+                    r'authorization.*:\s*["\']Bearer|sessionId|sess_id|phpsessid',
+                    re.I), 2, "🔐 Auth Token"),
+                # CSRF / nonce
+                (re.compile(
+                    r'csrf|_token|nonce|authenticity_token|X-CSRF|anti.?forgery',
+                    re.I), 2, "🛡️ CSRF/Nonce"),
+                # Card data patterns
+                (re.compile(
+                    r'cardNumber|card_number|ccNumber|cc_number|cvv|cvc|expir|'
+                    r'encryptedCard|account_number|routing_number',
+                    re.I), 3, "💳 Card Data"),
+                # Firebase / cloud config
+                (re.compile(
+                    r'firebaseConfig|firebase\.initializeApp|databaseURL|'
+                    r'storageBucket.*firebaseapp|apiKey.*firebase',
+                    re.I), 3, "🔥 Firebase"),
+                # GraphQL / REST endpoints with data
+                (re.compile(
+                    r'"query"\s*:|"mutation"\s*:|graphql|__typename|'
+                    r'"data"\s*:\s*\{.*"id"\s*:',
+                    re.I), 2, "📡 GraphQL/API"),
+                # Checkout / order response
+                (re.compile(
+                    r'orderId|order_id|transactionId|transaction_id|'
+                    r'invoiceId|invoice_id|paymentStatus|payment_status',
+                    re.I), 2, "🧾 Order/Txn"),
+                # Webhook / callback URLs
+                (re.compile(r'webhook|callback.*url|notify_url|ipn_url', re.I), 2, "🪝 Webhook"),
+                # AWS / cloud credentials
+                (re.compile(
+                    r'AKIA[0-9A-Z]{16}|aws_access_key|aws_secret|'
+                    r'AWSCredentials|x-amz-security-token',
+                    re.I), 3, "☁️ AWS Cred"),
+            ]
+
+            def _score_content(body: str) -> tuple[int, list[str]]:
+                """Score content relevance. Returns (score, matched_labels)."""
+                score  = 0
+                labels = []
+                for pat, weight, label in _SCORE_PATTERNS:
+                    if pat.search(body):
+                        score  += weight
+                        labels.append(label)
+                return score, labels
 
             def on_resp(response):
                 if stop_event.is_set():
@@ -26162,22 +26570,31 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 resp_url = response.url
                 ct       = response.headers.get('content-type', '').lower()
 
-                # ── Skip non-text / non-script content ──────────────
+                # ── Skip non-text content ───────────────────────────
                 is_script = _SCRIPT_EXTS.search(resp_url)
                 is_api    = any(t in ct for t in _API_RESP_TYPES)
                 is_html   = 'html' in ct
                 if not (is_script or is_api or is_html):
                     return
 
-                # ── Skip large files ─────────────────────────────────
+                # ── Skip CDN / analytics hosts ──────────────────────
+                parsed_r = urlparse(resp_url)
+                if _SKIP_HOSTS.search(parsed_r.netloc):
+                    return
+
+                # ── Skip generic framework JS files ─────────────────
+                if _SKIP_FILENAMES.search(resp_url):
+                    return
+
+                # ── Skip oversized files ────────────────────────────
                 content_len = int(response.headers.get('content-length', '0') or 0)
-                if content_len > 500_000:
+                if content_len > 300_000:
                     return
 
                 try:
                     body_text = response.text()
-                    if len(body_text) > 500_000:
-                        body_text = body_text[:500_000]
+                    if len(body_text) > 300_000:
+                        body_text = body_text[:300_000]
                 except Exception:
                     return
 
@@ -26193,7 +26610,6 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
-
                     captcha_type = 'reCAPTCHA v2'
                     if re.search(r'grecaptcha\.execute', body_text, re.I):
                         captcha_type = 'reCAPTCHA v3'
@@ -26201,9 +26617,8 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         captcha_type = 'hCaptcha'
                     elif re.search(r'cf-turnstile|turnstile', body_text, re.I):
                         captcha_type = 'Cloudflare Turnstile'
-
-                    parsed   = urlparse(url)
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
+                    parsed_u = urlparse(url)
+                    base_url = f"{parsed_u.scheme}://{parsed_u.netloc}"
                     src_loc  = (f"External JS — `{resp_url[:60]}`"
                                 if 'javascript' in ct else "Inline HTML / <script> tag")
                     on_request_cb(
@@ -26215,58 +26630,70 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         f"📍 *Source:* {escape_md(src_loc)}"
                     )
 
-                # ── ② File capture — PHP/API/JS response bodies ──────
+                # ── ② Smart pattern-based file capture ───────────────
                 if on_file_cb is None:
                     return
                 if resp_url in _seen_file_urls:
                     return
 
-                # Only capture: script extensions OR JSON/XML API responses
-                should_capture = bool(is_script) or (
-                    is_api and not is_html and len(body_text) > 50
-                )
-                if not should_capture:
-                    return
+                # Score content relevance
+                score, matched = _score_content(body_text)
+
+                if score == 0:
+                    return   # Nothing interesting — skip entirely
 
                 _seen_file_urls.add(resp_url)
 
-                # Build a clean filename from URL
+                # Build filename
                 try:
-                    parsed_resp = urlparse(resp_url)
-                    raw_name    = parsed_resp.path.split('/')[-1] or 'response'
-                    # Strip long query params from filename
-                    raw_name    = raw_name.split('?')[0][:80] or 'response'
+                    p         = urlparse(resp_url)
+                    raw_name  = p.path.split('/')[-1].split('?')[0][:80] or 'response'
                     if not re.search(r'\.\w{2,5}$', raw_name):
-                        # No extension — guess from content-type
-                        ext_map = {
-                            'json':       '.json',
-                            'xml':        '.xml',
-                            'javascript': '.js',
-                            'html':       '.html',
-                            'php':        '.php',
-                        }
-                        ext = next((v for k, v in ext_map.items() if k in ct), '.txt')
+                        ext_map = {'json': '.json', 'xml': '.xml',
+                                   'javascript': '.js', 'html': '.html', 'php': '.php'}
+                        ext      = next((v for k, v in ext_map.items() if k in ct), '.txt')
                         raw_name += ext
-                    filename = re.sub(r'[^\w\.\-]', '_', raw_name)
+                    filename  = re.sub(r'[^\w.\-]', '_', raw_name)
                 except Exception:
                     filename = 'response.txt'
 
-                content_bytes = body_text.encode('utf-8', errors='replace')
-                size_kb       = len(content_bytes) // 1024
+                tags     = ' '.join(matched)
+                size_kb  = len(body_text.encode('utf-8', errors='replace')) // 1024
 
-                # Notify text first
-                on_request_cb(
-                    f"{'─'*34}\n"
-                    f"📂 *File Captured* — `{escape_md(filename)}`\n"
-                    f"🔗 `{escape_md(resp_url[:80])}`\n"
-                    f"📦 Size: `{size_kb} KB` | Type: `{escape_md(ct[:40])}`"
-                )
-
-                # Send file via callback
-                try:
-                    on_file_cb(filename, content_bytes)
-                except Exception:
-                    pass
+                if score >= 3 and _file_count[0] < MAX_FILES:
+                    # HIGH value → send as file
+                    _file_count[0] += 1
+                    on_request_cb(
+                        f"{'─'*34}\n"
+                        f"📂 *High-Value File* `#{_file_count[0]}` — `{escape_md(filename)}`\n"
+                        f"🏷️ {escape_md(tags)}\n"
+                        f"🔗 `{escape_md(resp_url[:80])}`\n"
+                        f"📦 `{size_kb} KB` | score: `{score}`"
+                        + (f"\n⚠️ File cap `{MAX_FILES}` reached — remaining as text only"
+                           if _file_count[0] == MAX_FILES else "")
+                    )
+                    try:
+                        on_file_cb(filename, body_text.encode('utf-8', errors='replace'))
+                    except Exception:
+                        pass
+                elif score >= 1:
+                    # MEDIUM value → text notification only (no file)
+                    # Extract key snippet (first 300 chars of first match)
+                    snippet = ''
+                    for pat, _, _ in _SCORE_PATTERNS:
+                        m2 = pat.search(body_text)
+                        if m2:
+                            start   = max(0, m2.start() - 30)
+                            snippet = body_text[start:start + 200].strip()
+                            snippet = re.sub(r'\s+', ' ', snippet)
+                            break
+                    on_request_cb(
+                        f"{'─'*34}\n"
+                        f"🔍 *Relevant Response* — `{escape_md(filename)}`\n"
+                        f"🏷️ {escape_md(tags)} | score: `{score}`\n"
+                        f"🔗 `{escape_md(resp_url[:70])}`\n"
+                        + (f"```\n{escape_md(snippet[:250])}\n```" if snippet else "")
+                    )
 
             def on_req(request):
                 if stop_event.is_set():
@@ -26391,6 +26818,23 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
             page.on('response', on_resp)
             page.on('request',  on_req)
 
+            # ── Register abort route for auto_submit mode ─────────
+            # POST requests triggered by simulate submit get aborted AFTER
+            # on_req captures the body — prevents real transactions.
+            _SIM_ABORT_METHODS = {'POST', 'PUT', 'PATCH'}
+            if auto_submit:
+                def _abort_sim_post(route):
+                    try:
+                        if route.request.method in _SIM_ABORT_METHODS:
+                            route.abort('aborted')
+                        else:
+                            route.continue_()
+                    except Exception:
+                        try: route.continue_()
+                        except Exception: pass
+                # Only intercept during sim phase — registered just before sim
+                # (see below after page load)
+
             # domcontentloaded = ပိုမြန်တယ်၊ initial requests miss မဖြစ်ဘူး
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=40_000)
@@ -26400,12 +26844,37 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 except Exception:
                     pass
 
+            # ── Wait for initial JS / lazy requests ───────────────
+            try:
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+            # ── Auto-Submit Simulation Phase ──────────────────────
+            if auto_submit and not stop_event.is_set():
+                # ① Register route to abort POST (captures in on_req first)
+                try:
+                    page.route('**/*', _abort_sim_post)
+                except Exception:
+                    pass
+
+                # ② Fill + click
+                _autosubmit_forms_playwright(page, url, on_request_cb, stop_event)
+
+                # ③ Unregister route — resume normal monitoring
+                try:
+                    page.unroute('**/*', _abort_sim_post)
+                except Exception:
+                    pass
+
             # ── Keep Playwright event loop alive ────────────────
             # time.sleep() သုံးလျှင် Playwright event loop block ဖြစ်ပြီး
             # requests process မဖြစ်တော့ဘူး — page.wait_for_timeout() သာ သုံးရမည်
-            elapsed_ms = 0
+            elapsed_ms  = 0
             interval_ms = 500
-            timeout_ms  = timeout_sec * 1000
+            # Subtract time already waited (3s initial + ~5s sim phase)
+            waited_ms   = 3000 + (8000 if auto_submit else 0)
+            timeout_ms  = max(timeout_sec * 1000 - waited_ms, 5000)
             while not stop_event.is_set() and elapsed_ms < timeout_ms:
                 try:
                     page.wait_for_timeout(interval_ms)
@@ -26420,16 +26889,22 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
 
 
 async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/payloadlive <url> — Realtime network request stream + tokenization detection"""
+    """/payloadlive <url> [--sim] — Realtime network request stream + tokenization detection"""
     if not context.args:
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/payloadlive https://example.com`\n\n"
+            "📌 *Usage:* `/payloadlive https://example.com`\n"
+            "         `/payloadlive https://example.com --sim`\n\n"
             "🔴 *Realtime intercepts:*\n"
             "  • POST/PUT/PATCH requests ဝင်တိုင်း ချက်ချင်း ပြသည်\n"
             "  • 💳 Card fields, 💰 Payment info, ✏️ User fields\n"
             "  • 🔐 Tokenization URL detection\n"
             "     (Stripe / Braintree / PayPal / Adyen…)\n"
             "  • 🔄 CSRF / Nonce / Session tokens\n\n"
+            "🤖 *`--sim` flag (Auto-Submit Simulation):*\n"
+            "  • Form fields ကို test data ဖြင့် auto-fill လုပ်သည်\n"
+            "  • Submit button click simulate လုပ်သည်\n"
+            "  • POST body ကို intercept/abort (transaction မဖြစ်)\n"
+            "  • CardPointe / hosted iframe token fields ပါ ကောက်နိုင်\n\n"
             "⏱️ Max 3 minutes — `/stop` နှိပ်ရင် ချက်ချင်း ရပ်သည်\n\n"
             "⚠️ _Authorized testing only._",
             parse_mode='Markdown'
@@ -26443,7 +26918,14 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
-    url = context.args[0].strip()
+    # ── Parse args — URL + optional --sim flag ─────────────────
+    args_lower  = [a.lower() for a in context.args]
+    auto_submit = '--sim' in args_lower or '--autosubmit' in args_lower or '--simulate' in args_lower
+    url_args    = [a for a in context.args if not a.startswith('--')]
+    if not url_args:
+        await update.effective_message.reply_text("❌ URL မပေးဘူး", parse_mode='Markdown')
+        return
+    url = url_args[0].strip()
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -26486,10 +26968,12 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     # ── Status message ─────────────────────────────────────────
+    sim_badge = " `[--sim]`" if auto_submit else ""
     status_msg = await update.effective_message.reply_text(
-        f"🔴 *PayloadLive — `{escape_md(domain)}`*\n\n"
+        f"🔴 *PayloadLive — `{escape_md(domain)}`*{escape_md(sim_badge)}\n\n"
         f"🌐 Intercepting requests...\n"
-        f"⏱️ Max 3 min — `/stop` နှိပ်ရင် ရပ်မည်\n\n"
+        + (f"🤖 Auto-Submit Simulation: *ON*\n" if auto_submit else "")
+        + f"⏱️ Max 3 min — `/stop` နှိပ်ရင် ရပ်မည်\n\n"
         f"⏳ Waiting for first request...",
         parse_mode='Markdown'
     )
@@ -26500,7 +26984,8 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def run_thread():
         _payloadlive_sync(url, on_request_cb, stop_event,
-                          timeout_sec=TIMEOUT, on_file_cb=on_file_cb)
+                          timeout_sec=TIMEOUT, on_file_cb=on_file_cb,
+                          auto_submit=auto_submit)
         loop.call_soon_threadsafe(send_queue.put_nowait, "__DONE__")
 
     thread = threading.Thread(target=run_thread, daemon=True)
