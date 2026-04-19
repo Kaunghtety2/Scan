@@ -24755,7 +24755,7 @@ def _payload_scan_subpages(base_url: str, main_html: str,
     }
 
 
-
+def _payload_fetch_js_sources(html: str, base_url: str, timeout: int = 10) -> dict:
     """
     HTML ထဲက <script src="..."> tag တွေကို fetch ပြီး {url: body} dict return။
     /payload sitekey deep-scan အတွက် သုံးသည်။
