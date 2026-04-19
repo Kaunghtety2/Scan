@@ -24566,8 +24566,296 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
     return results
 
 
+
+# ── Payment/Checkout sub-page paths ──────────────────────────────
+_PAYLOAD_SUBPAGES = [
+    # Payment & checkout
+    "/checkout", "/checkout/", "/cart", "/cart/", "/pay", "/payment",
+    "/payments", "/payment-method", "/billing", "/billing/",
+    "/order", "/order/", "/order-summary", "/purchase",
+    # Donation
+    "/donate", "/donate/", "/donation", "/donations", "/give", "/giving",
+    "/fundraise", "/support",
+    # Subscription
+    "/subscribe", "/subscription", "/upgrade", "/upgrade/plan",
+    "/pricing", "/plans", "/membership",
+    # Auth (CAPTCHA ရတတ်)
+    "/login", "/signin", "/sign-in", "/register", "/signup", "/sign-up",
+    "/forgot-password", "/reset-password",
+    # Contact / form
+    "/contact", "/contact-us", "/contact-form",
+    # Shopify / WooCommerce common paths
+    "/checkout/contact-information",
+    "/checkout/shipping",
+    "/checkout/payment",
+    "/wp-json/wc/store/checkout",
+    "/shop/checkout",
+]
+
+# Link keyword filter — main page <a href> discovery
+_PAYLOAD_LINK_KEYWORDS = [
+    "checkout", "payment", "pay", "billing", "cart", "order",
+    "donate", "donation", "subscribe", "purchase", "membership",
+    "pricing", "upgrade", "plan", "fundraise",
+]
+
+
+def _payload_scan_subpages(base_url: str, main_html: str,
+                            progress_cb=None, max_pages: int = 12,
+                            timeout: int = 10) -> dict:
+    """
+    Payment/checkout sub-page scanner for /payload.
+
+    ① Fixed path list (_PAYLOAD_SUBPAGES) ကို GET request လုပ်သည်
+    ② Main page HTML ထဲမှ payment keyword ပါတဲ့ <a href> links ကို discover လုပ်သည်
+    ③ Sub-page တစ်ခုချင်းစီမှာ forms + sitekeys + gateways extract လုပ်သည်
+
+    Returns:
+        {
+          'forms':    [...]  — extra forms not in main page
+          'sitekeys': [...]  — extra sitekeys
+          'gateways': [...]  — extra gateways
+          'scanned':  [{'url':..., 'status':..., 'forms':N, 'keys':N}]
+        }
+    """
+    parsed   = urlparse(base_url)
+    origin   = f"{parsed.scheme}://{parsed.netloc}"
+
+    extra_forms:    list = []
+    extra_sitekeys: list = []
+    extra_gateways: list = []
+    scanned_log:    list = []
+    seen_endpoints: set  = set()
+    seen_keys:      set  = set()
+    seen_gw:        set  = set()
+
+    # ── ② Discover links from main page HTML ────────────────────────────
+    discovered_paths: list = []
+    try:
+        soup = BeautifulSoup(main_html, 'html.parser')
+        for tag in soup.find_all('a', href=True):
+            href = tag['href'].strip()
+            if not href or href.startswith('#') or href.startswith('javascript'):
+                continue
+            full = urljoin(origin, href)
+            # Same origin only
+            if urlparse(full).netloc != parsed.netloc:
+                continue
+            path = urlparse(full).path.lower()
+            if any(kw in path for kw in _PAYLOAD_LINK_KEYWORDS):
+                disc_path = urlparse(full).path
+                if disc_path not in discovered_paths and disc_path not in _PAYLOAD_SUBPAGES:
+                    discovered_paths.append(disc_path)
+    except Exception:
+        pass
+
+    # Combine: fixed list first (priority), then discovered
+    all_paths = list(_PAYLOAD_SUBPAGES) + discovered_paths
+    # Deduplicate, preserve order
+    seen_paths: set = set()
+    unique_paths: list = []
+    for p in all_paths:
+        if p not in seen_paths:
+            seen_paths.add(p)
+            unique_paths.append(p)
+
+    # ── ① + ② Scan each sub-page ────────────────────────────────────────
+    scanned_count = 0
+    for path in unique_paths:
+        if scanned_count >= max_pages:
+            break
+        sub_url = urljoin(origin, path)
+        safe_ok, _ = is_safe_url(sub_url)
+        if not safe_ok:
+            continue
+        try:
+            r = requests.get(sub_url, headers=_get_headers(),
+                             timeout=timeout, verify=False, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            ct = r.headers.get('content-type', '')
+            if 'text/html' not in ct:
+                continue
+            sub_html = r.text
+            final_url = r.url
+        except Exception:
+            continue
+
+        scanned_count += 1
+        page_forms  = 0
+        page_keys   = 0
+        page_gw     = 0
+
+        if progress_cb:
+            progress_cb(f"🔎 Sub-page: {path}…")
+
+        # ── Forms ──────────────────────────────────────────────────────
+        try:
+            forms = _extract_forms_static(sub_html, final_url)
+            for f in forms:
+                ep  = f.get('endpoint', '')
+                mth = f.get('method', 'POST')
+                sig = (ep, mth)
+                if sig not in seen_endpoints:
+                    seen_endpoints.add(sig)
+                    f['_subpage'] = path         # mark origin
+                    extra_forms.append(f)
+                    page_forms += 1
+        except Exception:
+            pass
+
+        # ── Sitekeys ───────────────────────────────────────────────────
+        try:
+            keys = _extract_captcha_info(sub_html, final_url, {})
+            # Also fetch+scan JS from sub-page
+            sub_js = _payload_fetch_js_sources(sub_html, origin, timeout=8)
+            if sub_js:
+                keys += _extract_captcha_info("", final_url, sub_js)
+            for k in keys:
+                sk = k.get('site_key', '').strip()
+                if sk and sk not in seen_keys:
+                    seen_keys.add(sk)
+                    k['_subpage'] = path
+                    extra_sitekeys.append(k)
+                    page_keys += 1
+        except Exception:
+            pass
+
+        # ── Gateways ───────────────────────────────────────────────────
+        try:
+            gws = _detect_payment_gateway(sub_html, '')
+            for gw in gws:
+                gw_name = gw.get('name', '')
+                if gw_name and gw_name not in seen_gw:
+                    seen_gw.add(gw_name)
+                    gw['_subpage'] = path
+                    extra_gateways.append(gw)
+                    page_gw += 1
+        except Exception:
+            pass
+
+        scanned_log.append({
+            'url':    final_url,
+            'path':   path,
+            'forms':  page_forms,
+            'keys':   page_keys,
+            'gw':     page_gw,
+        })
+
+        if progress_cb:
+            progress_cb(
+                f"✅ {path} → forms:{page_forms} keys:{page_keys} gw:{page_gw}"
+            )
+
+    return {
+        'forms':    extra_forms,
+        'sitekeys': extra_sitekeys,
+        'gateways': extra_gateways,
+        'scanned':  scanned_log,
+    }
+
+
+
+    """
+    HTML ထဲက <script src="..."> tag တွေကို fetch ပြီး {url: body} dict return။
+    /payload sitekey deep-scan အတွက် သုံးသည်။
+    """
+    js_sources: dict = {}
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        for tag in soup.find_all('script', src=True):
+            src = tag.get('src', '').strip()
+            if not src:
+                continue
+            full_url = urljoin(base_url, src)
+            # Skip CDN scripts that don't contain sitekeys
+            if any(skip in full_url for skip in ('google.com/recaptcha', 'hcaptcha.com/1/api',
+                                                   'challenges.cloudflare.com/turnstile')):
+                continue
+            safe_ok, _ = is_safe_url(full_url)
+            if not safe_ok:
+                continue
+            try:
+                r = requests.get(full_url, headers=_get_headers(),
+                                 timeout=timeout, verify=False, allow_redirects=True)
+                if r.status_code == 200 and 'javascript' in r.headers.get('content-type','').lower():
+                    js_sources[full_url] = r.text[:300_000]   # 300KB cap
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return js_sources
+
+
+def _payload_extract_sitekeys(html: str, js_text: str, url: str,
+                               progress_cb=None) -> list:
+    """
+    Full sitekey extraction pipeline for /payload:
+      ① HTML + inline script scan  (_extract_captcha_info)
+      ② External JS file fetch + scan
+      ③ Advanced params  (_extract_advanced_captcha_params)
+      ④ Deobfuscation pass + re-scan
+    Returns merged, deduped list of finding dicts.
+    """
+    combined_html = html + js_text
+    seen_keys:  set  = set()
+    all_findings: list = []
+
+    def _add(finding: dict):
+        sk = finding.get('site_key', '').strip()
+        if sk and sk not in seen_keys:
+            seen_keys.add(sk)
+            all_findings.append(finding)
+        elif not sk:   # "key not found" entries — add once per type
+            typ = finding.get('type', '')
+            if typ not in {f.get('type','') for f in all_findings}:
+                all_findings.append(finding)
+
+    # ── ① HTML + inline script scan ─────────────────────────────────────
+    if progress_cb: progress_cb("🔑 Sitekey: scanning HTML + inline scripts...")
+    for f in _extract_captcha_info(combined_html, url, {}):
+        _add(f)
+
+    # ── ② External JS files ──────────────────────────────────────────────
+    if progress_cb: progress_cb("🔑 Sitekey: fetching external JS files...")
+    parsed   = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    js_sources = _payload_fetch_js_sources(combined_html, base_url)
+
+    if js_sources:
+        if progress_cb: progress_cb(f"🔑 Sitekey: scanning {len(js_sources)} JS file(s)...")
+        for f in _extract_captcha_info("", url, js_sources):
+            _add(f)
+
+    # ── ③ Advanced param extraction (Turnstile full / reCAPTCHA v3 score) ──
+    if progress_cb: progress_cb("🔑 Sitekey: advanced params (action/score/cData)...")
+    try:
+        adv = _extract_advanced_captcha_params(combined_html, js_sources, url)
+        for f in adv:
+            _add(f)
+    except Exception:
+        pass
+
+    # ── ④ Deobfuscation pass (atob / hex / join decode) + re-scan ────────
+    if progress_cb: progress_cb("🔑 Sitekey: deobfuscation pass...")
+    for js_url, js_body in list(js_sources.items()):
+        if len(js_body) < 30:
+            continue
+        try:
+            deob = _deobfuscate_text(js_body)
+            if deob:
+                for f in _extract_captcha_info("", url, {js_url + " [deobf]": deob}):
+                    f['source'] = f.get('source','') + ' [deobfuscated]'
+                    f['confidence'] = f.get('confidence', 'HIGH ✅')
+                    _add(f)
+        except Exception:
+            pass
+
+    return all_findings
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
-    """Main sync — static + playwright + payment + header detection."""
+    """Main sync — static + playwright + payment + header detection + deep sitekey."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
 
     static_html = ''
@@ -24611,22 +24899,68 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🔎 Locating token sources...")
     token_sources = _find_token_sources(static_html + js_html, js_text)
 
-    # Phase 7: reCAPTCHA / hCaptcha / Turnstile info
-    if progress_cb: progress_cb("🤖 Extracting CAPTCHA site key...")
-    recaptcha_info = _extract_recaptcha_info(static_html + js_html, js_text, url)
+    # Phase 7: Full sitekey deep extraction (HTML + JS + deobfuscation)
+    if progress_cb: progress_cb("🔑 Sitekey deep extraction starting...")
+    sitekeys = _payload_extract_sitekeys(
+        static_html + js_html, js_text, url, progress_cb
+    )
+
+    # Phase 8: Sub-page scan (checkout / payment / donate etc.)
+    if progress_cb: progress_cb("🔎 Sub-page scan starting (checkout/pay/donate…)")
+    sub_result = _payload_scan_subpages(
+        url, static_html + js_html, progress_cb, max_pages=12
+    )
+
+    # Merge sub-page forms (dedup vs main forms)
+    main_eps = {(f.get('endpoint',''), f.get('method','POST'))
+                for f in static_forms + js_forms}
+    for sf in sub_result['forms']:
+        ep  = sf.get('endpoint', '')
+        mth = sf.get('method', 'POST')
+        if (ep, mth) not in main_eps:
+            main_eps.add((ep, mth))
+            static_forms.append(sf)
+
+    # Merge sub-page sitekeys
+    main_sk_keys = {f.get('site_key','') for f in sitekeys}
+    for sk in sub_result['sitekeys']:
+        if sk.get('site_key','') not in main_sk_keys:
+            main_sk_keys.add(sk.get('site_key',''))
+            sitekeys.append(sk)
+
+    # Merge sub-page gateways
+    main_gw_names = {g.get('name','') for g in gateways}
+    for gw in sub_result['gateways']:
+        if gw.get('name','') not in main_gw_names:
+            main_gw_names.add(gw.get('name',''))
+            gateways.append(gw)
+
+    # Keep simple recaptcha_info for backward compat (first finding)
+    recaptcha_info = None
+    for sk in sitekeys:
+        if sk.get('site_key'):
+            recaptcha_info = {
+                'site_key':    sk['site_key'],
+                'page_url':    url,
+                'base_url':    f"{urlparse(url).scheme}://{urlparse(url).netloc}",
+                'captcha_type': sk.get('type', 'CAPTCHA'),
+            }
+            break
 
     parsed   = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     return {
-        'url':           url,
-        'base_url':      base_url,
-        'forms':         static_forms + js_forms,
-        'requests':      real_requests,
-        'gateways':      gateways,
-        'headers':       headers_result,
-        'token_sources': token_sources,
-        'recaptcha':     recaptcha_info,
+        'url':              url,
+        'base_url':         base_url,
+        'forms':            static_forms + js_forms,
+        'requests':         real_requests,
+        'gateways':         gateways,
+        'headers':          headers_result,
+        'token_sources':    token_sources,
+        'recaptcha':        recaptcha_info,
+        'sitekeys':         sitekeys,
+        'subpages_scanned': sub_result.get('scanned', []),
     }
 
 
@@ -24692,8 +25026,27 @@ def _format_payload_report(data: dict) -> str:
         [e for e in unique_entries if not e.get('is_payment')]
     )
 
-    # ── Per-entry block ──────────────────────────────────────
-    for idx, entry in enumerate(ordered[:6], 1):
+    lines.append(f"\n📊 *Total:* `{len(ordered)}` endpoint(s) | 💳 Payment: `{pay_cnt}`")
+
+    # ── Sub-page scan summary ────────────────────────────────────
+    subpages = data.get('subpages_scanned', [])
+    if subpages:
+        hit_pages = [s for s in subpages if s['forms'] + s['keys'] + s['gw'] > 0]
+        lines.append(
+            f"🗂️ *Sub-pages scanned:* `{len(subpages)}` "
+            f"| hits: `{len(hit_pages)}`"
+        )
+        for sp in hit_pages:
+            parts = []
+            if sp['forms']: parts.append(f"forms:{sp['forms']}")
+            if sp['keys']:  parts.append(f"keys:{sp['keys']}")
+            if sp['gw']:    parts.append(f"gw:{sp['gw']}")
+            lines.append(
+                f"  └ `{escape_md(sp['path'])}` — {', '.join(parts)}"
+            )
+
+    # ── Per-entry block — ALL entries, no limit ──────────────
+    for idx, entry in enumerate(ordered, 1):
         ep     = entry.get('endpoint', '')
         method = entry.get('method', 'POST')
         ct     = entry.get('enctype', '')
@@ -24702,24 +25055,26 @@ def _format_payload_report(data: dict) -> str:
         src    = '🌐 XHR' if entry.get('source') == 'playwright' else '📋 Form'
         dup_n  = seen_sigs.get(_fields_sig(entry), 1)
 
-        # Shorten content-type label
+        # Content-type label
         ct_short = (ct.replace('application/', '')
                       .replace('x-www-form-urlencoded', 'urlencoded')
                       .replace('; charset=utf-8', '')
-                      .strip()[:40])
+                      .strip()[:50])
 
-        pay_badge = " 💳" if is_pay else ""
-        dup_note  = f" _(×{dup_n} identical)_" if dup_n > 1 else ""
+        pay_badge  = " 💳" if is_pay else ""
+        dup_note   = f" _(×{dup_n} identical)_" if dup_n > 1 else ""
+        sub_note   = f" · `{escape_md(entry.get('_subpage',''))}`" if entry.get('_subpage') else ""
 
         lines.append(f"\n{'━'*34}")
-        lines.append(f"{src}{pay_badge} *#{idx}*{dup_note}")
-        lines.append(f"📡 *Endpoint* : `{escape_md(ep[:70])}`")
-        lines.append(f"🔁 *Method*   : `{escape_md(method)}`")
-        lines.append(f"📦 *Format*   : `{escape_md(ct_short)}`")
+        lines.append(f"{src}{pay_badge} *#{idx}*{dup_note}{sub_note}")
+        lines.append(
+            f"┌ 📡 `{escape_md(method)}`  →  `{escape_md(ep[:80])}`\n"
+            f"└ 📦 `{escape_md(ct_short) if ct_short else 'application/x-www-form-urlencoded'}`"
+        )
 
         if not fields:
             rb = entry.get('raw_body', '')
-            lines.append(f"📝 `{escape_md(rb[:120])}`" if rb else "⚠️ No extractable fields")
+            lines.append(f"📝 `{escape_md(rb[:200])}`" if rb else "⚠️ No extractable fields")
             continue
 
         # ── Classify fields by purpose ───────────────────────
@@ -24739,59 +25094,59 @@ def _format_payload_report(data: dict) -> str:
 
         lines.append("")
 
-        # ── Card fields — JSON code block (ALL, no truncation) ──
+        # ── Card fields — full values, no truncation ────────
         if card_strict:
             lines.append(f"💳 *Card Fields* ({len(card_strict)}):")
             card_json_lines = ["{"]
             for f in card_strict:
-                val     = f['value'][:40] if f.get('value') else ""
-                comment = " // required" if f.get('required') else ""
+                # Full value — no truncation
+                val     = f['value'] if f.get('value') else f.get('field_label', '')
+                val     = val or _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text'))
+                comment = "  // required" if f.get('required') else ""
+                card_type_note = f"  // {f['card_type']}" if f.get('card_type') else ""
                 card_json_lines.append(
-                    f'  "{f["name"]}": "{val or f["field_label"]}",{comment}'
+                    f'  "{f["name"]}": "{val}",{comment}{card_type_note}'
                 )
             card_json_lines.append("}")
             lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
 
-        # ── Payment info — compact ──────────────────────────────
+        # ── Payment info — full values ──────────────────────
         if pay_info:
             lines.append(f"💰 *Payment Info* ({len(pay_info)}):")
             pay_json_lines = ["{"]
             for f in pay_info:
-                val = f['value'][:40] if f.get('value') else f['field_label']
+                val = f['value'] if f.get('value') else f.get('field_label', '')
+                val = val or _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text'))
                 pay_json_lines.append(f'  "{f["name"]}": "{val}",')
             pay_json_lines.append("}")
             lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
 
-        # ── User fields — JSON code block (ALL, no truncation) ──
+        # ── User fields — full values, no truncation ────────
         if user_f:
             lines.append(f"✏️ *User Fields* ({len(user_f)}):")
             user_json_lines = ["{"]
             for f in user_f:
-                val     = (f['value'][:40] if f.get('value')
-                           else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
-                comment = " // required" if f.get('required') else ""
+                val     = f['value'] if f.get('value') else ""
+                val     = val or _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text'))
+                comment = "  // required" if f.get('required') else ""
                 user_json_lines.append(
                     f'  "{f["name"]}": "{val}",{comment}'
                 )
             user_json_lines.append("}")
             lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
 
-        # ── Dynamic fields — compact list ───────────────────────
+        # ── Dynamic fields — compact list ───────────────────
         if dyn_f:
             dyn_names = ", ".join(f"`{escape_md(f['name'])}`" for f in dyn_f)
-            lines.append(f"🔄 *Auto* ({len(dyn_f)}): {dyn_names}")
+            lines.append(f"🔄 *Auto-filled* ({len(dyn_f)}): {dyn_names}")
 
-        # ── Hidden — compact (count + key names only) ───────────
+        # ── Hidden — compact ────────────────────────────────
         if hidden_f:
-            hid_names = ", ".join(f"`{escape_md(f['name'])}`" for f in hidden_f[:8])
-            extra     = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
+            hid_names = ", ".join(f"`{escape_md(f['name'])}`" for f in hidden_f[:12])
+            extra     = f" +{len(hidden_f)-12}" if len(hidden_f) > 12 else ""
             lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hid_names}{escape_md(extra)}")
 
-    skipped = len(ordered) - min(len(ordered), 6)
-    if skipped > 0:
-        lines.append(f"\n_... +{skipped} more endpoint(s) — see JSON file_")
-
-    # ── Header Requirements (compact) ───────────────────────
+    # ── Header Requirements ──────────────────────────────────
     headers_result = data.get('headers', [])
     if headers_result:
         req_h = [h for h in headers_result if h['status_key'] == 'required']
@@ -24819,7 +25174,6 @@ def _format_payload_report(data: dict) -> str:
         lines.append("🔎 *Token Sources*")
         lines.append("_Where dynamic tokens live in page source:_\n")
 
-        # Group by source_type
         groups: dict = {}
         for t in token_sources:
             groups.setdefault(t['source_type'], []).append(t)
@@ -24845,12 +25199,103 @@ def _format_payload_report(data: dict) -> str:
                 lines.append(f"  `{escape_md(t['name'])}`{val_str}")
                 lines.append(f"  _{escape_md(t['label'])}_")
 
+    # ── Sitekey Deep Extraction Section ─────────────────────────
+    sitekeys = data.get('sitekeys', [])
+    if sitekeys:
+        lines.append(f"\n{'━'*34}")
+        lines.append(f"🔑 *Sitekeys Found* ({len(sitekeys)})")
+
+        _SK_TYPE_ICON = {
+            'recaptcha v2':               '♻️',
+            'recaptcha v3':               '♻️',
+            'recaptcha enterprise':       '🏢',
+            'hcaptcha':                   '🟠',
+            'cloudflare turnstile':       '🟠',
+            'cloudflare turnstile (full': '🟠',
+            'cloudflare turnstile (js':   '🟠',
+            'cloudflare turnstile (dyna': '🟠',
+        }
+        def _sk_icon(t: str) -> str:
+            tl = t.lower()
+            for k, v in _SK_TYPE_ICON.items():
+                if k in tl:
+                    return v
+            return '🔑'
+
+        for sk_f in sitekeys:
+            sk_type = sk_f.get('type', 'CAPTCHA')
+            sk_val  = sk_f.get('site_key', '')
+            action  = sk_f.get('action', '')
+            source  = sk_f.get('source', '')
+            conf    = sk_f.get('confidence', '')
+            params  = sk_f.get('params', {})
+            score   = sk_f.get('min_score') or sk_f.get('score_threshold', '')
+            invisible = sk_f.get('invisible', False)
+            s_param   = sk_f.get('s_param', '')
+            icon      = _sk_icon(sk_type)
+
+            lines.append(f"\n{icon} *{escape_md(sk_type)}*"
+                         + (f"  {escape_md(conf)}" if conf else ""))
+            if sk_val:
+                lines.append(f"  `{escape_md(sk_val)}`")
+            if action:
+                lines.append(f"  Action: `{escape_md(action)}`")
+            if score:
+                lines.append(f"  Min score: `{escape_md(str(score))}`")
+            if invisible:
+                lines.append("  ⚠️ Invisible mode")
+            if s_param:
+                lines.append(f"  s\\-param: `{escape_md(s_param)}`")
+            # Extra params (Turnstile full)
+            for pk, pv in params.items():
+                if pk not in ('action',) and pv:
+                    lines.append(f"  {escape_md(pk)}: `{escape_md(str(pv))}`")
+            if source:
+                lines.append(f"  _Source: {escape_md(source[:80])}_")
+
     lines.append(f"\n⚠️ _Authorized testing only._")
     return '\n'.join(lines)
 
 
 def _build_json_export(data: dict) -> str:
-    """Full JSON export — clean version."""
+    """Full JSON export — all fields, no truncation, classified by type."""
+
+    def _classify_entry_fields(entry: dict) -> dict:
+        """Group an entry's fields into card / payment / user / dynamic / hidden."""
+        fields = entry.get('fields', [])
+        return {
+            'card_fields': [
+                {k: v for k, v in f.items()}
+                for f in fields
+                if f.get('card_type') in ('Card Number', 'CVV/CVC', 'Expiry', 'Cardholder Name')
+            ],
+            'payment_info': [
+                {k: v for k, v in f.items()}
+                for f in fields
+                if f.get('card_type') in ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')
+            ],
+            'user_fields': [
+                {k: v for k, v in f.items()}
+                for f in fields
+                if not f.get('is_card') and not f.get('is_dynamic')
+                   and f.get('type') not in ('hidden', 'submit', 'button', 'reset')
+                   and f.get('card_type') not in ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')
+            ],
+            'dynamic_fields': [
+                {k: v for k, v in f.items()}
+                for f in fields
+                if f.get('is_dynamic') and not f.get('is_card')
+            ],
+            'hidden_fields': [
+                {k: v for k, v in f.items()}
+                for f in fields
+                if not f.get('is_card') and not f.get('is_dynamic')
+                   and f.get('type') in ('hidden', 'submit', 'button')
+                   and f.get('card_type') not in ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')
+            ],
+            'all_fields': [{k: v for k, v in f.items()} for f in fields],
+        }
+
     clean = {
         'url':      data.get('url'),
         'base_url': data.get('base_url', ''),
@@ -24860,40 +25305,36 @@ def _build_json_export(data: dict) -> str:
         'requests': [],
     }
     for entry in data.get('forms',[]):
+        classified = _classify_entry_fields(entry)
         clean['forms'].append({
             'source':     entry.get('source'),
             'endpoint':   entry.get('endpoint'),
             'method':     entry.get('method'),
             'enctype':    entry.get('enctype'),
             'is_payment': entry.get('is_payment', False),
-            'fields': [{
-                'name':        f['name'],
-                'type':        f['type'],
-                'value':       f['value'],
-                'required':    f['required'],
-                'field_label': f['field_label'],
-                'is_dynamic':  f['is_dynamic'],
-                'is_card':     f.get('is_card', False),
-                'card_type':   f.get('card_type'),
-            } for f in entry.get('fields', [])]
+            # Classified sections — full values, no truncation
+            'card_fields':    classified['card_fields'],
+            'payment_info':   classified['payment_info'],
+            'user_fields':    classified['user_fields'],
+            'dynamic_fields': classified['dynamic_fields'],
+            'hidden_fields':  classified['hidden_fields'],
+            # Raw full list as well
+            'fields': classified['all_fields'],
         })
     for entry in data.get('requests',[]):
+        classified = _classify_entry_fields(entry)
         clean['requests'].append({
             'endpoint':   entry.get('endpoint'),
             'method':     entry.get('method'),
             'enctype':    entry.get('enctype'),
             'is_payment': entry.get('is_payment', False),
             'raw_body':   entry.get('raw_body',''),
-            'fields': [{
-                'name':        f['name'],
-                'type':        f['type'],
-                'value':       f['value'],
-                'required':    f['required'],
-                'field_label': f['field_label'],
-                'is_dynamic':  f['is_dynamic'],
-                'is_card':     f.get('is_card', False),
-                'card_type':   f.get('card_type'),
-            } for f in entry.get('fields', [])]
+            'card_fields':    classified['card_fields'],
+            'payment_info':   classified['payment_info'],
+            'user_fields':    classified['user_fields'],
+            'dynamic_fields': classified['dynamic_fields'],
+            'hidden_fields':  classified['hidden_fields'],
+            'fields': classified['all_fields'],
         })
     # Headers
     clean['headers'] = [
@@ -24920,6 +25361,25 @@ def _build_json_export(data: dict) -> str:
         }
         for t in data.get('token_sources', [])
     ]
+    # Sitekeys (deep extraction)
+    clean['sitekeys'] = [
+        {
+            'type':        sk.get('type', ''),
+            'site_key':    sk.get('site_key', ''),
+            'page_url':    sk.get('page_url', url if isinstance(url, str) else ''),
+            'action':      sk.get('action', ''),
+            'source':      sk.get('source', ''),
+            'confidence':  sk.get('confidence', ''),
+            'invisible':   sk.get('invisible', False),
+            'min_score':   sk.get('min_score', ''),
+            's_param':     sk.get('s_param', ''),
+            'params':      sk.get('params', {}),
+            '_subpage':    sk.get('_subpage', ''),
+        }
+        for sk in data.get('sitekeys', [])
+    ]
+    # Sub-pages scan log
+    clean['subpages_scanned'] = data.get('subpages_scanned', [])
     return json.dumps(clean, indent=2, ensure_ascii=False)
 
 
@@ -25097,7 +25557,11 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("💳", "Payment gateway detection",        ["gateway"]),
         ("🔍", "Header requirement probing",       ["Probing header", "header"]),
         ("🔎", "Token source detection",           ["token source", "Locating token"]),
-        ("🤖", "CAPTCHA site key extraction",      ["CAPTCHA", "site key", "reCAPTCHA"]),
+        ("🔑", "Sitekey deep extraction",          ["Sitekey", "sitekey", "CAPTCHA", "site key",
+                                                    "reCAPTCHA", "deobfuscation", "inline script",
+                                                    "external JS", "advanced params"]),
+        ("🗂️", "Sub-page scan",                   ["Sub-page", "sub-page", "checkout", "payment",
+                                                    "donate", "subscribe"]),
     ]
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
 
@@ -25139,7 +25603,7 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ── Thread-safe progress bridge ────────────────────────────
-    loop           = asyncio.get_event_loop()
+    loop           = asyncio.get_running_loop()
     progress_queue: asyncio.Queue = asyncio.Queue()
     phase_state    = [0]   # mutable so thread closure can update
 
@@ -25153,24 +25617,29 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     async def progress_editor():
-        """Async task: drain queue, edit Telegram message."""
-        last_text = ""
+        """Async task: drain queue, edit Telegram message (realtime)."""
+        last_text  = ""
+        last_edit  = 0.0
+        MIN_INTERVAL = 1.2   # Telegram rate-limit: min ~1s between edits
         while True:
             try:
-                item = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+                item = await asyncio.wait_for(progress_queue.get(), timeout=0.15)
             except asyncio.TimeoutError:
-                # Check if scan task is still running
                 task_obj = _user_tasks.get(uid)
                 if task_obj and task_obj.done():
                     break
                 continue
-            if item is None:        # sentinel — scan done
+            if item is None:
                 break
             idx, note = item
             new_text = _build_progress_msg(domain, idx, note)
             if new_text == last_text:
                 continue
+            now = asyncio.get_running_loop().time()
+            if now - last_edit < MIN_INTERVAL:
+                await asyncio.sleep(MIN_INTERVAL - (now - last_edit))
             last_text = new_text
+            last_edit = asyncio.get_running_loop().time()
             try:
                 await msg.edit_text(new_text, parse_mode='Markdown')
             except Exception:
@@ -25205,8 +25674,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done_lines = [f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n"]
         for i, (icon, label, _) in enumerate(_PAYLOAD_PHASES):
             done_lines.append(f"✅ {icon} Phase {i+1}: {label}")
-        done_lines.append(f"\n`[{'█' * TOTAL_PHASES}]` 100% — Done\!")
-        await msg.edit_text("\n".join(done_lines), parse_mode='MarkdownV2')
+        done_lines.append(f"\n`[{'█' * TOTAL_PHASES}]` 100% — Done!")
+        await msg.edit_text("\n".join(done_lines), parse_mode='Markdown')
     except Exception:
         pass
 
