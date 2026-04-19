@@ -23820,33 +23820,45 @@ _PAYMENT_GATEWAYS = [
 # ── Card Field Patterns ────────────────────────────────────────
 _CARD_FIELDS = [
     # ── Card number variants ───────────────────────────────────
-    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|card$|^number$', re.I),
+    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|card$|^number$'
+                r'|credit.?card|debit.?card|card.?digit|card.?info|cc$|payment.?card'
+                r'|card.?data|encryptedcardnumber|encryptednumber', re.I),
      "Card Number", "💳", True),
     # ── CVV ───────────────────────────────────────────────────
-    (re.compile(r'cvv|cvc|csc|card.?code|security.?code|cvv2', re.I),
+    (re.compile(r'cvv|cvc|csc|card.?code|security.?code|cvv2'
+                r'|encryptedcvv|encryptedcvc|encryptedcsc|cid$|cardverif', re.I),
      "CVV/CVC", "🔐", True),
     # ── Expiry ────────────────────────────────────────────────
-    (re.compile(r'exp.?year|expirationDateYear|card.?year|expyear', re.I),
+    (re.compile(r'exp.?year|expirationDateYear|card.?year|expyear'
+                r'|encryptedexpiryYear|cc.?yr|expiry.?year', re.I),
      "Expiry Year", "📅", True),
-    (re.compile(r'exp.?date|expiry|exp.?month|expirationDateMonth|card.?exp|mm.?yy|valid.?thru', re.I),
+    (re.compile(r'exp.?date|expiry|exp.?month|expirationDateMonth|card.?exp|mm.?yy|valid.?thru'
+                r'|encryptedexpiryMonth|cc.?month|expiry.?month|card.?valid|exp$', re.I),
      "Expiry Month", "📅", True),
     # ── Cardholder ────────────────────────────────────────────
-    (re.compile(r'card.?holder|cardholder|name.?on.?card|billing.?name', re.I),
+    (re.compile(r'card.?holder|cardholder|name.?on.?card|billing.?name'
+                r'|cc.?name|ccname|card.?owner|holder.?name', re.I),
      "Cardholder Name", "👤", False),
-    # ── Banking (ACH) ─────────────────────────────────────────
-    (re.compile(r'routing.?num|routingnumber|aba.?num|transit.?num', re.I),
+    # ── Banking (ACH / IBAN / SWIFT) ──────────────────────────
+    (re.compile(r'routing.?num|routingnumber|aba.?num|transit.?num|sort.?code', re.I),
      "Routing Number", "🏦", True),
-    (re.compile(r'account.?num|accountnumber|acct.?num|bank.?acct', re.I),
+    (re.compile(r'account.?num|accountnumber|acct.?num|bank.?acct'
+                r'|iban|bban|bank.?account', re.I),
      "Account Number", "🏦", True),
-    (re.compile(r'account.?type|acct.?type', re.I),
+    (re.compile(r'swift|bic.?code|bank.?code', re.I),
+     "SWIFT/BIC", "🏦", True),
+    (re.compile(r'account.?type|acct.?type|bank.?type', re.I),
      "Account Type", "🏦", False),
     # ── Customer/Merchant ID ──────────────────────────────────
-    (re.compile(r'customer.?id|cust.?id|merchant.?id|client.?id$', re.I),
+    (re.compile(r'customer.?id|cust.?id|merchant.?id|client.?id$'
+                r'|buyer.?id|payer.?id|shopper.?id', re.I),
      "Customer ID", "🆔", False),
     # ── Billing address fields ─────────────────────────────────
-    (re.compile(r'billing.?zip|billing.?postal|bill.?zip|bill.?postal', re.I),
+    (re.compile(r'billing.?zip|billing.?postal|bill.?zip|bill.?postal'
+                r'|post.?code|zip.?code', re.I),
      "Billing Zip", "🏠", False),
-    (re.compile(r'billing.?address|billing.?addr|bill.?addr|bill.?address', re.I),
+    (re.compile(r'billing.?address|billing.?addr|bill.?addr|bill.?address'
+                r'|bill.?street|billing.?street|billing.?line', re.I),
      "Billing Address", "🏠", False),
     (re.compile(r'billing.?city|bill.?city', re.I),
      "Billing City", "🏠", False),
@@ -23863,31 +23875,77 @@ _CARD_FIELDS = [
     (re.compile(r'bill.?company|billing.?company', re.I),
      "Billing Company", "🏢", False),
     # ── Amount / Currency ─────────────────────────────────────
-    (re.compile(r'amount|total|price|subtotal|grand.?total', re.I),
+    (re.compile(r'amount|total|price|subtotal|grand.?total'
+                r'|charge|fee|cost|payment.?amount|txn.?amount', re.I),
      "Amount", "💰", False),
-    (re.compile(r'currency|cur$', re.I),
+    (re.compile(r'currency|cur$|currencycode', re.I),
      "Currency", "💱", False),
     # ── Order / Transaction ───────────────────────────────────
-    (re.compile(r'order.?id|transaction.?id|payment.?id|invoice', re.I),
-     "Order/Txn ID", "🧾", True),
+    (re.compile(r'order.?id|transaction.?id|payment.?id|invoice'
+                r'|txn.?id|ref.?id|reference.?num|merchant.?ref', re.I),
+     "Order/Txn ID", "🧾", False),
+    # ── Crypto / Digital Wallet (NEW) ─────────────────────────
+    (re.compile(r'wallet.?addr|crypto.?addr|btc.?addr|eth.?addr|coin.?addr'
+                r'|blockchain.?addr|recipient.?addr', re.I),
+     "Crypto Wallet", "🪙", True),
+    (re.compile(r'seed.?phrase|mnemonic|private.?key|wallet.?key', re.I),
+     "Seed/Private Key", "🔑", True),
+    # ── E-wallet / QR (NEW) ───────────────────────────────────
+    (re.compile(r'paypal.?email|paypal.?id|venmo|cashapp|zelle', re.I),
+     "E-Wallet ID", "📱", True),
+    (re.compile(r'promptpay|qr.?code|phone.?pay|upi.?id|paytm|gcash', re.I),
+     "Mobile Pay ID", "📱", True),
+    # ── Gift Card / Voucher (NEW) ─────────────────────────────
+    (re.compile(r'gift.?card|voucher.?code|promo.?code|coupon.?code'
+                r'|redeem.?code|giftcode', re.I),
+     "Gift/Voucher Code", "🎁", True),
+    # ── Card PIN / Passcode (NEW) ──────────────────────────────
+    (re.compile(r'card.?pin|atm.?pin|debit.?pin|bank.?pin', re.I),
+     "Card PIN", "🔢", True),
+    # ── Card Brand / Network field (NEW) ──────────────────────
+    (re.compile(r'card.?brand|card.?network|card.?type|card.?scheme'
+                r'|payment.?method.?type|cc.?type|cctype', re.I),
+     "Card Brand", "💳", False),
+    # ── Explicit brand field names (NEW) ──────────────────────
+    (re.compile(r'^visa$|visa.?card|visa.?num', re.I),
+     "Card Number (Visa)", "💳", True),
+    (re.compile(r'^mastercard$|master.?card.?num|mc.?num', re.I),
+     "Card Number (Mastercard)", "💳", True),
+    (re.compile(r'amex|american.?express', re.I),
+     "Card Number (Amex)", "💳", True),
+    (re.compile(r'unionpay|union.?pay', re.I),
+     "Card Number (UnionPay)", "💳", True),
+    (re.compile(r'discover.?card|discover.?num', re.I),
+     "Card Number (Discover)", "💳", True),
 ]
 
 # ── Dynamic field patterns ─────────────────────────────────────
 _DYNAMIC_PATTERNS = [
-    (re.compile(r'csrf', re.I),                        "CSRF Token",   "🔄"),
-    (re.compile(r'nonce', re.I),                       "Nonce",        "🔄"),
-    (re.compile(r'_token$', re.I),                     "CSRF Token",   "🔄"),
-    (re.compile(r'authenticity_token', re.I),          "Rails CSRF",   "🔄"),
-    (re.compile(r'__requestverification', re.I),       "ASP.NET CSRF", "🔄"),
-    (re.compile(r'session', re.I),                     "Session ID",   "🔑"),
-    (re.compile(r'sess_?id', re.I),                    "Session ID",   "🔑"),
-    (re.compile(r'phpsessid', re.I),                   "PHP Session",  "🔑"),
-    (re.compile(r'timestamp|expires?_?at|exp$', re.I), "Timestamp",    "⏱️"),
-    (re.compile(r'otp|verification_?code|pin$', re.I), "OTP/Code",     "📟"),
-    (re.compile(r'captcha|recaptcha|h-captcha', re.I), "Captcha",      "🤖"),
-    (re.compile(r'sig(nature)?$|hmac|checksum', re.I), "Signature",    "🔏"),
-    (re.compile(r'payment.?token|pay.?token|pm_', re.I),"Pay Token",   "🔄"),
-    (re.compile(r'client.?secret|publishable.?key', re.I),"PK/Secret", "🔑"),
+    (re.compile(r'csrf', re.I),                           "CSRF Token",    "🔄"),
+    (re.compile(r'nonce', re.I),                          "Nonce",         "🔄"),
+    (re.compile(r'_token$', re.I),                        "CSRF Token",    "🔄"),
+    (re.compile(r'authenticity_token', re.I),             "Rails CSRF",    "🔄"),
+    (re.compile(r'__requestverification', re.I),          "ASP.NET CSRF",  "🔄"),
+    (re.compile(r'session', re.I),                        "Session ID",    "🔑"),
+    (re.compile(r'sess_?id', re.I),                       "Session ID",    "🔑"),
+    (re.compile(r'phpsessid', re.I),                      "PHP Session",   "🔑"),
+    (re.compile(r'timestamp|expires?_?at|exp$', re.I),    "Timestamp",     "⏱️"),
+    (re.compile(r'otp|verification_?code|pin$', re.I),    "OTP/Code",      "📟"),
+    (re.compile(r'captcha|recaptcha|h-captcha', re.I),    "Captcha",       "🤖"),
+    (re.compile(r'sig(nature)?$|hmac|checksum', re.I),    "Signature",     "🔏"),
+    (re.compile(r'payment.?token|pay.?token|pm_', re.I),  "Pay Token",     "🔄"),
+    (re.compile(r'client.?secret|publishable.?key', re.I),"PK/Secret",     "🔑"),
+    # ── NEW additions ──────────────────────────────────────────
+    (re.compile(r'__vt|_vt$|viewstate', re.I),            "ViewState",     "🔄"),
+    (re.compile(r'fingerprint|fp_|device.?id|browser.?id', re.I), "Device Fingerprint", "🖥️"),
+    (re.compile(r'idempotency.?key|idempotency', re.I),   "Idempotency",   "🔄"),
+    (re.compile(r'access.?token|bearer|auth.?token|jwt', re.I), "Auth Token", "🔑"),
+    (re.compile(r'refresh.?token', re.I),                 "Refresh Token", "🔑"),
+    (re.compile(r'api.?key|apikey|x.?api.?key', re.I),    "API Key",       "🔑"),
+    (re.compile(r'turnstile.?token|cf.?token|cf_', re.I), "CF Turnstile",  "🤖"),
+    (re.compile(r'correlation.?id|request.?id|trace.?id', re.I), "Trace ID", "🔄"),
+    (re.compile(r'fraud.?session|threat.?token|px_|perimeterx', re.I), "Anti-Fraud", "🛡️"),
+    (re.compile(r'_ga|_gid|analytics.?id|tracking', re.I), "Analytics ID", "📊"),
 ]
 
 _STATIC_KEYWORDS = re.compile(
@@ -23902,18 +23960,175 @@ _STATIC_KEYWORDS = re.compile(
 # ── Helpers ───────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
 
-def _classify_field(name: str, value: str) -> tuple:
-    """Returns: (label, icon, is_dynamic, card_type_or_None)"""
-    for pattern, label, icon, sensitive in _CARD_FIELDS:
-        if pattern.search(name):
-            return label, icon, sensitive, label
+def _luhn_check(num: str) -> bool:
+    """Luhn algorithm — card number validity စစ်သည်။"""
+    digits = [int(d) for d in reversed(num)]
+    total  = sum(
+        d if i % 2 == 0 else (d * 2 - 9 if d * 2 > 9 else d * 2)
+        for i, d in enumerate(digits)
+    )
+    return total % 10 == 0
+
+
+def _detect_card_brand(num: str) -> str:
+    """
+    BIN prefix ကနေ card brand ရှာသည်။
+    num = digits only, spaces/dashes removed, Luhn already passed.
+    """
+    # Convert first 6 digits to int for range checks
+    try:
+        p2  = int(num[:2])
+        p4  = int(num[:4])
+        p6  = int(num[:6])
+    except (ValueError, IndexError):
+        return ""
+
+    # ── Visa ──────────────────────────────────────────────────
+    if num[0] == '4':
+        return "Visa 💳"
+
+    # ── Mastercard ────────────────────────────────────────────
+    # Classic range: 51-55
+    if 51 <= p2 <= 55:
+        return "Mastercard 💳"
+    # New range: 2221-2720
+    if 2221 <= p4 <= 2720:
+        return "Mastercard 💳"
+
+    # ── American Express ──────────────────────────────────────
+    if p2 in (34, 37):
+        return "Amex 💳"
+
+    # ── Discover ──────────────────────────────────────────────
+    if p4 == 6011 or (622126 <= p6 <= 622925) or (644 <= int(num[:3]) <= 649) or p2 == 65:
+        return "Discover 💳"
+
+    # ── JCB ───────────────────────────────────────────────────
+    if 3528 <= p4 <= 3589:
+        return "JCB 💳"
+
+    # ── Diners Club ───────────────────────────────────────────
+    if 300 <= int(num[:3]) <= 305 or p2 in (36, 38):
+        return "Diners Club 💳"
+
+    # ── UnionPay ──────────────────────────────────────────────
+    if p2 == 62 or (624 <= int(num[:3]) <= 626) or (6282 <= p4 <= 6288):
+        return "UnionPay 💳"
+
+    # ── Maestro ───────────────────────────────────────────────
+    if p4 in (6304, 6759, 6761, 6762, 6763):
+        return "Maestro 💳"
+
+    # ── RuPay (India) ─────────────────────────────────────────
+    if p4 in (6521, 6522) or (60 <= p2 <= 60 and num[2] in '89'):
+        return "RuPay 💳"
+
+    # ── Mir (Russia) ──────────────────────────────────────────
+    if 2200 <= p4 <= 2204:
+        return "Mir 💳"
+
+    return ""
+
+
+def _detect_by_value(name: str, value: str) -> tuple | None:
+    """
+    Value format ကနေ card field ခန့်မှန်းသည်။
+    name obfuscated ဖြစ်နေသော်လည်း value ကနေ detect နိုင်သည်။
+    Returns (label, icon, is_dynamic, card_type) or None
+    """
+    if not value:
+        return None
+    v = re.sub(r'[\s\-]', '', value)
+
+    # ── Card number — Luhn + Brand detection ──────────────────
+    if re.match(r'^\d{13,19}$', v) and _luhn_check(v):
+        brand = _detect_card_brand(v)
+        label = f"Card Number ({brand})" if brand else "Card Number"
+        return label, "💳", False, "Card Number"
+
+    # ── CVV — 3-4 digits + name hint ──────────────────────────
+    if re.match(r'^\d{3,4}$', v) and re.search(r'cv|sec|code|verif', name, re.I):
+        return "CVV/CVC", "🔐", False, "CVV/CVC"
+
+    # ── Expiry MM/YY or MM/YYYY ────────────────────────────────
+    if re.match(r'^(0[1-9]|1[0-2])[\/\-](\d{2}|\d{4})$', v):
+        return "Expiry", "📅", False, "Expiry"
+
+    # ── Expiry month only (01-12) ──────────────────────────────
+    if re.match(r'^(0?[1-9]|1[0-2])$', v) and re.search(r'month|mo|mm', name, re.I):
+        return "Expiry Month", "📅", False, "Expiry Month"
+
+    # ── Expiry year only (20xx) ────────────────────────────────
+    if re.match(r'^20\d{2}$', v) and re.search(r'year|yr|yy', name, re.I):
+        return "Expiry Year", "📅", False, "Expiry Year"
+
+    # ── IBAN ──────────────────────────────────────────────────
+    if re.match(r'^[A-Z]{2}\d{2}[A-Z0-9]{4,30}$', v.upper()):
+        return "Account Number", "🏦", False, "Account Number"
+
+    # ── Crypto address (ETH/BTC/etc.) ─────────────────────────
+    if re.match(r'^0x[0-9a-fA-F]{40}$', v):
+        return "Crypto Wallet", "🪙", False, "Crypto Wallet"
+    if re.match(r'^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$', v) or re.match(r'^bc1[a-z0-9]{39,59}$', v):
+        return "Crypto Wallet", "🪙", False, "Crypto Wallet"
+
+    # ── Long base64/hex — dynamic token ───────────────────────
+    if len(value) > 20 and re.match(r'^[A-Za-z0-9+/=_\-]+$', value):
+        return "Dynamic Token", "🔄", True, None
+
+    return None
+
+
+def _classify_field(name: str, value: str,
+                    ftype: str = 'text',
+                    placeholder: str = '',
+                    aria_label: str = '',
+                    label_text: str = '') -> tuple:
+    """
+    Returns: (label, icon, is_dynamic, card_type_or_None)
+
+    Priority:
+      1. _CARD_FIELDS pattern — name + hint_text combined
+      2. _DYNAMIC_PATTERNS  — name match
+      3. _detect_by_value   — value format (Luhn, IBAN, crypto…)
+      4. HTML input type hint
+      5. _STATIC_KEYWORDS
+      6. Default: User Input
+    """
+    # Combined hint: name + placeholder + aria-label + visible label
+    hint = ' '.join(filter(None, [name, placeholder, aria_label, label_text]))
+
+    # ── ① Card / Payment fields ───────────────────────────────
+    for pattern, label, icon, _ in _CARD_FIELDS:
+        if pattern.search(hint):
+            return label, icon, False, label   # ④ Bug fix: is_dynamic=False (not sensitive)
+
+    # ── ② Dynamic patterns ────────────────────────────────────
     for pattern, label, icon in _DYNAMIC_PATTERNS:
         if pattern.search(name):
             return label, icon, True, None
-    if value and len(value) > 20 and re.match(r'^[A-Za-z0-9+/=_\-]+$', value):
-        return "Dynamic Token", "🔄", True, None
+
+    # ── ③ Value-based detection ───────────────────────────────
+    val_result = _detect_by_value(name, value)
+    if val_result:
+        return val_result
+
+    # ── ① Field type hints (HTML input type) ─────────────────
+    _TYPE_MAP = {
+        'password': ("Password",    "🔒", False, None),
+        'email':    ("Email",       "📧", False, None),
+        'tel':      ("Phone",       "📞", False, None),
+        'number':   ("Numeric",     "🔢", False, None),
+        'date':     ("Date",        "📅", False, None),
+        'hidden':   ("Hidden",      "📌", False, None),
+    }
+    if ftype in _TYPE_MAP:
+        return _TYPE_MAP[ftype]
+
+    # ── ⑤ Static params ───────────────────────────────────────
     if _STATIC_KEYWORDS.search(name):
         return "Static Param", "📌", False, None
+
     return "User Input", "✏️", False, None
 
 
@@ -24011,6 +24226,14 @@ def _extract_forms_static(html: str, page_url: str) -> list:
     """BeautifulSoup ဖြင့် <form> မှ payload structure ထုတ်သည်။"""
     from bs4 import BeautifulSoup
     soup    = BeautifulSoup(html, 'html.parser')
+
+    # ── Pre-build label map: input id → visible label text ────
+    label_map = {}
+    for lbl in soup.find_all('label'):
+        for_id = lbl.get('for', '').strip()
+        if for_id:
+            label_map[for_id] = lbl.get_text(strip=True)
+
     results = []
     for idx, form in enumerate(soup.find_all('form')):
         action  = form.get('action', '')
@@ -24022,15 +24245,23 @@ def _extract_forms_static(html: str, page_url: str) -> list:
         for inp in form.find_all(['input', 'textarea', 'select']):
             name  = inp.get('name') or inp.get('id') or ''
             if not name: continue
-            ftype = inp.get('type', 'text').lower()
-            value = inp.get('value', '')
-            req   = inp.has_attr('required')
-            label, icon, is_dyn, card_type = _classify_field(name, value)
+            ftype       = inp.get('type', 'text').lower()
+            value       = inp.get('value', '')
+            placeholder = inp.get('placeholder', '')
+            aria_label  = inp.get('aria-label', '') or inp.get('aria-labelledby', '')
+            inp_id      = inp.get('id', '')
+            label_text  = label_map.get(inp_id, '')
+            req         = inp.has_attr('required')
+
+            label, icon, is_dyn, card_type = _classify_field(
+                name, value, ftype, placeholder, aria_label, label_text
+            )
             fields.append({
                 'name': name, 'type': ftype, 'value': value[:80],
                 'required': req, 'field_label': label, 'icon': icon,
                 'is_dynamic': is_dyn, 'is_card': card_type is not None,
                 'card_type': card_type,
+                'placeholder': placeholder,
             })
         card_fields = [f for f in fields if f.get('is_card')]
         results.append({
@@ -25866,10 +26097,12 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
     return '\n'.join(lines)
 
 
-def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 180):
+def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 180,
+                      on_file_cb=None):
     """
     Playwright realtime intercept.
     on_request_cb(entry_text: str) — ဒါကို main thread safe queue ထဲ ထည့်မယ်
+    on_file_cb(filename, content_bytes) — PHP/JSON response body file ဖြစ် ပို့မည်
     stop_event: threading.Event — set() ဖြစ်ရင် ရပ်မယ်
     """
     if not PLAYWRIGHT_OK:
@@ -25917,18 +26150,30 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
             page = ctx.new_page()
 
             # ── Response hook — scan JS files for sitekeys ──────
+            # ── + capture PHP/API response bodies as files ───────
+            _SCRIPT_EXTS    = re.compile(r'\.(php\d?|asp|aspx|cfm|jsp|py|rb|cgi)(\?|$)', re.I)
+            _API_RESP_TYPES = ('application/json', 'application/xml', 'text/xml',
+                               'application/javascript', 'text/javascript')
+            _seen_file_urls: set = set()
+
             def on_resp(response):
                 if stop_event.is_set():
                     return
                 resp_url = response.url
-                ct       = response.headers.get('content-type', '')
-                # Only scan JS / HTML responses
-                if not any(x in ct for x in ('javascript', 'html', 'text')):
+                ct       = response.headers.get('content-type', '').lower()
+
+                # ── Skip non-text / non-script content ──────────────
+                is_script = _SCRIPT_EXTS.search(resp_url)
+                is_api    = any(t in ct for t in _API_RESP_TYPES)
+                is_html   = 'html' in ct
+                if not (is_script or is_api or is_html):
                     return
-                # Skip large files — response.text() blocks on large files
+
+                # ── Skip large files ─────────────────────────────────
                 content_len = int(response.headers.get('content-length', '0') or 0)
-                if content_len > 500_000:   # skip > 500KB
+                if content_len > 500_000:
                     return
+
                 try:
                     body_text = response.text()
                     if len(body_text) > 500_000:
@@ -25936,6 +26181,10 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 except Exception:
                     return
 
+                if not body_text or not body_text.strip():
+                    return
+
+                # ── ① Sitekey scan (existing logic) ─────────────────
                 for pat in _RECAPTCHA_SITEKEY_PATTERNS:
                     m = pat.search(body_text)
                     if not m:
@@ -25945,7 +26194,6 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         continue
                     seen_keys.add(key)
 
-                    # Detect type
                     captcha_type = 'reCAPTCHA v2'
                     if re.search(r'grecaptcha\.execute', body_text, re.I):
                         captcha_type = 'reCAPTCHA v3'
@@ -25956,14 +26204,9 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
 
                     parsed   = urlparse(url)
                     base_url = f"{parsed.scheme}://{parsed.netloc}"
-
-                    # Source location
-                    if 'javascript' in ct:
-                        src_loc = f"External JS — `{resp_url[:60]}`"
-                    else:
-                        src_loc = "Inline HTML / <script> tag"
-
-                    msg_text = (
+                    src_loc  = (f"External JS — `{resp_url[:60]}`"
+                                if 'javascript' in ct else "Inline HTML / <script> tag")
+                    on_request_cb(
                         f"{'─'*34}\n"
                         f"🤖 *{escape_md(captcha_type)} — Site Key Found*\n\n"
                         f"  `RECAPTCHA_SITE_KEY` = `{escape_md(key)}`\n"
@@ -25971,7 +26214,59 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         f"  `BASE_URL`           = `{escape_md(base_url)}`\n\n"
                         f"📍 *Source:* {escape_md(src_loc)}"
                     )
-                    on_request_cb(msg_text)
+
+                # ── ② File capture — PHP/API/JS response bodies ──────
+                if on_file_cb is None:
+                    return
+                if resp_url in _seen_file_urls:
+                    return
+
+                # Only capture: script extensions OR JSON/XML API responses
+                should_capture = bool(is_script) or (
+                    is_api and not is_html and len(body_text) > 50
+                )
+                if not should_capture:
+                    return
+
+                _seen_file_urls.add(resp_url)
+
+                # Build a clean filename from URL
+                try:
+                    parsed_resp = urlparse(resp_url)
+                    raw_name    = parsed_resp.path.split('/')[-1] or 'response'
+                    # Strip long query params from filename
+                    raw_name    = raw_name.split('?')[0][:80] or 'response'
+                    if not re.search(r'\.\w{2,5}$', raw_name):
+                        # No extension — guess from content-type
+                        ext_map = {
+                            'json':       '.json',
+                            'xml':        '.xml',
+                            'javascript': '.js',
+                            'html':       '.html',
+                            'php':        '.php',
+                        }
+                        ext = next((v for k, v in ext_map.items() if k in ct), '.txt')
+                        raw_name += ext
+                    filename = re.sub(r'[^\w\.\-]', '_', raw_name)
+                except Exception:
+                    filename = 'response.txt'
+
+                content_bytes = body_text.encode('utf-8', errors='replace')
+                size_kb       = len(content_bytes) // 1024
+
+                # Notify text first
+                on_request_cb(
+                    f"{'─'*34}\n"
+                    f"📂 *File Captured* — `{escape_md(filename)}`\n"
+                    f"🔗 `{escape_md(resp_url[:80])}`\n"
+                    f"📦 Size: `{size_kb} KB` | Type: `{escape_md(ct[:40])}`"
+                )
+
+                # Send file via callback
+                try:
+                    on_file_cb(filename, content_bytes)
+                except Exception:
+                    pass
 
             def on_req(request):
                 if stop_event.is_set():
@@ -26172,12 +26467,21 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Async queue for thread-safe Telegram sends ─────────────
     send_queue: asyncio.Queue = asyncio.Queue()
+    file_queue: asyncio.Queue = asyncio.Queue()   # (filename, content_bytes)
 
     def on_request_cb(text: str):
         """Called from Playwright thread → put into async queue."""
         try:
             loop = asyncio.get_event_loop()
             loop.call_soon_threadsafe(send_queue.put_nowait, text)
+        except Exception:
+            pass
+
+    def on_file_cb(filename: str, content_bytes: bytes):
+        """Called from Playwright thread → put file into file_queue."""
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(file_queue.put_nowait, (filename, content_bytes))
         except Exception:
             pass
 
@@ -26195,14 +26499,51 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TIMEOUT = 180  # 3 minutes
 
     def run_thread():
-        _payloadlive_sync(url, on_request_cb, stop_event, timeout_sec=TIMEOUT)
+        _payloadlive_sync(url, on_request_cb, stop_event,
+                          timeout_sec=TIMEOUT, on_file_cb=on_file_cb)
         loop.call_soon_threadsafe(send_queue.put_nowait, "__DONE__")
 
     thread = threading.Thread(target=run_thread, daemon=True)
     thread.start()
 
     request_count = 0
+    file_count    = 0
     first_received = False
+
+    async def file_sender_loop():
+        """Background task: drain file_queue and send documents."""
+        nonlocal file_count
+        while True:
+            try:
+                item = await asyncio.wait_for(file_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if not thread.is_alive():
+                    break
+                continue
+            if item is None:
+                break
+            filename, content_bytes = item
+            file_count += 1
+            try:
+                import io
+                await update.effective_message.reply_document(
+                    document=io.BytesIO(content_bytes),
+                    filename=filename,
+                    caption=(
+                        f"📂 *LiveCapture #{file_count}* — `{escape_md(filename)}`\n"
+                        f"📦 `{len(content_bytes)//1024} KB`"
+                    ),
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                try:
+                    await update.effective_message.reply_text(
+                        f"⚠️ File send failed: `{escape_md(str(e)[:80])}`",
+                        parse_mode='Markdown')
+                except Exception:
+                    pass
+
+    file_task = asyncio.create_task(file_sender_loop())
 
     async def sender_loop():
         nonlocal request_count, first_received
@@ -26257,12 +26598,20 @@ async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stop_event.set()
 
     # ── Final summary ──────────────────────────────────────────
+    stop_event.set()
+    await file_queue.put(None)   # signal file_sender_loop to stop
+    try:
+        await asyncio.wait_for(file_task, timeout=5.0)
+    except Exception:
+        file_task.cancel()
+
     stop_reason = "🛑 Stopped" if (_cancel_flags.get(uid) and
                                     _cancel_flags[uid].is_set()) else "⏱️ Timeout (3 min)"
     summary = (
         f"{'─'*34}\n"
         f"📊 *Summary — `{escape_md(domain)}`*\n"
         f"📡 Total intercepted: `{request_count}`\n"
+        f"📂 Files captured: `{file_count}`\n"
         f"{stop_reason}"
     )
     try:
