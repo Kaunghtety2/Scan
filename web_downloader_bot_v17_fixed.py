@@ -8625,7 +8625,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
             ws_url = ws.url
             def _on_frame_sent(payload):
                 if payload and len(str(payload)) > 4:
-                    _ws_frames.append({"dir": "send", "url": ws_url,
+                    _ws_frames.append({"dir": "sent", "url": ws_url,
                                        "payload": str(payload)[:500]})
             def _on_frame_recv(payload):
                 if payload and len(str(payload)) > 4:
@@ -9898,12 +9898,13 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             )
 
         return {
-            "error":         None,
-            "live_requests": live_requests,
-            "live_findings": live_findings,
-            "sse_frames":    sse_frames,
-            "ws_frames":     _ws_frames,
-            "page_url":      page_url_ref[0],
+            "error":           None,
+            "live_requests":   live_requests,
+            "live_findings":   live_findings,
+            "sse_frames":      sse_frames,
+            "ws_frames":       _ws_frames,
+            "response_bodies": _plw_response_bodies,   # BUG FIX 3: expose for _gather_all_text_v2
+            "page_url":        page_url_ref[0],
         }
 
     except Exception as e:
@@ -9912,6 +9913,8 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             "live_requests": [],
             "live_findings": [],
             "sse_frames":    [],
+            "ws_frames":     [],          # BUG FIX 1: was missing → KeyError downstream
+            "response_bodies": {},        # BUG FIX 3: was missing → _gather_all_text_v2 missed bodies
             "page_url":      url,
         }
 
@@ -10014,6 +10017,15 @@ def _gather_all_text_v2(data: dict, live_result: dict | None = None) -> list:
     )
     if sse_combined:
         texts.append((sse_combined, "SSE stream frames"))
+
+    # BUG FIX 3b: Also include Playwright-level response bodies
+    # These are captured synchronously and more reliable than JS hook async bodies.
+    for resp_url, resp_body in live_result.get("response_bodies", {}).items():
+        if resp_body and len(resp_body) > 10:
+            label = f"Playwright response ← {resp_url[:60]}"
+            # Dedup: skip if already added via live_requests body
+            if not any(t[1].endswith(resp_url[-40:]) for t in texts):
+                texts.append((resp_body, label))
 
     return texts
 
@@ -10302,10 +10314,16 @@ def _websocket_deep_scan(live_result: dict, patterns: list, seen: set) -> list:
         live_result.get("ws_frames", [])
     )
     for frame in frames:
-        data_str = (
-            frame.get("data", "") or frame.get("message", "")
-            if isinstance(frame, dict) else str(frame)
-        )
+        # BUG FIX 2: _stream_intercept_sync stores WS frames with key "payload"
+        # but this function was only reading "data"/"message" → all WS findings missed.
+        # Now reads both: "payload" (from stream_intercept) + "data"/"message" (legacy)
+        data_str = ""
+        if isinstance(frame, dict):
+            data_str = (frame.get("payload", "")
+                        or frame.get("data", "")
+                        or frame.get("message", ""))
+        else:
+            data_str = str(frame)
         if len(data_str) < 10:
             continue
         # Raw pattern scan
@@ -13260,6 +13278,55 @@ _PAY_PATTERNS = [
     ("Midtrans Client Key",          re.compile(r'\b((?:Mid-client|SB-Mid-client)-[A-Za-z0-9_\-]{20,50})\b')),
     # ══ Payhere (Sri Lanka) ═══════════════════════════════════════════════════
     ("Payhere Merchant ID",          re.compile(r'(?i)payhere[_-]?merchant[_-]?(?:id|secret)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
+    # ══ 2C2P (Myanmar / SEA) ══════════════════════════════════════════════════
+    ("2C2P Merchant ID",             re.compile(r'(?i)2c2p[_-]?merchant[_-]?(?:id|code)\s*[=:]\s*["\']?([A-Za-z0-9]{8,20})["\']?')),
+    ("2C2P Secret Key",              re.compile(r'(?i)2c2p[_-]?(?:secret|key)\s*[=:]\s*["\']([A-Za-z0-9+/=]{16,64})["\']')),
+    ("2C2P Payment Token",           re.compile(r'(?i)paymentToken\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,200})["\']')),
+    # ══ KBZ Pay (Myanmar) ═════════════════════════════════════════════════════
+    ("KBZPay App ID",                re.compile(r'(?i)kbz[_-]?(?:pay[_-]?)?app[_-]?id\s*[=:]\s*["\']?([A-Za-z0-9]{8,40})["\']?')),
+    ("KBZPay Merchant Code",         re.compile(r'(?i)kbz[_-]?merchant[_-]?(?:code|id)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{6,30})["\']?')),
+    ("KBZPay Secret",                re.compile(r'(?i)kbz[_-]?(?:pay[_-]?)?(?:secret|key)\s*[=:]\s*["\']([A-Za-z0-9+/=]{16,80})["\']')),
+    # ══ AYA Pay (Myanmar) ═════════════════════════════════════════════════════
+    ("AYAPay Merchant ID",           re.compile(r'(?i)aya[_-]?(?:pay[_-]?)?merchant[_-]?(?:id|code)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{6,30})["\']?')),
+    ("AYAPay API Key",               re.compile(r'(?i)aya[_-]?(?:pay[_-]?)?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,80})["\']')),
+    # ══ Wave Money (Myanmar) ══════════════════════════════════════════════════
+    ("Wave Money Merchant ID",       re.compile(r'(?i)wave[_-]?money[_-]?merchant[_-]?(?:id|code)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{6,30})["\']?')),
+    ("Wave Money Secret",            re.compile(r'(?i)wave[_-]?(?:money[_-]?)?(?:secret|key)\s*[=:]\s*["\']([A-Za-z0-9+/=]{16,80})["\']')),
+    # ══ CB Pay (CB Bank Myanmar) ══════════════════════════════════════════════
+    ("CB Pay Merchant ID",           re.compile(r'(?i)cb[_-]?(?:pay[_-]?|bank[_-]?)?merchant[_-]?(?:id|code)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{6,30})["\']?')),
+    ("CB Pay API Key",               re.compile(r'(?i)cb[_-]?(?:pay[_-]?)?(?:api[_-]?)?(?:key|secret)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,80})["\']')),
+    # ══ MPU (Myanmar Payment Union) ═══════════════════════════════════════════
+    ("MPU Merchant ID",              re.compile(r'(?i)mpu[_-]?merchant[_-]?(?:id|code)\s*[=:]\s*["\']?([A-Za-z0-9]{6,20})["\']?')),
+    ("MPU Secret Key",               re.compile(r'(?i)mpu[_-]?(?:secret|key)\s*[=:]\s*["\']([A-Za-z0-9+/=]{16,64})["\']')),
+    # ══ OK Dollar / True Money (Myanmar) ══════════════════════════════════════
+    ("OK Dollar Merchant",           re.compile(r'(?i)(?:okdollar|ok[_-]?dollar|truemoney|true[_-]?money)[_-]?(?:merchant|id|key)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{6,40})["\']?')),
+    # ══ Dinger (Myanmar) ══════════════════════════════════════════════════════
+    ("Dinger Merchant ID",           re.compile(r'(?i)dinger[_-]?merchant[_-]?(?:id|code)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{6,30})["\']?')),
+    ("Dinger API Key",               re.compile(r'(?i)dinger[_-]?(?:api[_-]?)?(?:key|secret)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,80})["\']')),
+    # ══ GrabPay (SEA) ═════════════════════════════════════════════════════════
+    ("GrabPay Partner ID",           re.compile(r'(?i)grab[_-]?(?:pay[_-]?)?partner[_-]?(?:id|key)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{10,50})["\']?')),
+    ("GrabPay Client Secret",        re.compile(r'(?i)grab[_-]?(?:pay[_-]?)?client[_-]?secret\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,80})["\']')),
+    # ══ PromptPay QR (Thailand) ═══════════════════════════════════════════════
+    ("PromptPay Merchant ID",        re.compile(r'(?i)promptpay[_-]?(?:merchant[_-]?)?(?:id|number)\s*[=:]\s*["\']?(\d{13,15})["\']?')),
+    # ══ PayMongo (Philippines) ════════════════════════════════════════════════
+    ("PayMongo Public Key",          re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{24,60})\b')),  # same format as Stripe
+    ("PayMongo Secret Key",          re.compile(r'(?i)paymongo[_-]?(?:secret|private)[_-]?key\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,80})["\']')),
+    # ══ OmniPay / Generic SEA patterns ════════════════════════════════════════
+    ("SEA Payment API Key",          re.compile(r'(?i)(?:merchant[_-]?key|payment[_-]?api[_-]?key|gateway[_-]?key)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,80})["\']')),
+    # ══ JS function call-site patterns (NEW) ══════════════════════════════════
+    # loadStripe('pk_live_...') — most common Stripe SDK init
+    ("Stripe Publishable Key",       re.compile(r'(?:loadStripe|Stripe)\s*\(\s*["\']?(pk_(?:live|test)_[A-Za-z0-9]{20,120})["\']?')),
+    # initStripe / createStripe alternatives
+    ("Stripe Publishable Key",       re.compile(r'(?:initStripe|stripeInit|setupStripe)\s*\(\s*["\']?(pk_(?:live|test)_[A-Za-z0-9]{20,120})["\']?')),
+    # Stripe key in env object: NEXT_PUBLIC_STRIPE_KEY: 'pk_...'
+    ("Stripe Publishable Key",       re.compile(r'(?:NEXT_PUBLIC_STRIPE|REACT_APP_STRIPE|VUE_APP_STRIPE|GATSBY_STRIPE)[_A-Z]*\s*[=:]\s*["\']?(pk_(?:live|test)_[A-Za-z0-9]{20,120})["\']?')),
+    # Razorpay init call: new Razorpay({key: 'rzp_live_...'})
+    ("Razorpay Key ID",              re.compile(r'(?:Razorpay|razorpay)\s*\(\s*\{[^}]{0,100}key\s*:\s*["\']?(rzp_(?:live|test)_[A-Za-z0-9]{14,20})["\']?')),
+    # PayPal SDK script URL client-id
+    ("PayPal Client ID",             re.compile(r'paypal\.com/sdk/js\?[^"\']*client-id=([A-Za-z0-9_\-]{10,120})')),
+    # Generic publishableKey / apiKey assignment with payment-key-like values
+    ("Stripe Publishable Key",       re.compile(r'["\']publishableKey["\']\s*:\s*["\']?(pk_(?:live|test)_[A-Za-z0-9]{20,120})["\']?')),
+    ("Stripe Secret Key",            re.compile(r'["\']secretKey["\']\s*:\s*["\']?(sk_(?:live|test)_[A-Za-z0-9]{20,120})["\']?')),
 ]
 
 # ── Gateway prefix lookup for live/test detection ─────────────────────────
@@ -13841,6 +13908,19 @@ _PAY_JS_EVAL = """() => {
         'coinbaseCommerceKey', 'COINBASE_COMMERCE_KEY',
         'alipayAppId', 'ALIPAY_APP_ID',
         'wechatAppId', 'WECHAT_APP_ID', 'WX_APP_ID',
+        // v19+: Myanmar / SEA gateways
+        'kbzPayAppId', 'KBZ_PAY_APP_ID', 'kbzpay_app_id', 'kbzMerchantCode',
+        'ayaPayMerchantId', 'AYA_PAY_MERCHANT_ID', 'ayapay_merchant_id',
+        'waveMoneyMerchantId', 'WAVE_MONEY_MERCHANT_ID', 'wavemoney_merchant_id',
+        'cbPayMerchantId', 'CB_PAY_MERCHANT_ID', 'cbpay_merchant_id',
+        'mpuMerchantId', 'MPU_MERCHANT_ID', 'mpu_merchant_id',
+        'dingerMerchantId', 'DINGER_MERCHANT_ID', 'dinger_merchant_id',
+        'dingerApiKey', 'DINGER_API_KEY',
+        'twoCTwoPMerchantId', '2C2P_MERCHANT_ID', 'c2p_merchant_id',
+        'grabPayPartnerId', 'GRAB_PAY_PARTNER_ID', 'grabpay_partner_id',
+        'promptPayMerchantId', 'PROMPTPAY_MERCHANT_ID',
+        'payMongoPublicKey', 'PAYMONGO_PUBLIC_KEY', 'paymongo_public_key',
+        'xenditPublicKey', 'XENDIT_PUBLIC_KEY', 'xendit_public_key',
     ];
     sdkKeys.forEach(k => {
         try {
@@ -13871,6 +13951,20 @@ _PAY_JS_EVAL = """() => {
         ['FlutterwaveCheckout', window.FlutterwaveCheckout],
         ['AfterPay', window.AfterPay],
         ['Sezzle', window.Sezzle],
+        // v19+: Myanmar / SEA SDK objects
+        ['KBZPay', window.KBZPay],
+        ['kbzpay', window.kbzpay],
+        ['AYAPay', window.AYAPay],
+        ['ayapay', window.ayapay],
+        ['WaveMoney', window.WaveMoney],
+        ['DingerPay', window.DingerPay],
+        ['dinger', window.dinger],
+        ['TwoCTwoP', window.TwoCTwoP],
+        ['CCPP', window.CCPP],
+        ['GrabPay', window.GrabPay],
+        ['grabpay', window.grabpay],
+        ['PayMongo', window.PayMongo],
+        ['paymongo', window.paymongo],
     ];
     envSources.forEach(([k, v]) => {
         if (!v) return;
@@ -13893,7 +13987,12 @@ _PAY_JS_EVAL = """() => {
                      kl.includes('klarna') || kl.includes('adyen') || kl.includes('checkout') ||
                      kl.includes('mollie') || kl.includes('publishable') || kl.includes('client_id') ||
                      kl.includes('paystack') || kl.includes('flutterwave') || kl.includes('cashfree') ||
-                     kl.includes('affirm') || kl.includes('sezzle') || kl.includes('coinbase')) &&
+                     kl.includes('affirm') || kl.includes('sezzle') || kl.includes('coinbase') ||
+                     // Myanmar / SEA
+                     kl.includes('kbz') || kl.includes('ayapay') || kl.includes('wavemoney') ||
+                     kl.includes('dinger') || kl.includes('grabpay') || kl.includes('2c2p') ||
+                     kl.includes('xendit') || kl.includes('midtrans') || kl.includes('mpu') ||
+                     kl.includes('paymongo') || kl.includes('merchant_key') || kl.includes('merchant_id')) &&
                      typeof v === 'string' && v.length > 5) {
                     res['__NEXT_DATA__.env:' + k] = v;
                 }
@@ -13916,7 +14015,12 @@ _PAY_JS_EVAL = """() => {
                      kl.includes('braintree') || kl.includes('square') || kl.includes('razorpay') ||
                      kl.includes('paystack') || kl.includes('flutterwave') || kl.includes('cashfree') ||
                      kl.includes('affirm') || kl.includes('afterpay') || kl.includes('sezzle') ||
-                     kl.includes('coinbase') || kl.includes('alipay') || kl.includes('wechat')) &&
+                     kl.includes('coinbase') || kl.includes('alipay') || kl.includes('wechat') ||
+                     // Myanmar / SEA
+                     kl.includes('kbz') || kl.includes('aya') || kl.includes('wave') ||
+                     kl.includes('dinger') || kl.includes('grabpay') || kl.includes('2c2p') ||
+                     kl.includes('xendit') || kl.includes('midtrans') || kl.includes('mpu') ||
+                     kl.includes('paymongo') || kl.includes('merchant') || kl.includes('gateway')) &&
                      typeof v === 'string' && v.length > 5 && v.length < 300) {
                     res[ck + ':' + k] = v;
                 }
@@ -13934,7 +14038,14 @@ _PAY_JS_EVAL = """() => {
                 kl.includes('adyen') || kl.includes('mollie') || kl.includes('paystack') ||
                 kl.includes('flutterwave') || kl.includes('cashfree') || kl.includes('affirm') ||
                 kl.includes('sezzle') || kl.includes('coinbase') || kl.includes('alipay') ||
-                kl.includes('wechat')) {
+                kl.includes('wechat') ||
+                // Myanmar / SEA
+                kl.includes('kbzpay') || kl.includes('kbz_pay') || kl.includes('ayapay') ||
+                kl.includes('aya_pay') || kl.includes('wavemoney') || kl.includes('wave_money') ||
+                kl.includes('cbpay') || kl.includes('cb_pay') || kl.includes('dinger') ||
+                kl.includes('grabpay') || kl.includes('grab_pay') || kl.includes('paymongo') ||
+                kl.includes('2c2p') || kl.includes('promptpay') || kl.includes('xendit') ||
+                kl.includes('midtrans') || kl.includes('mpu')) {
                 const v = window[k];
                 if (typeof v === 'string' && v.length > 5 && v.length < 500)
                     res['win:' + k] = v;
@@ -14481,7 +14592,50 @@ _PAY_METHOD_SIGNALS = {
     "ACH":             [r"us_bank_account", r"ach_debit", r"plaid"],
     "Buy Now Pay Later": [r"afterpay", r"klarna", r"affirm", r"bnpl", r"pay_later"],
     "Crypto":          [r"coinbase", r"web3", r"wallet_address", r"ETH|BTC|USDC"],
+    # Myanmar / SEA wallets
+    "KBZPay":          [r"kbzpay", r"kbz[_\-]?pay", r"KBZPay", r"kbz\.com"],
+    "AYAPay":          [r"ayapay", r"aya[_\-]?pay", r"AYAPay", r"ayabank"],
+    "Wave Money":      [r"wavemoney", r"wave[_\-]?money", r"WaveMoney"],
+    "CB Pay":          [r"cbpay", r"cb[_\-]?pay", r"CBPay", r"cbbank"],
+    "MPU":             [r"\bMPU\b", r"myanmar.*payment.*union", r"mpu[_\-]?card"],
+    "OK Dollar":       [r"okdollar", r"ok[_\-]?dollar", r"truemoney"],
+    "Dinger":          [r"\bdinger\b", r"dingerpay", r"dinger[_\-]?pay"],
+    "2C2P":            [r"2c2p", r"two[_\-]?c[_\-]?two[_\-]?p", r"ccpp\.net"],
+    "GrabPay":         [r"grabpay", r"grab[_\-]?pay", r"GrabPay", r"grab\.com"],
+    "PromptPay":       [r"promptpay", r"prompt[_\-]?pay", r"PromptPay"],
+    "PayMongo":        [r"paymongo", r"PayMongo"],
+    "Xendit":          [r"xendit", r"Xendit", r"xnd_public"],
+    "Midtrans":        [r"midtrans", r"Midtrans", r"snap\.midtrans"],
 }
+
+# Payment SDK load signals — detect which SDKs are present even without keys
+_PAY_SDK_LOAD_SIGNALS = [
+    ("Stripe.js",        re.compile(r'js\.stripe\.com/v[0-9]|stripe\.js')),
+    ("PayPal SDK",       re.compile(r'paypal\.com/sdk/js|paypal-checkout')),
+    ("Braintree SDK",    re.compile(r'js\.braintreegateway\.com|braintree\.js')),
+    ("Square SDK",       re.compile(r'js\.squareup\.com|web\.squarecdn\.com')),
+    ("Razorpay SDK",     re.compile(r'checkout\.razorpay\.com')),
+    ("Adyen SDK",        re.compile(r'checkoutshopper.*adyen\.com|adyen\.js')),
+    ("Klarna SDK",       re.compile(r'js\.klarna\.com|klarna-payments')),
+    ("Mollie SDK",       re.compile(r'js\.mollie\.com')),
+    ("Checkout.com SDK", re.compile(r'cdn\.checkout\.com')),
+    ("Paddle SDK",       re.compile(r'cdn\.paddle\.com')),
+    ("Paystack SDK",     re.compile(r'js\.paystack\.co')),
+    ("Flutterwave SDK",  re.compile(r'checkout\.flutterwave\.com|rave_inline')),
+    ("Midtrans Snap",    re.compile(r'app\.midtrans\.com|snap\.midtrans\.com')),
+    ("Xendit SDK",       re.compile(r'js\.xendit\.co')),
+    ("Dinger SDK",       re.compile(r'dinger\.app|pay\.dinger')),
+    ("2C2P SDK",         re.compile(r'2c2p\.com|ccpp\.net')),
+    ("KBZPay SDK",       re.compile(r'kbzpay\.com|kbz\.com/pay')),
+    ("AYAPay SDK",       re.compile(r'ayapay\.com|payaya\.aya')),
+    ("Wave Money SDK",   re.compile(r'wavemoney\.io|wave\.com\.mm')),
+    ("GrabPay SDK",      re.compile(r'grab\.com/pay|grabpay\.com')),
+    ("PromptPay",        re.compile(r'promptpay|thqr|qrpayment.*th')),
+    ("Affirm SDK",       re.compile(r'cdn1\.affirm\.com|affirm\.js')),
+    ("Afterpay SDK",     re.compile(r'portal\.afterpay\.com|afterpay\.js')),
+    ("Sezzle SDK",       re.compile(r'checkout\.sezzle\.com')),
+    ("Coinbase Commerce",re.compile(r'commerce\.coinbase\.com')),
+]
 
 # 3DS / SCA enforcement signals
 _3DS_SIGNALS = {
@@ -14783,6 +14937,21 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
     live_result = _stream_intercept_sync(url, progress_cb, extra_patterns=_LIVE_PAY_PATTERNS)
 
+    # BUG FIX 4: If live intercept itself errored, log it but continue with empty result
+    # Previously: error went unchecked → downstream calls crashed on missing keys
+    if live_result.get("error"):
+        if progress_cb:
+            progress_cb(f"⚠️ Live intercept error: {live_result['error'][:80]} — continuing with static scan")
+        live_result = {
+            "live_requests":   [],
+            "live_findings":   [],
+            "sse_frames":      [],
+            "ws_frames":       [],
+            "response_bodies": {},
+            "page_url":        url,
+            "error":           live_result.get("error"),
+        }
+
     # ── v19: extra scan passes ─────────────────────────────────────────────
     html_text = data.get("html", "")
 
@@ -14965,6 +15134,18 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     all_texts_for_profile = _gather_all_text_v2(data, live_result)
     gateway_profile = _pay_gateway_profile(findings, all_texts_for_profile)
 
+    # ── SDK Load Detection — detect SDKs even when no keys found ─────────────
+    combined_for_sdk = "\n".join(t for t, _ in all_texts_for_profile) + "\n" + html_text
+    sdk_hints = []
+    for sdk_name, sdk_pat in _PAY_SDK_LOAD_SIGNALS:
+        if sdk_pat.search(combined_for_sdk):
+            sdk_hints.append(sdk_name)
+    # Also scan raw HTML <script src> tags
+    _html_for_sdk = data.get("html", "")
+    for sdk_name, sdk_pat in _PAY_SDK_LOAD_SIGNALS:
+        if sdk_name not in sdk_hints and sdk_pat.search(_html_for_sdk):
+            sdk_hints.append(sdk_name)
+
     # ── 3DS / SCA Verification (v19 new) ────────────────────────────────────
     combined_js_for_3ds = "\n".join(t for t, _ in all_texts_for_profile)
     tds_result = None
@@ -15001,6 +15182,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         "gateway_profile": gateway_profile,
         "tds_result":     tds_result,
         "sitekeys":  sitekeys,
+        "sdk_hints": sdk_hints,
         "extra_scans": {
             "sourcemaps": len(sourcemap_texts),
             "service_workers": len(sw_texts),
@@ -15008,6 +15190,109 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             "graphql": len(gql_texts),
         },
     }
+
+def _format_live_intercept_section(live_result: dict, findings: list) -> list:
+    """
+    Render a dedicated 🔴 Live Intercept block for the paykeys report.
+    Shows intercepted request/SSE/WS counts, live-only findings,
+    payment endpoint URLs, auth headers captured.
+    """
+    lines = []
+    live_reqs  = live_result.get("live_requests", [])
+    sse_frames = live_result.get("sse_frames",    [])
+    ws_frames  = live_result.get("ws_frames",     [])
+    live_finds = live_result.get("live_findings", [])
+    err        = live_result.get("error")
+
+    if not live_reqs and not live_finds and not sse_frames and not ws_frames:
+        return []
+
+    lines += ["", "🔴 *Live Network Intercept*", "━━━━━━━━━━━━━━━━━━━━"]
+
+    req_c = len(live_reqs)
+    sse_c = len(sse_frames)
+    ws_c  = len(ws_frames)
+    lf_c  = len(live_finds)
+    lines.append(
+        f"📡 Requests: `{req_c}` | SSE: `{sse_c}` | WS: `{ws_c}` | "
+        f"🔍 Secrets: `{lf_c}`"
+    )
+    if err:
+        lines.append(f"⚠️ _{escape_md(str(err)[:80])}_")
+
+    # Pure live-only secrets (not in static scan)
+    static_vals = {f.get("value","")[:60] for f in findings}
+    live_only   = [lf for lf in live_finds
+                   if lf.get("value","")[:60] not in static_vals]
+    if live_only:
+        lines.append("")
+        lines.append(f"🔑 *Live-only secrets — {len(live_only)} found:*")
+        for i, lf in enumerate(live_only[:15], 1):
+            ltype = escape_md(lf.get("type", "unknown"))
+            lval  = lf.get("value", "")[:80].replace("`", "'")
+            lsrc  = escape_md(lf.get("source", "")[:100])
+            conf  = lf.get("confidence", "HIGH")
+            badge = "✅" if "CONFIRM" in conf else ("🔴" if "HIGH" in conf else "🟡")
+            lines.append(f"  *[{i}]* {badge} `{ltype}`")
+            lines.append(f"       🔑 `{lval}`")
+            if lsrc:
+                lines.append(f"       📂 _{lsrc}_")
+
+    # Payment-relevant intercepted endpoints
+    _pay_url_re = re.compile(
+        r"(?i)(stripe|paypal|braintree|square|razorpay|adyen|mollie|checkout"
+        r"|klarna|paddle|paystack|flutterwave|2c2p|midtrans|xendit|payment"
+        r"|billing|cart|pay|wallet|kbzpay|ayapay|wavemoney)", re.I
+    )
+    pay_ep, seen_ep = [], set()
+    for req in live_reqs:
+        u = req.get("url", "")
+        method = req.get("method", req.get("type", "GET")).upper()
+        if _pay_url_re.search(u) and u[:80] not in seen_ep:
+            seen_ep.add(u[:80])
+            pay_ep.append((method, u))
+    if pay_ep:
+        lines.append("")
+        lines.append(f"🌐 *Intercepted Payment Endpoints ({len(pay_ep)}):*")
+        for method, ep_url in pay_ep[:10]:
+            short = ep_url if len(ep_url) <= 85 else "..." + ep_url[-80:]
+            lines.append(f"  `{method}` `{escape_md(short)}`")
+
+    # Auth headers captured
+    auth_hits = []
+    for req in live_reqs:
+        for hn, hv in req.get("headers", {}).items():
+            if hn.lower() in ("authorization", "x-api-key", "x-auth-token",
+                              "x-stripe-key", "stripe-signature"):
+                short_v = hv[:40] + "…" if len(hv) > 40 else hv
+                auth_hits.append(f"`{hn}`: `{escape_md(short_v)}`")
+    if auth_hits:
+        lines.append("")
+        lines.append(f"🔐 *Auth Headers Intercepted ({len(auth_hits)}):*")
+        for ah in auth_hits[:5]:
+            lines.append(f"  {ah}")
+
+    # SSE stream summary
+    if sse_frames:
+        sse_urls = list(dict.fromkeys(
+            f.get("url","")[:70] for f in sse_frames if f.get("url")
+        ))
+        lines.append("")
+        lines.append(f"📡 *SSE Streams ({sse_c} frames):*")
+        for su in sse_urls[:3]:
+            lines.append(f"  `{escape_md(su)}`")
+
+    # WebSocket summary
+    if ws_frames:
+        ws_urls = list(dict.fromkeys(
+            f.get("url","")[:70] for f in ws_frames if f.get("url")
+        ))
+        lines.append("")
+        lines.append(f"🔌 *WebSocket Frames ({ws_c}):*")
+        for wu in ws_urls[:3]:
+            lines.append(f"  `{escape_md(wu)}`")
+
+    return lines
 
 
 async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15090,6 +15375,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_reqs    = len(live_result.get("live_requests", []))
     extra        = result.get("extra_scans", {})
     sitekeys     = result.get("sitekeys", [])
+    sdk_hints    = result.get("sdk_hints", [])
 
     confirmed   = [f for f in findings if "CONFIRMED"   in f.get("confidence","")]
     high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
@@ -15097,15 +15383,53 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_keys   = [f for f in findings if f.get("env") == "🔴 LIVE"]
 
     if not findings:
-        await safe_markdown_reply(msg,
-            f"💳 *Payment Key Extractor v19 — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No payment keys found\n"
-            f"🌐 `{escape_md(page_url)}`\n"
-            f"📡 Static: `{reqs}` | Live: `{live_reqs}`\n"
+        # ── No keys found — still show SDK hints + gateway profile + sitekeys ──
+        no_key_lines = [
+            f"💳 *Payment Key Extractor v19 — `{escape_md(domain)}`*",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            f"📭 *Payment keys မတွေ့ပါ*",
+            f"🌐 `{escape_md(page_url)}`",
+            f"📡 Static: `{reqs}` | Live: `{live_reqs}`",
             f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | "
             f"⚙️ SW: `{extra.get('service_workers',0)}` | "
-            f"🔗 Pages: `{extra.get('subpages',0)}`"
-        )
+            f"🔗 Pages: `{extra.get('subpages',0)}`",
+        ]
+
+        # SDK detection hints — ဘယ် payment SDK ကို load လုပ်ထားသည်
+        if sdk_hints:
+            no_key_lines.append("")
+            no_key_lines.append(f"📦 *Detected Payment SDKs ({len(sdk_hints)}):*")
+            for sdk in sdk_hints[:12]:
+                no_key_lines.append(f"  • {escape_md(sdk)}")
+            no_key_lines.append("")
+            no_key_lines.append(
+                "⚠️ _SDK detected but keys not exposed client\\-side_\n"
+                "_\\(server\\-side only / hosted checkout / tokenization\\)_"
+            )
+        else:
+            no_key_lines.append("")
+            no_key_lines.append("📦 _Payment SDKs မတွေ့ပါ — site uses server-side payment flow_")
+
+        # Gateway profile (methods, 3DS, PCI signals)
+        gw_profile = result.get("gateway_profile")
+        if gw_profile:
+            _gp_lines = _format_pay_gateway_profile(gw_profile)
+            # Only append if there's something meaningful
+            if any(x.strip() and not x.startswith("━") and "No gateway" not in x
+                   for x in _gp_lines[2:]):
+                no_key_lines += _gp_lines
+
+        # 🔴 Live intercept data (even when no keys extracted)
+        live_no_key_section = _format_live_intercept_section(live_result, [])
+        if live_no_key_section:
+            no_key_lines += live_no_key_section
+
+        # Sitekeys even when no payment keys
+        if sitekeys:
+            no_key_lines += _format_sitekey_section(sitekeys)
+
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(no_key_lines)))
         return
 
     # ── Build enhanced report ──────────────────────────────────────────────
@@ -15187,6 +15511,11 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
 
+    # ── 🔴 Live Intercept Section (realtime XHR/fetch/SSE/WS findings) ───────
+    live_section = _format_live_intercept_section(live_result, findings)
+    if live_section:
+        lines += live_section
+
     # ── Gateway Profile block (v18 unique) ─────────────────────────────────
     gw_profile = result.get("gateway_profile")
     if gw_profile:
@@ -15250,6 +15579,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "bot_version":            "v19",
                 "findings":               findings,
                 "sitekeys":               sitekeys,
+                "sdk_hints":              sdk_hints,
                 "live_requests_captured": live_reqs,
                 "sse_frames_captured":    len(live_result.get("sse_frames",[])),
                 "confirmed":              len(confirmed),
@@ -23791,30 +24121,55 @@ def _bypass_sync(url: str) -> list:
 # /payload — Request Payload Structure Extractor (Patterns + Helpers)
 # ══════════════════════════════════════════════════════════════
 _PAYMENT_GATEWAYS = [
-    ("Stripe",       re.compile(r'stripe\.com/v\d|Stripe\.js|stripe\.createToken|stripe\.confirmCard', re.I),
-                     re.compile(r'api\.stripe\.com', re.I), "💳"),
-    ("PayPal",       re.compile(r'paypal\.com/sdk|paypal\.Buttons|PAYPAL', re.I),
-                     re.compile(r'paypal\.com/v\d|paypalobjects', re.I), "🅿️"),
-    ("Braintree",    re.compile(r'braintree|braintreepayments|braintree\.setup', re.I),
-                     re.compile(r'braintreegateway\.com|payments\.braintree', re.I), "🌿"),
-    ("Square",       re.compile(r'squareup\.com|Square\.payments|sq-payment', re.I),
-                     re.compile(r'squareup\.com/v\d', re.I), "⬛"),
-    ("Adyen",        re.compile(r'adyen\.com|AdyenCheckout|adyen\.encrypt', re.I),
-                     re.compile(r'adyen\.com/v\d|checkout\.adyen', re.I), "🔷"),
-    ("Razorpay",     re.compile(r'razorpay\.com|Razorpay\(', re.I),
-                     re.compile(r'api\.razorpay\.com', re.I), "🇮🇳"),
-    ("2Checkout",    re.compile(r'2checkout|TCO\.loadCart|avangate', re.I),
-                     re.compile(r'2co\.com|2checkout\.com', re.I), "2️⃣"),
-    ("Authorize.Net",re.compile(r'authorize\.net|Accept\.js|authorizenet', re.I),
-                     re.compile(r'api\.authorize\.net|accept\.authorize', re.I), "🏦"),
-    ("Klarna",       re.compile(r'klarna\.com|KlarnaCheckout|klarna\.load', re.I),
-                     re.compile(r'klarna\.com/v\d|api\.klarna', re.I), "🟢"),
-    ("Mollie",       re.compile(r'mollie\.com|Mollie\.createPayment', re.I),
-                     re.compile(r'api\.mollie\.com', re.I), "🟡"),
-    ("WooCommerce",  re.compile(r'woocommerce|wc_checkout|wc-checkout', re.I),
-                     re.compile(r'/wc-api/|wc/v\d/orders', re.I), "🛒"),
-    ("Shopify",      re.compile(r'shopify\.com|Shopify\.checkout|shopify_checkout', re.I),
-                     re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "🛍️"),
+    ("Stripe",        re.compile(r'stripe\.com/v\d|Stripe\.js|stripe\.createToken|stripe\.confirmCard|stripe\.elements', re.I),
+                      re.compile(r'api\.stripe\.com', re.I), "💳"),
+    ("PayPal",        re.compile(r'paypal\.com/sdk|paypal\.Buttons|PAYPAL|paypalobjects', re.I),
+                      re.compile(r'paypal\.com/v\d|api\.paypal', re.I), "🅿️"),
+    ("Braintree",     re.compile(r'braintree|braintreepayments|braintree\.setup|dropin\.create', re.I),
+                      re.compile(r'braintreegateway\.com|payments\.braintree', re.I), "🌿"),
+    ("Square",        re.compile(r'squareup\.com|Square\.payments|sq-payment|web-sdk\.squarecdn', re.I),
+                      re.compile(r'squareup\.com/v\d|connect\.squareup', re.I), "⬛"),
+    ("Adyen",         re.compile(r'adyen\.com|AdyenCheckout|adyen\.encrypt|checkoutshopperapi', re.I),
+                      re.compile(r'adyen\.com/v\d|checkout\.adyen', re.I), "🔷"),
+    ("Razorpay",      re.compile(r'razorpay\.com|Razorpay\(|checkout\.razorpay', re.I),
+                      re.compile(r'api\.razorpay\.com', re.I), "🇮🇳"),
+    ("2Checkout",     re.compile(r'2checkout|TCO\.loadCart|avangate|verifone', re.I),
+                      re.compile(r'2co\.com|2checkout\.com', re.I), "2️⃣"),
+    ("Authorize.Net", re.compile(r'authorize\.net|Accept\.js|authorizenet|AcceptUI', re.I),
+                      re.compile(r'api\.authorize\.net|accept\.authorize', re.I), "🏦"),
+    ("Klarna",        re.compile(r'klarna\.com|KlarnaCheckout|klarna\.load|klarnacdn', re.I),
+                      re.compile(r'klarna\.com/v\d|api\.klarna', re.I), "🟢"),
+    ("Mollie",        re.compile(r'mollie\.com|Mollie\.createPayment', re.I),
+                      re.compile(r'api\.mollie\.com', re.I), "🟡"),
+    ("WooCommerce",   re.compile(r'woocommerce|wc_checkout|wc-checkout|wc_stripe', re.I),
+                      re.compile(r'/wc-api/|wc/v\d/orders', re.I), "🛒"),
+    ("Shopify",       re.compile(r'shopify\.com|Shopify\.checkout|shopify_checkout|shop\.app', re.I),
+                      re.compile(r'checkout\.shopify\.com|\.myshopify\.com', re.I), "🛍️"),
+    # ── ENH: Additional gateways ──────────────────────────────────────────
+    ("Paddle",        re.compile(r'paddle\.com|PaddleSetup|paddle\.Initialize|paddle\.Checkout', re.I),
+                      re.compile(r'api\.paddle\.com|sandbox-api\.paddle', re.I), "🏓"),
+    ("Paystack",      re.compile(r'paystack\.com|PaystackPop|paystackintegration', re.I),
+                      re.compile(r'api\.paystack\.co', re.I), "🟩"),
+    ("Flutterwave",   re.compile(r'flutterwave\.com|FlutterwaveCheckout|rave-inline', re.I),
+                      re.compile(r'api\.flutterwave\.com|ravesandbox', re.I), "🦋"),
+    ("CardPointe",    re.compile(r'cardpointe\.com|cardconnect\.com|cardsecure', re.I),
+                      re.compile(r'cardpointe\.com/api|fts\.cardconnect', re.I), "🏧"),
+    ("Checkout.com",  re.compile(r'checkout\.com|Frames\.|cko-payment', re.I),
+                      re.compile(r'api\.checkout\.com', re.I), "✅"),
+    ("Xendit",        re.compile(r'xendit\.co|xendit\.com|XenditEmbedder', re.I),
+                      re.compile(r'api\.xendit\.co', re.I), "🇮🇩"),
+    ("Midtrans",      re.compile(r'midtrans\.com|snap\.js|MidtransNew3ds', re.I),
+                      re.compile(r'api\.midtrans\.com|app\.sandbox\.midtrans', re.I), "🇮🇩"),
+    ("Affirm",        re.compile(r'affirm\.com|_affirm_config|affirm\.ui', re.I),
+                      re.compile(r'api\.affirm\.com', re.I), "🅰️"),
+    ("Afterpay",      re.compile(r'afterpay\.com|clearpay\.co\.uk|afterpaytouch', re.I),
+                      re.compile(r'portal\.afterpay\.com|global-api\.afterpay', re.I), "🔲"),
+    ("Google Pay",    re.compile(r'pay\.google\.com|google.*pay|PaymentRequest', re.I),
+                      re.compile(r'pay\.google\.com/gp', re.I), "🟦"),
+    ("Apple Pay",     re.compile(r'ApplePaySession|apple-pay|apple\.com/apple-pay', re.I),
+                      re.compile(r'apple-pay-gateway', re.I), "🍎"),
+    ("Amazon Pay",    re.compile(r'amazon.*pay|amazonpayments|AmazonPay', re.I),
+                      re.compile(r'pay\.amazon\.com', re.I), "📦"),
 ]
 
 # ── Card Field Patterns ────────────────────────────────────────
@@ -23902,16 +24257,37 @@ _STATIC_KEYWORDS = re.compile(
 # ── Helpers ───────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
 
-def _classify_field(name: str, value: str) -> tuple:
-    """Returns: (label, icon, is_dynamic, card_type_or_None)"""
+def _classify_field(name: str, value: str,
+                    ftype: str = 'text',
+                    placeholder: str = '',
+                    aria_label: str = '',
+                    label_text: str = '') -> tuple:
+    """Returns: (label, icon, is_dynamic, card_type_or_None)
+    ENH: Now uses placeholder + aria-label + visible label for better detection.
+    """
+    # Combined hint text for matching
+    hint = ' '.join(filter(None, [name, placeholder, aria_label, label_text]))
+
     for pattern, label, icon, sensitive in _CARD_FIELDS:
-        if pattern.search(name):
-            return label, icon, sensitive, label
+        if pattern.search(hint):
+            return label, icon, False, label
     for pattern, label, icon in _DYNAMIC_PATTERNS:
         if pattern.search(name):
             return label, icon, True, None
+    # Value-based: long opaque string = likely a token
     if value and len(value) > 20 and re.match(r'^[A-Za-z0-9+/=_\-]+$', value):
         return "Dynamic Token", "🔄", True, None
+    # HTML type hints
+    _TYPE_MAP = {
+        'password': ("Password",  "🔒", False, None),
+        'email':    ("Email",     "📧", False, None),
+        'tel':      ("Phone",     "📞", False, None),
+        'number':   ("Numeric",   "🔢", False, None),
+        'date':     ("Date",      "📅", False, None),
+        'hidden':   ("Hidden",    "📌", False, None),
+    }
+    if ftype in _TYPE_MAP:
+        return _TYPE_MAP[ftype]
     if _STATIC_KEYWORDS.search(name):
         return "Static Param", "📌", False, None
     return "User Input", "✏️", False, None
@@ -24008,30 +24384,95 @@ def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
 
 
 def _extract_forms_static(html: str, page_url: str) -> list:
-    """BeautifulSoup ဖြင့် <form> မှ payload structure ထုတ်သည်။"""
+    """BeautifulSoup ဖြင့် <form> + orphan fields ကို extract လုပ်သည်။
+    ENH: label map, aria-label, placeholder, select options, orphan field capture.
+    """
     from bs4 import BeautifulSoup
-    soup    = BeautifulSoup(html, 'html.parser')
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # ── Build label map: input id/name → visible label text ──────────────
+    label_map = {}
+    for lbl in soup.find_all('label'):
+        txt = lbl.get_text(strip=True)
+        if not txt:
+            continue
+        for_id = lbl.get('for', '').strip()
+        if for_id:
+            label_map[for_id] = txt
+        # Also map by wrapped input
+        wrapped = lbl.find(['input', 'select', 'textarea'])
+        if wrapped:
+            wid = wrapped.get('id', '') or wrapped.get('name', '')
+            if wid and wid not in label_map:
+                label_map[wid] = txt
+
+    def _get_label(inp) -> str:
+        for key in [inp.get('id', ''), inp.get('name', '')]:
+            if key and key in label_map:
+                return label_map[key]
+        al = inp.get('aria-label', '') or inp.get('title', '')
+        if al:
+            return al
+        ph = inp.get('placeholder', '')
+        if ph:
+            return ph
+        # Nearest preceding sibling text
+        try:
+            for sib in reversed(list(inp.previous_siblings)):
+                t = getattr(sib, 'get_text', lambda **k: '')(strip=True)
+                if t and 2 < len(t) < 80:
+                    return t
+        except Exception:
+            pass
+        return ''
+
+    def _build_field(inp, label_override='') -> dict | None:
+        name  = inp.get('name') or inp.get('id') or ''
+        if not name:
+            return None
+        ftype       = inp.get('type', 'text').lower()
+        value       = inp.get('value', '')
+        placeholder = inp.get('placeholder', '')
+        aria_label  = inp.get('aria-label', '') or inp.get('title', '')
+        label_text  = label_override or _get_label(inp)
+        req         = inp.has_attr('required') or inp.get('required') == 'required'
+        # Select options
+        options = []
+        if inp.name == 'select':
+            options = [o.get('value', '') or o.get_text(strip=True)
+                       for o in inp.find_all('option') if o.get('value', '') != ''][:20]
+        label, icon, is_dyn, card_type = _classify_field(
+            name, value, ftype, placeholder, aria_label, label_text
+        )
+        entry = {
+            'name': name, 'type': ftype, 'value': value[:80],
+            'required': req,
+            'field_label': label_text or label,
+            'icon': icon,
+            'is_dynamic': is_dyn,
+            'is_card': card_type is not None,
+            'card_type': card_type,
+            'placeholder': placeholder,
+        }
+        if options:
+            entry['options'] = options
+        return entry
+
     results = []
+    in_form_names: set = set()
+
     for idx, form in enumerate(soup.find_all('form')):
-        action  = form.get('action', '')
-        method  = form.get('method', 'GET').upper()
-        enctype = form.get('enctype', 'application/x-www-form-urlencoded')
+        action   = form.get('action', '')
+        method   = form.get('method', 'GET').upper()
+        enctype  = form.get('enctype', 'application/x-www-form-urlencoded')
         endpoint = (urljoin(page_url, action)
                     if action and not action.startswith('http') else (action or page_url))
         fields = []
         for inp in form.find_all(['input', 'textarea', 'select']):
-            name  = inp.get('name') or inp.get('id') or ''
-            if not name: continue
-            ftype = inp.get('type', 'text').lower()
-            value = inp.get('value', '')
-            req   = inp.has_attr('required')
-            label, icon, is_dyn, card_type = _classify_field(name, value)
-            fields.append({
-                'name': name, 'type': ftype, 'value': value[:80],
-                'required': req, 'field_label': label, 'icon': icon,
-                'is_dynamic': is_dyn, 'is_card': card_type is not None,
-                'card_type': card_type,
-            })
+            f = _build_field(inp)
+            if f:
+                fields.append(f)
+                in_form_names.add(f['name'])
         card_fields = [f for f in fields if f.get('is_card')]
         results.append({
             'source': 'static', 'form_idx': idx + 1,
@@ -24039,6 +24480,31 @@ def _extract_forms_static(html: str, page_url: str) -> list:
             'fields': fields, 'card_fields': card_fields,
             'is_payment': len(card_fields) > 0,
         })
+
+    # ── ENH: Capture inputs OUTSIDE any <form> (orphan fields) ───────────
+    orphan_fields = []
+    for inp in soup.find_all(['input', 'textarea', 'select']):
+        if inp.find_parent('form'):
+            continue
+        ftype = inp.get('type', 'text').lower()
+        if ftype in ('submit', 'button', 'reset', 'image'):
+            continue
+        f = _build_field(inp)
+        if f and f['name'] not in in_form_names:
+            orphan_fields.append(f)
+            in_form_names.add(f['name'])
+
+    if orphan_fields:
+        card_fields = [f for f in orphan_fields if f.get('is_card')]
+        results.append({
+            'source': 'static_orphan', 'form_idx': len(results) + 1,
+            'endpoint': page_url, 'method': 'POST',
+            'enctype': 'application/x-www-form-urlencoded',
+            'fields': orphan_fields, 'card_fields': card_fields,
+            'is_payment': len(card_fields) > 0,
+            'note': 'Fields outside <form> tags',
+        })
+
     return results
 
 
@@ -24126,8 +24592,150 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
             except Exception:
                 try: page.goto(url, wait_until="load", timeout=25_000)
                 except Exception: pass
-            try: page.wait_for_timeout(3000)
+            try: page.wait_for_timeout(4000)
             except Exception: pass
+
+            # ── ENH: DOM field extraction from rendered page + iframes ─────
+            if progress_cb: progress_cb("🔍 Extracting DOM fields (rendered + iframes)...")
+            try:
+                dom_raw = page.evaluate("""() => {
+                    const fields = [];
+                    const seen   = new Set();
+
+                    function getLabel(el) {
+                        if (el.id) {
+                            const lbl = document.querySelector('label[for="' + el.id + '"]');
+                            if (lbl) return lbl.innerText.trim();
+                        }
+                        if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
+                        if (el.title) return el.title.trim();
+                        if (el.placeholder) return el.placeholder.trim();
+                        let p = el.parentElement;
+                        while (p && p.tagName !== 'FORM' && p.tagName !== 'BODY') {
+                            if (p.tagName === 'LABEL') return p.innerText.replace(el.value||'','').trim();
+                            p = p.parentElement;
+                        }
+                        let sib = el.previousElementSibling;
+                        while (sib) {
+                            const t = (sib.innerText || '').trim();
+                            if (t && t.length > 1 && t.length < 80) return t;
+                            sib = sib.previousElementSibling;
+                        }
+                        const par = el.closest('div,td,li,fieldset');
+                        if (par) {
+                            const clone = par.cloneNode(true);
+                            clone.querySelectorAll('input,select,textarea,button').forEach(e=>e.remove());
+                            const t = clone.innerText.trim();
+                            if (t && t.length < 80) return t;
+                        }
+                        return el.name || el.id || '';
+                    }
+
+                    function extractFrom(root, prefix) {
+                        root.querySelectorAll('input,textarea,select').forEach(el => {
+                            const name = el.name || el.id || '';
+                            const type = (el.type || 'text').toLowerCase();
+                            if (!name || ['submit','button','image','reset'].includes(type)) return;
+                            const key = prefix + ':' + name;
+                            if (seen.has(key)) return;
+                            seen.add(key);
+                            const opts = el.tagName === 'SELECT'
+                                ? Array.from(el.options).map(o=>o.value||o.text).filter(Boolean).slice(0,20)
+                                : [];
+                            fields.push({
+                                name, type,
+                                value:       (el.value||'').slice(0,80),
+                                placeholder: el.placeholder||'',
+                                required:    el.required || el.getAttribute('required')!==null,
+                                label:       getLabel(el).slice(0,80),
+                                options:     opts,
+                                from_iframe: prefix !== 'main',
+                            });
+                        });
+                    }
+
+                    extractFrom(document, 'main');
+
+                    document.querySelectorAll('iframe').forEach((fr, i) => {
+                        try {
+                            const doc = fr.contentDocument || fr.contentWindow.document;
+                            if (doc) extractFrom(doc, 'iframe_' + i);
+                        } catch(e) {
+                            fields.push({
+                                name: 'iframe_' + i, type: 'iframe',
+                                value: fr.src || '', placeholder: '',
+                                required: false,
+                                label: 'Hosted payment iframe: ' + (fr.src||'cross-origin'),
+                                options: [], from_iframe: true,
+                            });
+                        }
+                    });
+
+                    const formInfo = [];
+                    document.querySelectorAll('form').forEach((f,i) => {
+                        formInfo.push({idx:i, action:f.action||'', method:(f.method||'POST').toUpperCase()});
+                    });
+                    return {fields, formInfo};
+                }""")
+
+                dom_fields = dom_raw.get('fields', []) if dom_raw else []
+                form_info  = dom_raw.get('formInfo', []) if dom_raw else []
+
+                if dom_fields:
+                    endpoint = page.url
+                    if form_info:
+                        act = form_info[0].get('action', '')
+                        if act and act.startswith('http'):
+                            endpoint = act
+                        elif act:
+                            endpoint = urljoin(url, act)
+
+                    fields_out = []
+                    existing_names: set = set()
+                    for f in dom_fields:
+                        fname      = f.get('name', '')
+                        ftype      = f.get('type', 'text')
+                        fval       = f.get('value', '')
+                        fph        = f.get('placeholder', '')
+                        flabel     = f.get('label', '')
+                        freq       = f.get('required', False)
+                        fopts      = f.get('options', [])
+                        label, icon, is_dyn, card_type = _classify_field(
+                            fname, fval, ftype, fph, '', flabel
+                        )
+                        entry = {
+                            'name': fname, 'type': ftype, 'value': fval[:80],
+                            'required': freq,
+                            'field_label': flabel or label,
+                            'icon': icon, 'is_dynamic': is_dyn,
+                            'is_card': card_type is not None,
+                            'card_type': card_type,
+                            'placeholder': fph,
+                            'from_iframe': f.get('from_iframe', False),
+                        }
+                        if fopts:
+                            entry['options'] = fopts
+                        if fname not in existing_names:
+                            fields_out.append(entry)
+                            existing_names.add(fname)
+
+                    card_fields_dom = [f for f in fields_out if f.get('is_card')]
+                    captured.append({
+                        'source': 'playwright_dom',
+                        'form_idx': len(captured) + 1,
+                        'endpoint': endpoint,
+                        'method': form_info[0].get('method', 'POST') if form_info else 'POST',
+                        'enctype': 'application/x-www-form-urlencoded',
+                        'fields': fields_out,
+                        'card_fields': card_fields_dom,
+                        'is_payment': len(card_fields_dom) > 0,
+                        'note': f'Playwright DOM ({len(dom_fields)} fields, includes iframes)',
+                    })
+                    if progress_cb:
+                        progress_cb(f"✅ DOM: {len(fields_out)} fields (incl. iframes)")
+            except Exception as dom_err:
+                if progress_cb:
+                    progress_cb(f"⚠️ DOM extract: {dom_err}")
 
             # Grab JS source for gateway detection
             try:
@@ -24567,7 +25175,7 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
 
 
 def _payload_sync(url: str, progress_cb=None) -> dict:
-    """Main sync — static + playwright + payment + header detection."""
+    """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
 
     static_html = ''
@@ -24575,58 +25183,179 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         resp = requests.get(url, headers=_get_headers(),
                             timeout=TIMEOUT, verify=False, allow_redirects=True)
         static_html = resp.text
-    except Exception: pass
+    except Exception:
+        pass
 
     static_forms = _extract_forms_static(static_html, url) if static_html else []
-    if progress_cb: progress_cb(f"📋 {len(static_forms)} form(s) — Playwright launching...")
+    if progress_cb: progress_cb(f"📋 {len(static_forms)} static form(s) — Playwright launching...")
 
     pw_requests = _extract_requests_playwright(url, progress_cb)
 
-    js_html  = fetch_with_playwright(url) or ''
+    js_html = fetch_with_playwright(url) or ''
     js_forms = []
     if js_html and js_html != static_html:
         js_forms = _extract_forms_static(js_html, url)
-        existing = {(f['endpoint'],f['method']) for f in static_forms}
-        js_forms = [f for f in js_forms if (f['endpoint'],f['method']) not in existing]
-        for f in js_forms: f['source'] = 'js_render'
+        existing = {(f['endpoint'], f['method']) for f in static_forms}
+        js_forms = [f for f in js_forms if (f['endpoint'], f['method']) not in existing]
+        for f in js_forms:
+            f['source'] = 'js_render'
 
-    # Extract js_text & clean internal entries
-    js_text = ''
+    # ── Split pw_requests: js_text | DOM forms | network requests ────────
+    js_text       = ''
     real_requests = []
+    dom_forms     = []
+
     for r in pw_requests:
         if r.pop('_js_only', False):
-            js_text = r.pop('_js_text','')
+            js_text = r.pop('_js_text', '')
+            continue
+        js_text += r.pop('_js_text', '')
+        if r.get('source') == 'playwright_dom':
+            dom_forms.append(r)
         else:
-            js_text += r.pop('_js_text','')
             real_requests.append(r)
+
+    # ── ENH: Merge DOM-extracted fields (most complete — sees rendered + iframe) ─
+    if dom_forms:
+        existing_field_names: set = {
+            f['name']
+            for form in static_forms + js_forms
+            for f in form.get('fields', [])
+        }
+        for dom_form in dom_forms:
+            new_fields = [
+                f for f in dom_form.get('fields', [])
+                if f['name'] not in existing_field_names
+                   and f.get('type') not in ('hidden', 'submit', 'button', 'reset')
+            ]
+            if new_fields:
+                card_fields = [f for f in new_fields if f.get('is_card')]
+                static_forms.append({
+                    'source': 'playwright_dom',
+                    'form_idx': len(static_forms) + 1,
+                    'endpoint': dom_form.get('endpoint', url),
+                    'method': dom_form.get('method', 'POST'),
+                    'enctype': 'application/x-www-form-urlencoded',
+                    'fields': new_fields,
+                    'card_fields': card_fields,
+                    'is_payment': len(card_fields) > 0,
+                    'note': dom_form.get('note', 'Playwright DOM'),
+                })
+                existing_field_names.update(f['name'] for f in new_fields)
+            # Also fill gaps in first existing form
+            elif static_forms and dom_form.get('fields'):
+                ff = static_forms[0]
+                ff_names = {f['name'] for f in ff.get('fields', [])}
+                for df in dom_form.get('fields', []):
+                    if df['name'] not in ff_names:
+                        ff['fields'].append(df)
+                        ff_names.add(df['name'])
+                        if df.get('is_card'):
+                            ff.setdefault('card_fields', []).append(df)
+                            ff['is_payment'] = True
+
+        if progress_cb:
+            tot = sum(len(f.get('fields', [])) for f in dom_forms)
+            progress_cb(f"✅ DOM merge: {tot} fields total (incl. iframes)")
 
     gateways = _detect_payment_gateway(static_html + js_html, js_text)
     if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
 
-    # Phase 5: Header requirement probing
+    # Phase 5: Header probing
     if progress_cb: progress_cb("🔍 Probing header requirements...")
     headers_result = _probe_header_requirement(url, progress_cb)
 
-    # Phase 6: Token source detection
+    # Phase 6: Token sources
     if progress_cb: progress_cb("🔎 Locating token sources...")
     token_sources = _find_token_sources(static_html + js_html, js_text)
 
-    # Phase 7: reCAPTCHA / hCaptcha / Turnstile info
+    # Phase 7: CAPTCHA sitekeys
     if progress_cb: progress_cb("🤖 Extracting CAPTCHA site key...")
     recaptcha_info = _extract_recaptcha_info(static_html + js_html, js_text, url)
+
+    # ── ENH Phase 8: Sub-page scan ────────────────────────────────────────
+    _SUBPAGES = [
+        "/checkout", "/checkout/payment", "/cart", "/pay", "/payment",
+        "/billing", "/order", "/donate", "/donation", "/subscribe",
+        "/register", "/signup", "/login", "/contact",
+        "/pricing", "/plans", "/membership", "/upgrade",
+    ]
+    if progress_cb: progress_cb("🔗 Scanning payment sub-pages...")
+    subpage_forms: list = []
+    subpage_sitekeys: list = []
+    _parsed = urlparse(url)
+    _origin = f"{_parsed.scheme}://{_parsed.netloc}"
+    _existing_eps = {f.get('endpoint', '') for f in static_forms + js_forms}
+
+    for _sp in _SUBPAGES[:12]:
+        _sub_url = _origin + _sp
+        try:
+            _sr = requests.get(_sub_url, headers=_get_headers(),
+                               timeout=8, verify=False, allow_redirects=True)
+            if _sr.status_code != 200:
+                continue
+            if 'text/html' not in _sr.headers.get('content-type', ''):
+                continue
+            _sub_forms = _extract_forms_static(_sr.text, _sub_url)
+            for sf in _sub_forms:
+                if sf.get('endpoint') not in _existing_eps and sf.get('fields'):
+                    sf['source'] = f'subpage:{_sp}'
+                    subpage_forms.append(sf)
+                    _existing_eps.add(sf.get('endpoint', ''))
+            # Sitekey scan on sub-page
+            _sk = _extract_recaptcha_info(_sr.text, '', _sub_url)
+            if _sk and _sk.get('site_key'):
+                subpage_sitekeys.append(_sk)
+        except Exception:
+            pass
+
+    if subpage_forms and progress_cb:
+        progress_cb(f"✅ Sub-pages: {len(subpage_forms)} extra form(s)")
+
+    # ── ENH Phase 9: 3DS / SCA signal detection ───────────────────────────
+    _combined_text = static_html + js_html + js_text
+    _3DS_SIGS = [
+        (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction'), "Stripe 3DS confirmPayment"),
+        (re.compile(r'(?i)stripe\.confirmCardPayment'),                       "Stripe confirmCardPayment"),
+        (re.compile(r'(?i)requires_action|authentication_required'),          "PaymentIntent requires_action"),
+        (re.compile(r'(?i)threeDS(?:Method|Result|Fingerprint)'),             "Adyen/Generic 3DS"),
+        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),                      "3D Secure"),
+        (re.compile(r'(?i)\.redirect(?:To)?3ds'),                             "redirect3DS"),
+        (re.compile(r'(?i)sca[_\-]?(?:required|enforcement)'),               "SCA enforcement"),
+        (re.compile(r'(?i)cardinal(?:Commerce|cruise)'),                      "Cardinal Commerce 3DS"),
+    ]
+    threeds_signals = [lbl for pat, lbl in _3DS_SIGS if pat.search(_combined_text)]
+
+    # ── ENH Phase 10: Wallet / express pay detection ──────────────────────
+    _WALLET_SIGS = [
+        (re.compile(r'(?i)ApplePaySession|apple.?pay'),       "Apple Pay"),
+        (re.compile(r'(?i)new\s+PaymentRequest|google.?pay'), "Google Pay / Payment Request API"),
+        (re.compile(r'(?i)stripe.*link|link\.stripe\.com'),   "Stripe Link"),
+        (re.compile(r'(?i)amazon.*pay'),                      "Amazon Pay"),
+        (re.compile(r'(?i)shop(?:ify)?\.pay|shop_pay'),       "Shop Pay"),
+        (re.compile(r'(?i)afterpay|clearpay'),                "Afterpay/Clearpay"),
+        (re.compile(r'(?i)klarna\.(?:load|init)'),            "Klarna"),
+        (re.compile(r'(?i)alipay'),                           "Alipay"),
+        (re.compile(r'(?i)wechat.*pay|wechatpay'),            "WeChat Pay"),
+        (re.compile(r'(?i)samsung.?pay'),                     "Samsung Pay"),
+    ]
+    wallets = [lbl for pat, lbl in _WALLET_SIGS if pat.search(_combined_text)]
 
     parsed   = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     return {
-        'url':           url,
-        'base_url':      base_url,
-        'forms':         static_forms + js_forms,
-        'requests':      real_requests,
-        'gateways':      gateways,
-        'headers':       headers_result,
-        'token_sources': token_sources,
-        'recaptcha':     recaptcha_info,
+        'url':              url,
+        'base_url':         base_url,
+        'forms':            static_forms + js_forms + subpage_forms,
+        'requests':         real_requests,
+        'gateways':         gateways,
+        'headers':          headers_result,
+        'token_sources':    token_sources,
+        'recaptcha':        recaptcha_info,
+        'subpage_sitekeys': subpage_sitekeys,
+        'threeds_signals':  threeds_signals,
+        'wallets':          wallets,
     }
 
 
@@ -24654,6 +25383,27 @@ def _format_payload_report(data: dict) -> str:
         lines.append(f"🤖 *{escape_md(rc['captcha_type'])} Detected*")
         lines.append(f"  `RECAPTCHA_SITE_KEY` = `{escape_md(rc['site_key'])}`")
         lines.append(f"  `RECAPTCHA_PAGE_URL` = `{escape_md(rc['page_url'])}`")
+
+    # ── ENH: Sub-page sitekeys ───────────────────────────────
+    for sp_sk in data.get('subpage_sitekeys', []):
+        lines.append(f"🤖 *{escape_md(sp_sk.get('captcha_type','CAPTCHA'))}* (sub-page)")
+        lines.append(f"  `{escape_md(sp_sk.get('site_key',''))}`")
+
+    # ── ENH: 3DS / SCA signals ──────────────────────────────
+    threeds = data.get('threeds_signals', [])
+    if threeds:
+        lines.append("")
+        lines.append("🔐 *3DS / SCA Signals:*")
+        for sig in threeds:
+            lines.append(f"  • {escape_md(sig)}")
+
+    # ── ENH: Wallet / Express pay ───────────────────────────
+    wallets = data.get('wallets', [])
+    if wallets:
+        lines.append("")
+        lines.append("📱 *Wallet / Express Pay:* " + " · ".join(
+            f"`{escape_md(w)}`" for w in wallets
+        ))
 
     all_entries = forms + requests_
     total   = len(all_entries)
@@ -24720,17 +25470,31 @@ def _format_payload_report(data: dict) -> str:
         if not fields:
             rb = entry.get('raw_body', '')
             lines.append(f"📝 `{escape_md(rb[:120])}`" if rb else "⚠️ No extractable fields")
+            # Show iframe hint if present
+            note = entry.get('note', '')
+            if note:
+                lines.append(f"_ℹ️ {escape_md(note)}_")
             continue
+
+        # ── Show subpage source ──────────────────────────────────────────
+        src_label = entry.get('source', '')
+        if src_label.startswith('subpage:'):
+            lines.append(f"_📄 From sub-page: `{escape_md(src_label[8:])}`_")
+        elif src_label == 'playwright_dom':
+            lines.append(f"_🌐 DOM extracted (includes iframes)_")
 
         # ── Classify fields by purpose ───────────────────────
         card_strict = [f for f in fields if f.get('card_type') in
-                       ('Card Number', 'CVV/CVC', 'Expiry', 'Cardholder Name')]
+                       ('Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year', 'Cardholder Name')]
         pay_info    = [f for f in fields if f.get('card_type') in
-                       ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address')]
+                       ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address',
+                        'Billing Zip', 'Billing City', 'Billing State', 'Billing Country',
+                        'Billing Province', 'Billing First Name', 'Billing Last Name', 'Billing Company')]
+        iframe_f    = [f for f in fields if f.get('from_iframe') and f.get('type') == 'iframe']
         user_f      = [f for f in fields
                        if not f.get('is_card') and not f.get('is_dynamic')
-                       and f.get('type') not in ('hidden', 'submit', 'button', 'reset')
-                       and f not in pay_info]
+                       and f.get('type') not in ('hidden', 'submit', 'button', 'reset', 'iframe')
+                       and f not in pay_info and not f.get('from_iframe')]
         dyn_f       = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
         hidden_f    = [f for f in fields
                        if not f.get('is_card') and not f.get('is_dynamic')
@@ -24739,20 +25503,24 @@ def _format_payload_report(data: dict) -> str:
 
         lines.append("")
 
-        # ── Card fields — JSON code block (ALL, no truncation) ──
+        # ── ENH: Iframe hosted fields hint ─────────────────────────────
+        if iframe_f:
+            lines.append(f"🖼️ *Hosted iframe fields* ({len(iframe_f)}):")
+            for f in iframe_f:
+                lines.append(f"  `{escape_md(f.get('label', f['name'])[:80])}`")
+
+        # ── Card fields ─────────────────────────────────────────────────
         if card_strict:
             lines.append(f"💳 *Card Fields* ({len(card_strict)}):")
             card_json_lines = ["{"]
             for f in card_strict:
                 val     = f['value'][:40] if f.get('value') else ""
-                comment = " // required" if f.get('required') else ""
-                card_json_lines.append(
-                    f'  "{f["name"]}": "{val or f["field_label"]}",{comment}'
-                )
+                comment = "  // required" if f.get('required') else ""
+                card_json_lines.append(f'  "{f["name"]}": "{val or f["field_label"]}",{comment}')
             card_json_lines.append("}")
             lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
 
-        # ── Payment info — compact ──────────────────────────────
+        # ── Payment info ─────────────────────────────────────────────────
         if pay_info:
             lines.append(f"💰 *Payment Info* ({len(pay_info)}):")
             pay_json_lines = ["{"]
@@ -24762,26 +25530,30 @@ def _format_payload_report(data: dict) -> str:
             pay_json_lines.append("}")
             lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
 
-        # ── User fields — JSON code block (ALL, no truncation) ──
+        # ── User fields ──────────────────────────────────────────────────
         if user_f:
             lines.append(f"✏️ *User Fields* ({len(user_f)}):")
             user_json_lines = ["{"]
             for f in user_f:
                 val     = (f['value'][:40] if f.get('value')
                            else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
-                comment = " // required" if f.get('required') else ""
-                user_json_lines.append(
-                    f'  "{f["name"]}": "{val}",{comment}'
-                )
+                comment = "  // required" if f.get('required') else ""
+                # ENH: Show select options
+                opts = f.get('options', [])
+                if opts:
+                    opts_str = "|".join(opts[:6])
+                    user_json_lines.append(f'  "{f["name"]}": "{val}",{comment}  /* options: {opts_str} */')
+                else:
+                    user_json_lines.append(f'  "{f["name"]}": "{val}",{comment}')
             user_json_lines.append("}")
             lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
 
-        # ── Dynamic fields — compact list ───────────────────────
+        # ── Dynamic fields ───────────────────────────────────────────────
         if dyn_f:
             dyn_names = ", ".join(f"`{escape_md(f['name'])}`" for f in dyn_f)
             lines.append(f"🔄 *Auto* ({len(dyn_f)}): {dyn_names}")
 
-        # ── Hidden — compact (count + key names only) ───────────
+        # ── Hidden fields ────────────────────────────────────────────────
         if hidden_f:
             hid_names = ", ".join(f"`{escape_md(f['name'])}`" for f in hidden_f[:8])
             extra     = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
