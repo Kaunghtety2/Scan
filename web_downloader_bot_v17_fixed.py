@@ -2815,6 +2815,206 @@ _NOTABLE_HEADERS = [
     'x-application-context', 'x-aspnet-version', 'x-iinfo', 'rndr-id',
 ]
 
+# ══════════════════════════════════════════════════════════════
+# 🔑  GLOBAL PATTERN TABLES  (missing definitions — fixed)
+# ══════════════════════════════════════════════════════════════
+
+# ── Secret patterns: {type: (regex_string, risk_label)} ───────
+_SECRET_PATTERNS = {
+    "AWS Access Key":         (r'AKIA[0-9A-Z]{16}',                                                   "🔴 Critical"),
+    "AWS Secret Key":         (r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})["\']',         "🔴 Critical"),
+    "Stripe Secret Key":      (r'sk_live_[0-9a-zA-Z]{24,}',                                           "🔴 Critical"),
+    "Stripe Publishable Key": (r'pk_live_[0-9a-zA-Z]{24,}',                                           "🟡 Medium"),
+    "Stripe Test Key":        (r'sk_test_[0-9a-zA-Z]{24,}',                                           "🟡 Medium"),
+    "GitHub Token":           (r'ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}',                   "🔴 Critical"),
+    "Google API Key":         (r'AIza[0-9A-Za-z\-_]{35}',                                             "🟠 High"),
+    "Firebase URL":           (r'https://[a-z0-9\-]+\.firebaseio\.com',                               "🟡 Medium"),
+    "Firebase Config":        (r'firebaseConfig\s*=\s*\{[^}]{50,}',                                   "🟡 Medium"),
+    "JWT Token":              (r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}', "🟠 High"),
+    "Private Key (PEM)":      (r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',                  "🔴 Critical"),
+    "Generic Password":       (r'(?i)(?:password|passwd|pwd)\s*[:=]\s*["\']([^"\']{6,})["\']',       "🟠 High"),
+    "Generic Secret":         (r'(?i)(?:secret|api_secret|client_secret)\s*[:=]\s*["\']([A-Za-z0-9_\-]{16,})["\']', "🟠 High"),
+    "MongoDB URI":            (r'mongodb(?:\+srv)?://[^"\'>\s]{10,}',                                 "🔴 Critical"),
+    "PostgreSQL URI":         (r'postgres(?:ql)?://[^"\'>\s]{10,}',                                   "🔴 Critical"),
+    "MySQL URI":              (r'mysql://[^"\'>\s]{10,}',                                              "🟠 High"),
+    "SendGrid API Key":       (r'SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}',                       "🟠 High"),
+    "Twilio Account SID":     (r'AC[a-z0-9]{32}',                                                     "🟡 Medium"),
+    "Twilio Auth Token":      (r'(?i)twilio.{0,20}["\']([a-f0-9]{32})["\']',                         "🟠 High"),
+    "Square Access Token":    (r'sq0atp-[A-Za-z0-9\-_]{22}',                                          "🔴 Critical"),
+    "Mailgun API Key":        (r'key-[a-z0-9]{32}',                                                   "🟠 High"),
+    "Slack Bot Token":        (r'xoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}',                   "🔴 Critical"),
+    "Slack Webhook":          (r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+', "🟠 High"),
+    "NPM Token":              (r'npm_[A-Za-z0-9]{36}',                                                "🟠 High"),
+    "Cloudinary URL":         (r'cloudinary://[0-9]+:[A-Za-z0-9\-_]+@',                              "🟠 High"),
+    "Azure Storage Key":      (r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}', "🔴 Critical"),
+    "GCP Service Account":    (r'"type"\s*:\s*"service_account"',                                     "🔴 Critical"),
+    "Generic Bearer Token":   (r'(?i)bearer\s+([A-Za-z0-9\-_=]{20,})',                               "🟡 Medium"),
+}
+
+# ── Captcha patterns: {cap_type: [compiled_regex_list]} ───────
+_CAPTCHA_PATTERNS = {
+    "reCAPTCHA v2":         [re.compile(r'["\']sitekey["\']\s*:\s*["\']([^"\']{30,60})["\']', re.I),
+                              re.compile(r'data-sitekey=["\']([^"\']{30,60})["\']', re.I)],
+    "reCAPTCHA v3":         [re.compile(r'grecaptcha\.execute\s*\(\s*["\']([^"\']{30,60})["\']', re.I)],
+    "reCAPTCHA Enterprise": [re.compile(r'RecaptchaEnterpriseService.*?["\']([^"\']{30,60})["\']', re.I)],
+    "hCaptcha":             [re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I)],
+    "Cloudflare Turnstile": [re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']0x[0-9A-Fa-f]{30,}["\']', re.I)],
+    "FunCaptcha":           [re.compile(r'(?:public_key|data-pkey)\s*[:=]\s*["\']([0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12})["\']', re.I)],
+    "GeeTest":              [re.compile(r'\bgt\s*:\s*["\']([a-f0-9]{32})["\']', re.I)],
+    "AWS WAF Captcha":      [re.compile(r'AwsWafCaptcha|aws-waf-token', re.I)],
+    "DataDome":             [re.compile(r'datadome|dd_cookie', re.I)],
+    "Kasada Bot Defense":   [re.compile(r'kasada|kpsdk', re.I)],
+    "Akamai Bot Manager":   [re.compile(r'_abck|bm_sz|akamai-bm', re.I)],
+    "PerimeterX/HUMAN":     [re.compile(r'_pxhd|_px2|px\.js|PerimeterX', re.I)],
+    "FriendlyCaptcha":      [re.compile(r'friendly-challenge|frc-captcha', re.I)],
+    "mCaptcha":             [re.compile(r'mcaptcha|m-captcha', re.I)],
+    "MTCaptcha":            [re.compile(r'mtcaptcha|mt-captcha', re.I)],
+    "Imperva/Incapsula":    [re.compile(r'incap_ses|visid_incap|___utmvc', re.I)],
+    "Tencent Captcha":      [re.compile(r'TencentCaptcha|tc-captcha', re.I)],
+    "Yandex SmartCaptcha":  [re.compile(r'SmartCaptcha|yandex-smart', re.I)],
+    "NopeCHA":              [re.compile(r'nopecha|nope-cha', re.I)],
+    "Lexi Shield":          [re.compile(r'lexi-shield|lexishield', re.I)],
+    "Netacea":              [re.compile(r'netacea|ntc-', re.I)],
+    "F5 Shape Security":    [re.compile(r'f5-shape|shape-security|shp_', re.I)],
+    "Captcha (generic)":    [re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I)],
+}
+
+# ── Key validators: {cap_type: validator_func_or_None} ────────
+_KEY_VALIDATORS = {cap_type: None for cap_type in _CAPTCHA_PATTERNS}
+
+# ── Network URL patterns for captcha key capture ──────────────
+_NET_PATTERNS = [
+    (re.compile(r'[?&]k=([A-Za-z0-9_\-]{30,})',                                               re.I), "reCAPTCHA v2"),
+    (re.compile(r'render=([A-Za-z0-9_\-]{30,})',                                               re.I), "reCAPTCHA v3"),
+    (re.compile(r'sitekey=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',  re.I), "hCaptcha"),
+    (re.compile(r'sitekey=(0x[0-9A-Fa-f]{30,})',                                               re.I), "Cloudflare Turnstile"),
+    (re.compile(r'public_key=([0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12})',                  re.I), "FunCaptcha"),
+    (re.compile(r'gt=([a-f0-9]{32})',                                                           re.I), "GeeTest"),
+    (re.compile(r'[?&]k=([A-Za-z0-9_\-]{20,})',                                                re.I), "Captcha (generic)"),
+]
+
+# ── Asset categories for APK/IPA analysis ─────────────────────
+_ASSET_CATEGORIES = {
+    "JavaScript":   {".js", ".mjs", ".cjs"},
+    "HTML":         {".html", ".htm", ".xhtml"},
+    "CSS":          {".css", ".scss", ".sass", ".less"},
+    "Images":       {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp"},
+    "Fonts":        {".ttf", ".otf", ".woff", ".woff2", ".eot"},
+    "Config":       {".json", ".yaml", ".yml", ".xml", ".plist", ".properties", ".env", ".ini", ".cfg"},
+    "Source":       {".py", ".java", ".kt", ".swift", ".ts", ".tsx", ".jsx", ".go", ".rb", ".php"},
+    "Data":         {".csv", ".tsv", ".sql", ".db", ".sqlite"},
+    "Documents":    {".pdf", ".txt", ".md", ".rst"},
+    "Archives":     {".zip", ".tar", ".gz", ".bz2", ".7z"},
+    "Certificates": {".pem", ".crt", ".cer", ".der", ".p12", ".pfx", ".key"},
+    "Native":       {".so", ".dylib", ".dll", ".a", ".o"},
+}
+
+# ── Binary file extensions (string extraction) ────────────────
+_BINARY_EXTS = {".so", ".dylib", ".dll", ".a", ".o", ".bin", ".dat", ".class", ".dex"}
+
+# ── API live validators: {key_type: {url, method, headers, valid_if, invalid_if}} ─
+_API_LIVE_VALIDATORS = {
+    "Google API Key": {
+        "url":        "https://maps.googleapis.com/maps/api/staticmap?center=0,0&zoom=1&size=1x1&key={key}",
+        "method":     "GET",
+        "headers":    {},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code in (400, 403),
+    },
+    "GitHub Token": {
+        "url":        "https://api.github.com/user",
+        "method":     "GET",
+        "headers":    {"Authorization": "token {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Stripe Secret Key": {
+        "url":        "https://api.stripe.com/v1/balance",
+        "method":     "GET",
+        "headers":    {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Stripe Publishable Key": {
+        "url":        "https://api.stripe.com/v1/tokens",
+        "method":     "GET",
+        "headers":    {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code in (200, 400),
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "SendGrid API Key": {
+        "url":        "https://api.sendgrid.com/v3/user/profile",
+        "method":     "GET",
+        "headers":    {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Slack Bot Token": {
+        "url":        "https://slack.com/api/auth.test",
+        "method":     "GET",
+        "headers":    {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code in (400, 401),
+    },
+    "NPM Token": {
+        "url":        "https://registry.npmjs.org/-/whoami",
+        "method":     "GET",
+        "headers":    {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+}
+
+# ── App file extensions for /appassets ────────────────────────
+_APP_EXTS = {
+    ".apk": "Android APK",
+    ".aab": "Android App Bundle",
+    ".ipa": "iOS IPA",
+    ".zip": "ZIP Archive",
+    ".tar": "TAR Archive",
+    ".gz":  "GZip Archive",
+}
+
+# ── Directories to skip during app asset scan ─────────────────
+_SKIP_DIRS = [
+    "__MACOSX", ".git", "node_modules", "Pods/",
+    "build/intermediates", "build/generated",
+    "DerivedData", ".gradle", ".idea",
+]
+
+# ── URL patterns for app text content scan ────────────────────
+_APP_URL_PATTERNS = [
+    re.compile(r'https?://[A-Za-z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]{10,}'),
+    re.compile(r'(?:api|endpoint|base.?url|server.?url)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+    re.compile(r'(?:wss?|ftp)://[A-Za-z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]{8,}'),
+]
+
+# ── Secret patterns for app source scan ───────────────────────
+_APP_SECRET_PATTERNS = {
+    "API Key":        re.compile(r'(?i)api.?key\s*[:=]\s*["\']([A-Za-z0-9_\-]{16,})["\']'),
+    "Secret":         re.compile(r'(?i)secret\s*[:=]\s*["\']([A-Za-z0-9_\-]{16,})["\']'),
+    "Password":       re.compile(r'(?i)password\s*[:=]\s*["\']([^"\']{6,})["\']'),
+    "Token":          re.compile(r'(?i)token\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{20,})["\']'),
+    "AWS Key":        re.compile(r'AKIA[0-9A-Z]{16}'),
+    "Google API Key": re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
+    "Firebase URL":   re.compile(r'https://[a-z0-9\-]+\.firebaseio\.com'),
+    "Stripe Key":     re.compile(r'(?:sk|pk)_(?:live|test)_[0-9a-zA-Z]{24,}'),
+    "Private Key":    re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+    "JWT":            re.compile(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
+    "MongoDB URI":    re.compile(r'mongodb(?:\+srv)?://[^"\'>\s]{10,}'),
+    "DB Password":    re.compile(r'(?i)db.?pass(?:word)?\s*[:=]\s*["\']([^"\']{4,})["\']'),
+}
+
+# ── Text file extensions to scan inside app archives ──────────
+_SCAN_EXTENSIONS = {
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".html", ".htm", ".xml", ".json", ".yaml", ".yml",
+    ".plist", ".properties", ".env", ".cfg", ".ini", ".conf",
+    ".py", ".rb", ".php", ".java", ".kt", ".swift", ".go",
+    ".sh", ".bash", ".txt", ".md", ".gradle",
+}
+
+
 async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/extract <url> — Scan HTML + JS for secrets, always exports ZIP with all sources"""
     if not context.args:
@@ -21540,9 +21740,9 @@ _CARD_FIELDS = [
      "Card Number", "💳", "Card Number"),
     (re.compile(r'cvv|cvc|csc|security.?code|card.?code|cv2', re.I),
      "CVV/CVC", "🔐", "CVV/CVC"),
-    (re.compile(r'exp.*month|card.*month|month.*exp|cc.*month|mm\b', re.I),
+    (re.compile(r'exp.*month|card.*month|month.*exp|cc.*month|\bmm\b', re.I),
      "Expiry Month", "📅", "Expiry Month"),
-    (re.compile(r'exp.*year|card.*year|year.*exp|cc.*year|yy\b|yyyy\b', re.I),
+    (re.compile(r'exp.*year|card.*year|year.*exp|cc.*year|\byy\b|\byyyy\b', re.I),
      "Expiry Year", "📅", "Expiry Year"),
     (re.compile(r'expir|exp.?date|card.?valid|valid.*thru|expiry', re.I),
      "Expiry", "📅", "Expiry"),
@@ -21571,23 +21771,23 @@ _CARD_FIELDS = [
 # ── Dynamic / token field patterns ────────────────────────────────────────
 # Format: (compiled_regex, label, icon)
 _DYNAMIC_PATTERNS = [
-    (re.compile(r'csrf|_token|xsrf|nonce',          re.I), "CSRF Token",    "🛡️"),
-    (re.compile(r'session.?id|sess.?id|sessionid',  re.I), "Session ID",    "🔑"),
-    (re.compile(r'auth.?token|access.?token|bearer',re.I), "Auth Token",    "🔑"),
-    (re.compile(r'jwt\b|id.?token',                 re.I), "JWT Token",     "🔑"),
-    (re.compile(r'api.?key|apikey|api_key',         re.I), "API Key",       "🗝️"),
-    (re.compile(r'secret.?key|secret_key',          re.I), "Secret Key",    "🔐"),
-    (re.compile(r'refresh.?token',                  re.I), "Refresh Token", "🔄"),
-    (re.compile(r'captcha|recaptcha|h-captcha',     re.I), "Captcha Token", "🤖"),
-    (re.compile(r'fingerprint|fp\b|device.?id',     re.I), "Device ID",     "📱"),
-    (re.compile(r'timestamp|time_stamp|\bts\b',     re.I), "Timestamp",     "⏱️"),
-    (re.compile(r'signature|sig\b|hmac',            re.I), "Signature",     "✍️"),
+    (re.compile(r'csrf|_token|xsrf|nonce',           re.I), "CSRF Token",    "🛡️"),
+    (re.compile(r'session.?id|sess.?id|sessionid',   re.I), "Session ID",    "🔑"),
+    (re.compile(r'auth.?token|access.?token|bearer', re.I), "Auth Token",    "🔑"),
+    (re.compile(r'jwt\b|id.?token',                  re.I), "JWT Token",     "🔑"),
+    (re.compile(r'api.?key|apikey|api_key',          re.I), "API Key",       "🗝️"),
+    (re.compile(r'secret.?key|secret_key',           re.I), "Secret Key",    "🔐"),
+    (re.compile(r'refresh.?token',                   re.I), "Refresh Token", "🔄"),
+    (re.compile(r'captcha|recaptcha|h-captcha',      re.I), "Captcha Token", "🤖"),
+    (re.compile(r'fingerprint|fp\b|device.?id',      re.I), "Device ID",     "📱"),
+    (re.compile(r'timestamp|time_stamp|\bts\b',      re.I), "Timestamp",     "⏱️"),
+    (re.compile(r'signature|sig\b|hmac',             re.I), "Signature",     "✍️"),
     (re.compile(r'correlation.?id|request.?id|trace.?id', re.I), "Request ID", "🔗"),
 ]
 
 # ── Static / non-sensitive keyword patterns ───────────────────────────────
 _STATIC_KEYWORDS = re.compile(
-    r'redirect|return.?url|callback|next\b|source\b|ref\b|referr'
+    r'redirect|return.?url|callback|next\b|source\b|\bref\b|referr'
     r'|lang|locale|currency|country.?code|plan\b|product.?id|item.?id'
     r'|coupon|promo|voucher|affiliate|partner|medium|campaign|utm_'
     r'|page\b|step\b|form.?id|form_id|checkout.?id|order.?id|cart.?id',
@@ -21704,6 +21904,52 @@ def _smart_placeholder(name: str, label: str, ftype: str) -> str:
     slug = re.sub(r'([A-Z])', r'_', name).lower().strip('_')
     slug = re.sub(r'[^a-z0-9_]', '_', slug).strip('_')
     return f'<{slug}>'
+
+
+# ── Payment gateway detection patterns ───────────────────────────────────
+# Format: (name, js_pattern, endpoint_pattern, icon)
+_PAYMENT_GATEWAYS = [
+    ("Stripe",       re.compile(r'stripe\.js|js\.stripe\.com|Stripe\(', re.I),
+                     re.compile(r'api\.stripe\.com|stripe\.com/v\d', re.I),          "💳"),
+    ("PayPal",       re.compile(r'paypal\.js|paypalobjects|paypal\.Buttons', re.I),
+                     re.compile(r'api\.paypal\.com|paypal\.com/sdk', re.I),           "🅿️"),
+    ("Braintree",    re.compile(r'braintree\.js|braintree-web|dropin\.create', re.I),
+                     re.compile(r'payments\.braintree-api|braintreepayments', re.I),  "🌿"),
+    ("Authorize.Net",re.compile(r'accept\.js|AcceptUI|authorize\.net', re.I),
+                     re.compile(r'accept\.authorize\.net|api\.authorize\.net', re.I), "🏦"),
+    ("Adyen",        re.compile(r'adyen\.js|AdyenCheckout|adyen-web', re.I),
+                     re.compile(r'checkout\.adyen\.com|adyen\.com/v\d', re.I),        "🔷"),
+    ("Square",       re.compile(r'square\.js|SqPaymentForm|squareup\.com/js', re.I),
+                     re.compile(r'api\.squareup\.com|squareup\.com/v\d', re.I),       "⬛"),
+    ("Razorpay",     re.compile(r'razorpay\.js|Razorpay\(|checkout\.razorpay', re.I),
+                     re.compile(r'api\.razorpay\.com|razorpay\.com/v\d', re.I),       "🇮🇳"),
+    ("Klarna",       re.compile(r'klarna\.js|Klarna\.init|klarna-payments', re.I),
+                     re.compile(r'api\.klarna\.com|klarna\.com/v\d', re.I),           "🟢"),
+    ("Mollie",       re.compile(r'mollie\.js|Mollie\(|mollie-components', re.I),
+                     re.compile(r'api\.mollie\.com|mollie\.com/v\d', re.I),           "🟡"),
+    ("Shopify Pay",  re.compile(r'shopify-pay|shop\.js|shopifyPayments', re.I),
+                     re.compile(r'checkout\.shopify\.com|\.myshopify\.com/payment', re.I), "🛍️"),
+    ("WooCommerce",  re.compile(r'woocommerce|wc-ajax|wc_checkout', re.I),
+                     re.compile(r'wc-api|woocommerce/v\d|/wp-json/wc/', re.I),        "🛒"),
+    ("2Checkout",    re.compile(r'2checkout|twocheckout|TCO\.', re.I),
+                     re.compile(r'api\.2checkout\.com|2co\.com', re.I),               "2️⃣"),
+    ("Worldpay",     re.compile(r'worldpay\.js|Worldpay\(|wp-js', re.I),
+                     re.compile(r'api\.worldpay\.com|worldpay\.com/v\d', re.I),       "🌐"),
+    ("Cybersource",  re.compile(r'cybersource|flex-microform|CyberSource', re.I),
+                     re.compile(r'api\.cybersource\.com|flex\.cybersource', re.I),    "🔒"),
+    ("NMI",          re.compile(r'CollectJS|nmi\.js|networkmerchants', re.I),
+                     re.compile(r'secure\.networkmerchants\.com|gateway\.nmi', re.I), "🏧"),
+    ("CardPointe",   re.compile(r'cardpointe\.js|CardPointe|bolt\.js', re.I),
+                     re.compile(r'securepayments\.cardpointe\.com|cardpointe\.com/api', re.I), "🔵"),
+    ("PaymentWall",  re.compile(r'paymentwall\.js|Paymentwall\(', re.I),
+                     re.compile(r'api\.paymentwall\.com', re.I),                      "🧱"),
+    ("Checkout.com", re.compile(r'checkout\.com/js|Frames\.init|cko-', re.I),
+                     re.compile(r'api\.checkout\.com|api2\.checkout\.com', re.I),     "✅"),
+    ("Paddle",       re.compile(r'paddle\.js|Paddle\.Setup|paddle-js', re.I),
+                     re.compile(r'api\.paddle\.com|checkout\.paddle\.com', re.I),     "🏓"),
+    ("Spreedly",     re.compile(r'spreedly\.js|Spreedly\.init|core\.spreedly', re.I),
+                     re.compile(r'core\.spreedly\.com|api\.spreedly\.com', re.I),     "🔑"),
+]
 
 
 def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
