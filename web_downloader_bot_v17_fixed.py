@@ -21533,6 +21533,68 @@ def _detect_by_value(name: str, value: str) -> tuple | None:
     return None
 
 
+# ── Card / Payment field patterns ─────────────────────────────────────────
+# Format: (compiled_regex, label, icon, card_type_or_None)
+_CARD_FIELDS = [
+    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan\b', re.I),
+     "Card Number", "💳", "Card Number"),
+    (re.compile(r'cvv|cvc|csc|security.?code|card.?code|cv2', re.I),
+     "CVV/CVC", "🔐", "CVV/CVC"),
+    (re.compile(r'exp.*month|card.*month|month.*exp|cc.*month|mm\b', re.I),
+     "Expiry Month", "📅", "Expiry Month"),
+    (re.compile(r'exp.*year|card.*year|year.*exp|cc.*year|yy\b|yyyy\b', re.I),
+     "Expiry Year", "📅", "Expiry Year"),
+    (re.compile(r'expir|exp.?date|card.?valid|valid.*thru|expiry', re.I),
+     "Expiry", "📅", "Expiry"),
+    (re.compile(r'card.?holder|name.?on.?card|cardholder|cc.?name', re.I),
+     "Cardholder Name", "👤", "Cardholder Name"),
+    (re.compile(r'billing.?zip|billing.?postal|bill.?zip', re.I),
+     "Billing ZIP", "📮", "Billing ZIP"),
+    (re.compile(r'billing.?address|bill.?addr', re.I),
+     "Billing Address", "🏠", "Billing Address"),
+    (re.compile(r'billing.?city|bill.?city', re.I),
+     "Billing City", "🏙️", "Billing City"),
+    (re.compile(r'billing.?state|bill.?state', re.I),
+     "Billing State", "🗺️", "Billing State"),
+    (re.compile(r'billing.?country|bill.?country', re.I),
+     "Billing Country", "🌍", "Billing Country"),
+    (re.compile(r'billing.?name|bill.?name', re.I),
+     "Billing Name", "👤", "Billing Name"),
+    (re.compile(r'account.?num|acct.?num|account.?no|bank.?account', re.I),
+     "Account Number", "🏦", "Account Number"),
+    (re.compile(r'routing.?num|aba.?num|sort.?code', re.I),
+     "Routing Number", "🏦", "Routing Number"),
+    (re.compile(r'iban\b|swift\b|bic\b', re.I),
+     "IBAN/SWIFT", "🏦", "IBAN/SWIFT"),
+]
+
+# ── Dynamic / token field patterns ────────────────────────────────────────
+# Format: (compiled_regex, label, icon)
+_DYNAMIC_PATTERNS = [
+    (re.compile(r'csrf|_token|xsrf|nonce',          re.I), "CSRF Token",    "🛡️"),
+    (re.compile(r'session.?id|sess.?id|sessionid',  re.I), "Session ID",    "🔑"),
+    (re.compile(r'auth.?token|access.?token|bearer',re.I), "Auth Token",    "🔑"),
+    (re.compile(r'jwt\b|id.?token',                 re.I), "JWT Token",     "🔑"),
+    (re.compile(r'api.?key|apikey|api_key',         re.I), "API Key",       "🗝️"),
+    (re.compile(r'secret.?key|secret_key',          re.I), "Secret Key",    "🔐"),
+    (re.compile(r'refresh.?token',                  re.I), "Refresh Token", "🔄"),
+    (re.compile(r'captcha|recaptcha|h-captcha',     re.I), "Captcha Token", "🤖"),
+    (re.compile(r'fingerprint|fp\b|device.?id',     re.I), "Device ID",     "📱"),
+    (re.compile(r'timestamp|time_stamp|\bts\b',     re.I), "Timestamp",     "⏱️"),
+    (re.compile(r'signature|sig\b|hmac',            re.I), "Signature",     "✍️"),
+    (re.compile(r'correlation.?id|request.?id|trace.?id', re.I), "Request ID", "🔗"),
+]
+
+# ── Static / non-sensitive keyword patterns ───────────────────────────────
+_STATIC_KEYWORDS = re.compile(
+    r'redirect|return.?url|callback|next\b|source\b|ref\b|referr'
+    r'|lang|locale|currency|country.?code|plan\b|product.?id|item.?id'
+    r'|coupon|promo|voucher|affiliate|partner|medium|campaign|utm_'
+    r'|page\b|step\b|form.?id|form_id|checkout.?id|order.?id|cart.?id',
+    re.I
+)
+
+
 def _classify_field(name: str, value: str,
                     ftype: str = 'text',
                     placeholder: str = '',
