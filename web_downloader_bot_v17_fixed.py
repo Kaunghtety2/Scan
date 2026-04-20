@@ -32,7 +32,7 @@ import logging, asyncio, subprocess, socket, random, difflib, functools
 import concurrent.futures
 from datetime import datetime, date
 from ipaddress import ip_address, ip_network, AddressValueError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -4419,6 +4419,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         # Raw Message (from callback)
         target_msg  = update_or_msg
         chat_id     = update_or_msg.chat_id
+    uid = chat_id   # Fix: uid was undefined
 
     fname = os.path.basename(filepath)
     msg = await target_msg.reply_text(
@@ -8712,8 +8713,15 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                     js_urls_on_page.append(_chunk)
 
         # 3. Next.js _buildManifest chunk list
+        # Note: html is assigned after page.content() later in this function;
+        # use page_html_early as safe empty fallback until then.
+        _page_html_early = ""
         try:
-            _bm_urls = _re2.findall(r'/_next/static/[^"\']+/_buildManifest\.js', html)
+            _page_html_early = page.content()
+        except Exception:
+            pass
+        try:
+            _bm_urls = _re2.findall(r'/_next/static/[^"\']+/_buildManifest\.js', _page_html_early)
             for _bmu in _bm_urls[:2]:
                 _bm_full = _origin + _bmu
                 if _bm_full not in _seen_urls:
@@ -11505,13 +11513,13 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
     _all_patterns = _API_KEY_PATTERNS
     # Re-use the same seen set (already populated above) to avoid duplicates
     enh_network_log = data.get("network_log", [])
-    for ef in _deep_json_response_scan(enh_network_log, _all_patterns, seen):
+    for ef in _websocket_deep_scan(data, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
     for ef in _response_header_cookie_scan(enh_network_log, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
     for ef in _jwt_payload_scan(_gather_all_text(data), _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
-    for ef in _websocket_deep_scan(live_result, _all_patterns, seen):
+    for ef in _websocket_deep_scan(data, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
     for ef in _graphql_response_deep_scan(enh_network_log, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
@@ -25848,6 +25856,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     )
     cors_info = _analyze_cors(url, _cors_ep)
 
+    # ── Derive base_url early (GraphQL + API schema need it) ──────────────
+    _p = urlparse(url)
+    base_url = f"{_p.scheme}://{_p.netloc}"
+
     # ── ENH: GraphQL detection ─────────────────────────────────────────────
     if progress_cb: progress_cb("🔷 Probing GraphQL endpoint...")
     graphql_info = _detect_graphql(base_url)
@@ -25879,9 +25891,6 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             all_fields     = _snippet_form.get('fields', []),
             headers_required = headers_result,
         )
-
-    parsed   = urlparse(url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     return {
         'url':              url,
@@ -27993,6 +28002,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         # Raw Message (from callback)
         target_msg  = update_or_msg
         chat_id     = update_or_msg.chat_id
+    uid = chat_id   # Fix: uid was undefined (duplicate function definition)
 
     fname = os.path.basename(filepath)
     msg = await target_msg.reply_text(
@@ -29317,12 +29327,6 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
     return result
 
 
-    freq = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
-    ln = len(s)
-    return -sum((f/ln) * math.log2(f/ln) for f in freq.values())
-
 # ─── Master pattern registry (2026 Enhanced) ──────
 _KD_PATTERNS = {
     # ── Cloud & Infra ─────────────────────────────────────────────────────────
@@ -29817,6 +29821,42 @@ def _is_obfuscated(js_text: str) -> tuple:
 # Used by keydump, paykeys, sitekey, firebase as a corpus pre-processor.
 # Call: extra = _deobfuscate_text(js_text) → append to scan corpus.
 # ═══════════════════════════════════════════════════════════════
+
+def _deobfuscate_layer(texts_map: dict) -> list:
+    """
+    Fix: _deobfuscate_layer was called but never defined.
+    Wraps _deobfuscate_text for each source and returns findings
+    in the format expected by the sitekey command deobfuscation block:
+    [{"method": str, "entropy": float, "decoded": str,
+      "source": str, "in_secret_context": bool}]
+    """
+    import re as _re
+    _SECRET_CTX = _re.compile(
+        r'(?i)(api[_\-]?key|secret|token|auth|password|passwd|credential|private)',
+        _re.I
+    )
+    findings = []
+    for label, text in (texts_map or {}).items():
+        if not text:
+            continue
+        decoded_block = _deobfuscate_text(text)
+        if not decoded_block:
+            continue
+        for line in decoded_block.splitlines():
+            line = line.strip()
+            if len(line) < 8:
+                continue
+            ent = _entropy(line)
+            in_ctx = bool(_SECRET_CTX.search(line))
+            findings.append({
+                "method":           "deobfuscate",
+                "entropy":          round(ent, 2),
+                "decoded":          line[:200],
+                "source":           label,
+                "in_secret_context": in_ctx,
+            })
+    return findings
+
 
 def _deobfuscate_text(text: str) -> str:
     """
