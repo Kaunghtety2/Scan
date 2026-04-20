@@ -32,7 +32,7 @@ import logging, asyncio, subprocess, socket, random, difflib, functools
 import concurrent.futures
 from datetime import datetime, date
 from ipaddress import ip_address, ip_network, AddressValueError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -249,8 +249,9 @@ def safe_local_path(domain_dir: str, url: str) -> str:
 
 def escape_md(text: str) -> str:
     """
-    Escape special Markdown v1 characters in dynamic/user-controlled content.
-    Safe to embed inside * * bold or ` ` code spans.
+    Escape special Markdown v1 characters for text OUTSIDE backtick spans.
+    For text inside `code` spans use raw_code() instead — Telegram renders
+    backslash escapes literally inside backticks, so \\_ shows as \\_ not _.
     Escapes: _ * ` [ ]
     """
     if not isinstance(text, str):
@@ -259,6 +260,18 @@ def escape_md(text: str) -> str:
     for ch in ('\\', '_', '*', '`', '[', ']'):
         text = text.replace(ch, '\\' + ch)
     return text
+
+
+def raw_code(text, maxlen: int = 200) -> str:
+    """
+    Sanitize text for display inside Telegram `backtick` code spans.
+    Inside backticks, Telegram renders text literally — do NOT call escape_md()
+    or backslash escapes like \\_ will show as \\_ instead of _.
+    Only strips backticks (which would break the code span) and truncates.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace('`', "'")[:maxlen]
 
 
 def _truncate_safe_md(text: str, limit: int = 4000) -> str:
@@ -4419,6 +4432,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         # Raw Message (from callback)
         target_msg  = update_or_msg
         chat_id     = update_or_msg.chat_id
+    uid = chat_id   # Fix: uid was undefined
 
     fname = os.path.basename(filepath)
     msg = await target_msg.reply_text(
@@ -8712,8 +8726,15 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                     js_urls_on_page.append(_chunk)
 
         # 3. Next.js _buildManifest chunk list
+        # Note: html is assigned after page.content() later in this function;
+        # use page_html_early as safe empty fallback until then.
+        _page_html_early = ""
         try:
-            _bm_urls = _re2.findall(r'/_next/static/[^"\']+/_buildManifest\.js', html)
+            _page_html_early = page.content()
+        except Exception:
+            pass
+        try:
+            _bm_urls = _re2.findall(r'/_next/static/[^"\']+/_buildManifest\.js', _page_html_early)
             for _bmu in _bm_urls[:2]:
                 _bm_full = _origin + _bmu
                 if _bm_full not in _seen_urls:
@@ -11505,13 +11526,13 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
     _all_patterns = _API_KEY_PATTERNS
     # Re-use the same seen set (already populated above) to avoid duplicates
     enh_network_log = data.get("network_log", [])
-    for ef in _deep_json_response_scan(enh_network_log, _all_patterns, seen):
+    for ef in _websocket_deep_scan(data, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
     for ef in _response_header_cookie_scan(enh_network_log, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
     for ef in _jwt_payload_scan(_gather_all_text(data), _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
-    for ef in _websocket_deep_scan(live_result, _all_patterns, seen):
+    for ef in _websocket_deep_scan(data, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
     for ef in _graphql_response_deep_scan(enh_network_log, _all_patterns, seen):
         _add(ef["type"], ef["value"], ef["source"])
@@ -25848,6 +25869,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     )
     cors_info = _analyze_cors(url, _cors_ep)
 
+    # ── Derive base_url early (GraphQL + API schema need it) ──────────────
+    _p = urlparse(url)
+    base_url = f"{_p.scheme}://{_p.netloc}"
+
     # ── ENH: GraphQL detection ─────────────────────────────────────────────
     if progress_cb: progress_cb("🔷 Probing GraphQL endpoint...")
     graphql_info = _detect_graphql(base_url)
@@ -25879,9 +25904,6 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             all_fields     = _snippet_form.get('fields', []),
             headers_required = headers_result,
         )
-
-    parsed   = urlparse(url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     return {
         'url':              url,
@@ -26063,7 +26085,7 @@ def _format_payload_report(data: dict) -> str:
         if iframe_f:
             lines.append(f"🖼️ *Hosted iframe fields* ({len(iframe_f)}):")
             for f in iframe_f:
-                lines.append(f"  `{escape_md(f.get('label', f['name'])[:80])}`")
+                lines.append(f"  `{raw_code(f.get('label', f['name']), 80)}`")
 
         # ── Card fields ─────────────────────────────────────────────────
         if card_strict:
@@ -26071,10 +26093,9 @@ def _format_payload_report(data: dict) -> str:
             card_json_lines = ["{"]
             for f in card_strict:
                 val     = f['value'][:40] if f.get('value') else ""
-                comment = "  // required" if f.get('required') else ""
-                card_json_lines.append(f'  "{f["name"]}": "{val or f["field_label"]}",{comment}')
+                card_json_lines.append(f'  "{raw_code(f["name"])}: "{val or f["field_label"]}",')
             card_json_lines.append("}")
-            lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
+            lines.append("```json\n" + "\n".join(card_json_lines) + "\n```")
 
         # ── Payment info ─────────────────────────────────────────────────
         if pay_info:
@@ -26082,36 +26103,34 @@ def _format_payload_report(data: dict) -> str:
             pay_json_lines = ["{"]
             for f in pay_info:
                 val = f['value'][:40] if f.get('value') else f['field_label']
-                pay_json_lines.append(f'  "{f["name"]}": "{val}",')
+                pay_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
             pay_json_lines.append("}")
-            lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
+            lines.append("```json\n" + "\n".join(pay_json_lines) + "\n```")
 
         # ── User fields ──────────────────────────────────────────────────
         if user_f:
             lines.append(f"✏️ *User Fields* ({len(user_f)}):")
             user_json_lines = ["{"]
             for f in user_f:
-                val     = (f['value'][:40] if f.get('value')
-                           else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
-                comment = "  // required" if f.get('required') else ""
-                # ENH: Show select options
+                val  = (f['value'][:40] if f.get('value')
+                        else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
                 opts = f.get('options', [])
                 if opts:
                     opts_str = "|".join(opts[:6])
-                    user_json_lines.append(f'  "{f["name"]}": "{val}",{comment}  /* options: {opts_str} */')
+                    user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",  /* {raw_code(opts_str)} */')
                 else:
-                    user_json_lines.append(f'  "{f["name"]}": "{val}",{comment}')
+                    user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
             user_json_lines.append("}")
-            lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
+            lines.append("```json\n" + "\n".join(user_json_lines) + "\n```")
 
         # ── Dynamic fields ───────────────────────────────────────────────
         if dyn_f:
-            dyn_names = ", ".join(f"`{escape_md(f['name'])}`" for f in dyn_f)
+            dyn_names = ", ".join(f"`{raw_code(f['name'])}`" for f in dyn_f)
             lines.append(f"🔄 *Auto* ({len(dyn_f)}): {dyn_names}")
 
         # ── Hidden fields ────────────────────────────────────────────────
         if hidden_f:
-            hid_names = ", ".join(f"`{escape_md(f['name'])}`" for f in hidden_f[:8])
+            hid_names = ", ".join(f"`{raw_code(f['name'])}`" for f in hidden_f[:8])
             extra     = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
             lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hid_names}{escape_md(extra)}")
 
@@ -26120,12 +26139,12 @@ def _format_payload_report(data: dict) -> str:
         if submit_btns:
             btn_parts = []
             for btn in submit_btns:
-                txt  = btn.get('text', '') or btn.get('value', '') or 'Submit'
-                name = btn.get('name', '')
+                txt   = btn.get('text', '') or btn.get('value', '') or 'Submit'
+                name  = btn.get('name', '')
                 btype = btn.get('type', 'submit')
-                part  = f"`{escape_md(txt)}`"
+                part  = f"`{raw_code(txt)}`"
                 if name and name.lower() not in ('submit', 'button', ''):
-                    part += f" _(name=`{escape_md(name)}`, type={escape_md(btype)})_"
+                    part += f" _(name=`{raw_code(name)}`, type=`{raw_code(btype)}`)_"
                 btn_parts.append(part)
             lines.append(f"🟢 *Submit*: {' · '.join(btn_parts)}")
 
@@ -26183,8 +26202,8 @@ def _format_payload_report(data: dict) -> str:
             for t in grp:
                 val_str = ''
                 if t.get('value_preview') and t['value_preview'] != '(runtime value)':
-                    val_str = f" = `{escape_md(t['value_preview'])}`"
-                lines.append(f"  `{escape_md(t['name'])}`{val_str}")
+                    val_str = f" = `{raw_code(t['value_preview'], 60)}`"
+                lines.append(f"  `{raw_code(t['name'])}`{val_str}")
                 lines.append(f"  _{escape_md(t['label'])}_")
 
     # ── Honeypot fields warning ──────────────────────────────
@@ -26196,7 +26215,7 @@ def _format_payload_report(data: dict) -> str:
         lines.append(f"🪤 *Honeypot / Anti-bot Fields* ({len(_honeypots)}):")
         lines.append("_These are CSS-hidden — do NOT fill them or you will be blocked:_")
         for hp in _honeypots[:5]:
-            lines.append(f"  ⛔ `{escape_md(hp['name'])}` (type=`{escape_md(hp['type'])}`)")
+            lines.append(f"  ⛔ `{raw_code(hp['name'])}` (type=`{raw_code(hp['type'])}`)")
 
     # ── localStorage / sessionStorage dump ──────────────────
     cs = data.get('client_storage', {})
@@ -26208,11 +26227,11 @@ def _format_payload_report(data: dict) -> str:
         if _ls:
             lines.append("🗄️ *localStorage:*")
             for k, v in list(_ls.items())[:6]:
-                lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v)[:60])}`")
+                lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v), 60)}`")
         if _ss:
             lines.append("🗄️ *sessionStorage:*")
             for k, v in list(_ss.items())[:6]:
-                lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v)[:60])}`")
+                lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v), 60)}`")
 
     # ── Rate limit headers ────────────────────────────────────
     rl = data.get('rate_limit')
@@ -26220,7 +26239,7 @@ def _format_payload_report(data: dict) -> str:
         lines.append(f"\n{'━'*34}")
         lines.append("📊 *Rate Limit Headers*")
         for k, v in rl.items():
-            lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v))}`")
+            lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v))}`")
 
     # ── Auth cookie security ──────────────────────────────────
     auth_cookies = data.get('auth_cookies', [])
@@ -26231,7 +26250,7 @@ def _format_payload_report(data: dict) -> str:
             hi = "✅" if ck['httponly'] else "❌"
             se = "✅" if ck['secure']   else "❌"
             ss = ck.get('samesite', 'not set')
-            lines.append(f"  `{escape_md(ck['name'])}` — HttpOnly:{hi} Secure:{se} SameSite:`{escape_md(ss)}`")
+            lines.append(f"  `{raw_code(ck['name'])}` — HttpOnly:{hi} Secure:{se} SameSite:`{raw_code(ss)}`")
             for iss in ck.get('issues', []):
                 lines.append(f"    ⚠️ _{escape_md(iss)}_")
 
@@ -26242,10 +26261,10 @@ def _format_payload_report(data: dict) -> str:
         lines.append("🛡️ *Content-Security-Policy*")
         cs_src = csp.get('directives', {}).get('connect-src', [])
         if cs_src:
-            lines.append(f"  `connect-src`: `{escape_md(' '.join(cs_src[:5]))}`")
+            lines.append(f"  `connect-src`: `{raw_code(' '.join(cs_src[:5]))}`")
         fa = csp.get('directives', {}).get('form-action', [])
         if fa:
-            lines.append(f"  `form-action`: `{escape_md(' '.join(fa[:5]))}`")
+            lines.append(f"  `form-action`: `{raw_code(' '.join(fa[:5]))}`")
         for iss in csp.get('issues', []):
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not csp.get('issues'):
@@ -26258,8 +26277,8 @@ def _format_payload_report(data: dict) -> str:
         lines.append("🌐 *CORS Policy*")
         acao = cors.get('allow_origin', '')
         acac = cors.get('allow_credentials', '')
-        lines.append(f"  Allow-Origin: `{escape_md(acao or 'not set')}`")
-        lines.append(f"  Allow-Credentials: `{escape_md(acac or 'false')}`")
+        lines.append(f"  Allow-Origin: `{raw_code(acao or 'not set')}`")
+        lines.append(f"  Allow-Credentials: `{raw_code(acac or 'false')}`")
         for iss in cors.get('issues', []):
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not cors.get('issues'):
@@ -26269,9 +26288,9 @@ def _format_payload_report(data: dict) -> str:
     gql = data.get('graphql_info')
     if gql:
         lines.append(f"\n{'━'*34}")
-        lines.append(f"🔷 *GraphQL Detected* — `{escape_md(gql['endpoint'])}`")
+        lines.append(f"🔷 *GraphQL Detected* — `{raw_code(gql['endpoint'])}`")
         if gql.get('introspected'):
-            types_str = ', '.join(f"`{escape_md(t)}`" for t in gql['types'][:8])
+            types_str = ', '.join(f"`{raw_code(t)}`" for t in gql['types'][:8])
             lines.append(f"  Types: {types_str}")
         else:
             lines.append("  ⚠️ Introspection blocked (endpoint responds but schema hidden)")
@@ -26281,11 +26300,11 @@ def _format_payload_report(data: dict) -> str:
     if schema:
         lines.append(f"\n{'━'*34}")
         lines.append(f"📖 *API Schema Found* (v{escape_md(schema['spec_version'])})")
-        lines.append(f"  `{escape_md(schema['schema_url'])}`")
+        lines.append(f"  `{raw_code(schema['schema_url'])}`")
         if schema.get('pay_endpoints'):
             lines.append(f"  💳 Payment endpoints ({len(schema['pay_endpoints'])}):")
             for ep in schema['pay_endpoints'][:5]:
-                lines.append(f"    `{escape_md(ep['method'])}` `{escape_md(ep['endpoint'])}`"
+                lines.append(f"    `{raw_code(ep['method'])}` `{raw_code(ep['endpoint'])}`"
                              + (f" — _{escape_md(ep['summary'])}_" if ep['summary'] else ""))
 
     # ── Framework detection ───────────────────────────────────
@@ -26308,7 +26327,7 @@ def _format_payload_report(data: dict) -> str:
         if ms.get('likely_step_urls'):
             lines.append("  _Likely step URLs:_")
             for su in ms['likely_step_urls'][:3]:
-                lines.append(f"  `{escape_md(su)}`")
+                lines.append(f"  `{raw_code(su)}`")
 
     # ── curl / Python snippet ─────────────────────────────────
     snip = data.get('curl_snippet')
@@ -27993,6 +28012,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         # Raw Message (from callback)
         target_msg  = update_or_msg
         chat_id     = update_or_msg.chat_id
+    uid = chat_id   # Fix: uid was undefined (duplicate function definition)
 
     fname = os.path.basename(filepath)
     msg = await target_msg.reply_text(
@@ -29317,12 +29337,6 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
     return result
 
 
-    freq = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
-    ln = len(s)
-    return -sum((f/ln) * math.log2(f/ln) for f in freq.values())
-
 # ─── Master pattern registry (2026 Enhanced) ──────
 _KD_PATTERNS = {
     # ── Cloud & Infra ─────────────────────────────────────────────────────────
@@ -29817,6 +29831,42 @@ def _is_obfuscated(js_text: str) -> tuple:
 # Used by keydump, paykeys, sitekey, firebase as a corpus pre-processor.
 # Call: extra = _deobfuscate_text(js_text) → append to scan corpus.
 # ═══════════════════════════════════════════════════════════════
+
+def _deobfuscate_layer(texts_map: dict) -> list:
+    """
+    Fix: _deobfuscate_layer was called but never defined.
+    Wraps _deobfuscate_text for each source and returns findings
+    in the format expected by the sitekey command deobfuscation block:
+    [{"method": str, "entropy": float, "decoded": str,
+      "source": str, "in_secret_context": bool}]
+    """
+    import re as _re
+    _SECRET_CTX = _re.compile(
+        r'(?i)(api[_\-]?key|secret|token|auth|password|passwd|credential|private)',
+        _re.I
+    )
+    findings = []
+    for label, text in (texts_map or {}).items():
+        if not text:
+            continue
+        decoded_block = _deobfuscate_text(text)
+        if not decoded_block:
+            continue
+        for line in decoded_block.splitlines():
+            line = line.strip()
+            if len(line) < 8:
+                continue
+            ent = _entropy(line)
+            in_ctx = bool(_SECRET_CTX.search(line))
+            findings.append({
+                "method":           "deobfuscate",
+                "entropy":          round(ent, 2),
+                "decoded":          line[:200],
+                "source":           label,
+                "in_secret_context": in_ctx,
+            })
+    return findings
+
 
 def _deobfuscate_text(text: str) -> str:
     """
