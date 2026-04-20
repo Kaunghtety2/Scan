@@ -25946,11 +25946,12 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         )
 
     # ── ENH: Live network intercept — capture real tokens & sitekeys ─────
-    # Combined pattern: payment keys + sitekeys + hidden tokens
-    _PAYLOAD_LIVE_PATTERNS = _LIVE_PAY_PATTERNS + [
-        p for p in _LIVE_SITEKEY_PATTERNS if p not in _LIVE_PAY_PATTERNS
+    # Combined pattern: payment + sitekey + hidden tokens (deduplicated by label)
+    _pay_labels = {p[0] for p in _LIVE_PAY_PATTERNS}
+    _PAYLOAD_LIVE_PATTERNS = list(_LIVE_PAY_PATTERNS) + [
+        p for p in _LIVE_SITEKEY_PATTERNS if p[0] not in _pay_labels
     ] + [
-        p for p in _LIVE_HIDDEN_PATTERNS if p not in _LIVE_PAY_PATTERNS
+        p for p in _LIVE_HIDDEN_PATTERNS  if p[0] not in _pay_labels
     ]
     live_result = {"live_requests": [], "live_findings": [], "sse_frames": [],
                    "ws_frames": [], "response_bodies": {}, "error": None}
@@ -25986,6 +25987,59 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                     )
                     if _v3_action_m and not recaptcha_info.get('action'):
                         recaptcha_info['action'] = _v3_action_m.group(1)
+                # ── Merge live POST requests into real_requests (with parsed fields) ──
+                _existing_live_urls = {r.get('endpoint','') for r in real_requests}
+                for _lr_entry in _lr:
+                    _lr_url  = _lr_entry.get('url', '')
+                    _lr_body = _lr_entry.get('body', '') or _lr_entry.get('post_data', '')
+                    _lr_meth = _lr_entry.get('method', 'GET')
+                    # Only add POST/PUT with body content that isn't already known
+                    if (_lr_meth.upper() in ('POST', 'PUT', 'PATCH')
+                            and _lr_body
+                            and _lr_url not in _existing_live_urls):
+                        _existing_live_urls.add(_lr_url)
+                        # Parse body into fields
+                        _live_fields = []
+                        _ct = _lr_entry.get('content_type', '') or ''
+                        try:
+                            if 'json' in _ct:
+                                import json as _json
+                                _jd = _json.loads(_lr_body)
+                                if isinstance(_jd, dict):
+                                    for _k, _v in _jd.items():
+                                        _live_fields.append({
+                                            'name': str(_k), 'value': str(_v)[:80],
+                                            'type': 'json', 'required': True,
+                                            'field_label': str(_k),
+                                            'is_card': False, 'is_dynamic': False,
+                                        })
+                            else:
+                                for _kv in _lr_body.split('&'):
+                                    if '=' in _kv:
+                                        _k, _, _v = _kv.partition('=')
+                                        from urllib.parse import unquote_plus as _uqp
+                                        _live_fields.append({
+                                            'name': _uqp(_k), 'value': _uqp(_v)[:80],
+                                            'type': 'form', 'required': True,
+                                            'field_label': _uqp(_k),
+                                            'is_card': False, 'is_dynamic': False,
+                                        })
+                        except Exception:
+                            pass
+                        if _live_fields:
+                            real_requests.append({
+                                'source':   'live_intercept',
+                                'endpoint': _lr_url,
+                                'method':   _lr_meth,
+                                'enctype':  _ct or 'application/x-www-form-urlencoded',
+                                'fields':   _live_fields,
+                                'is_payment': any(
+                                    kw in _lr_url.lower()
+                                    for kw in ('pay','checkout','order','stripe','token','charge')
+                                ),
+                                'raw_body': _lr_body[:200],
+                                'note':    'Captured from live browser intercept',
+                            })
         except Exception as _live_err:
             logger.debug("payload live intercept error: %s", _live_err)
     else:
@@ -26234,6 +26288,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             src_note = f" _sub\\-page `{escape_md(src_lbl[8:])}`_"
         elif src_lbl == 'playwright_dom':
             src_note = " _DOM_"
+        elif src_lbl == 'live_intercept':
+            src_note = " 🔴 _live intercept_"
 
         lines.append(f"\n{SEP}")
         lines.append(f"📋{pay_badge} *Form {idx}*{src_note}")
@@ -26839,7 +26895,7 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("💳", "Payment gateway detection",        ["gateway"]),
         ("🔍", "Header requirement probing",       ["Probing header", "header"]),
         ("🔎", "Token source detection",           ["token source", "Locating token"]),
-        ("🤖", "CAPTCHA site key extraction",      ["CAPTCHA", "site key", "reCAPTCHA"]),
+        ("🤖", "CAPTCHA sitekey scan (Playwright)",["CAPTCHA", "site key", "reCAPTCHA", "Sitekeys found"]),
         ("🔗", "Sub-page scan",                   ["sub-page", "Sub-page", "subpage"]),
         ("🔐", "3DS / SCA signal detection",      ["3DS", "SCA", "3d secure"]),
         ("📱", "Wallet / Express pay detection",   ["wallet", "Wallet", "express pay"]),
@@ -26852,6 +26908,7 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("⚙️", "Framework detection",              ["framework", "Framework"]),
         ("🪜", "Multi-step checkout",              ["multi-step", "multi step", "checkout"]),
         ("📋", "Request snippet generation",       ["snippet", "curl"]),
+        ("🔴", "Live network intercept",           ["Live intercept", "Hooks active", "Live:", "live_result"]),
     ]
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
 
