@@ -25890,6 +25890,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     multistep = _detect_multistep(static_html + js_html, js_text, url)
 
     # ── ENH: curl/Python snippet (first payment form or first form) ───────
+    if progress_cb: progress_cb("📋 Generating curl/python snippet...")
     _snippet_form = next(
         (f for f in (static_forms + js_forms + subpage_forms + real_requests)
          if f.get('is_payment')),
@@ -25979,6 +25980,12 @@ def _format_payload_report(data: dict) -> str:
     all_entries = forms + requests_
     total   = len(all_entries)
     pay_cnt = sum(1 for e in all_entries if e.get('is_payment'))
+
+    # Summary line
+    summary_parts = [f"*{total}* endpoint(s)"]
+    if pay_cnt:     summary_parts.append(f"💳 *{pay_cnt}* payment")
+    if gateways:    summary_parts.append(f"🔒 *{len(gateways)}* gateway(s)")
+    lines.append(f"📊 {' · '.join(summary_parts)}")
 
     if total == 0:
         lines.append("\nℹ️ No forms or intercepted requests found.")
@@ -26694,7 +26701,7 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _PAYLOAD_PHASES = [
         ("⬇️", "Static HTML parse",              ["Fetching HTML"]),
         ("🌐", "Playwright JS render",            ["Playwright launching", "Playwright loading"]),
-        ("📡", "Network intercept (XHR/fetch)",   ["intercepting", "form(s)"]),
+        ("📡", "Network intercept (XHR/fetch)",   ["intercepting", "form(s)", "DOM fields", "Extracting DOM"]),
         ("💳", "Payment gateway detection",        ["gateway"]),
         ("🔍", "Header requirement probing",       ["Probing header", "header"]),
         ("🔎", "Token source detection",           ["token source", "Locating token"]),
@@ -26715,24 +26722,25 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
 
     def _build_progress_msg(domain: str, phase_idx: int, note: str = "") -> str:
-        """Build the animated progress message."""
-        lines = [f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n"]
-        for i, (icon, label, _) in enumerate(_PAYLOAD_PHASES):
-            if i < phase_idx:
-                marker = "✅"
-            elif i == phase_idx:
-                marker = "⏳"
-            else:
-                marker = "·"
-            phase_num = f"Phase {i+1}"
-            lines.append(f"{marker} {icon} {phase_num}: {label}")
-        # Progress bar
+        """Build the animated progress message — compact clean format."""
         filled  = min(phase_idx, TOTAL_PHASES)
         empty   = TOTAL_PHASES - filled - (1 if phase_idx < TOTAL_PHASES else 0)
         running = 1 if phase_idx < TOTAL_PHASES else 0
         bar     = "█" * filled + ("▓" * running) + "░" * empty
         pct     = int((filled / TOTAL_PHASES) * 100)
-        lines.append(f"\n`[{bar}]` {pct}%")
+
+        if phase_idx < TOTAL_PHASES:
+            _, cur_label, _ = _PAYLOAD_PHASES[phase_idx]
+            phase_line = f"⏳ *Phase {phase_idx + 1}/{TOTAL_PHASES}:* {escape_md(cur_label)}"
+        else:
+            phase_line = f"✅ *All {TOTAL_PHASES} phases done*"
+
+        lines = [
+            f"🧩 *Payload Extractor*",
+            f"`{escape_md(domain)}`\n",
+            f"`[{bar}]` {pct}%",
+            phase_line,
+        ]
         if note:
             lines.append(f"_{escape_md(note[:80])}_")
         return "\n".join(lines)
@@ -26766,13 +26774,17 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     async def progress_editor():
-        """Async task: drain queue, edit Telegram message."""
-        last_text = ""
+        """Async task: drain queue, edit Telegram message.
+        Throttle: edit at most once every 3s to avoid Telegram rate-limit.
+        """
+        import time as _time
+        last_text    = ""
+        last_edit_ts = 0.0
+        EDIT_INTERVAL = 3.0   # seconds between edits
         while True:
             try:
                 item = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
-                # Check if scan task is still running
                 task_obj = _user_tasks.get(uid)
                 if task_obj and task_obj.done():
                     break
@@ -26783,7 +26795,11 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_text = _build_progress_msg(domain, idx, note)
             if new_text == last_text:
                 continue
-            last_text = new_text
+            now = _time.monotonic()
+            if now - last_edit_ts < EDIT_INTERVAL:
+                continue          # skip — too soon, drop this update
+            last_text    = new_text
+            last_edit_ts = now
             try:
                 await msg.edit_text(new_text, parse_mode='Markdown')
             except Exception:
@@ -26791,8 +26807,22 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     editor_task = asyncio.create_task(progress_editor())
 
+    SCAN_TIMEOUT = 300   # 5 minutes max — prevent infinite hang
     try:
-        data = await run_scan(uid, _payload_sync, url, progress_cb)
+        data = await asyncio.wait_for(
+            run_scan(uid, _payload_sync, url, progress_cb),
+            timeout=SCAN_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        editor_task.cancel()
+        await msg.edit_text(
+            f"⏱️ *Scan timed out* ({SCAN_TIMEOUT}s)\n"
+            f"`{escape_md(domain)}` — Server responses နှေးလွန်းတယ်\n"
+            f"_ရရှိပြီးသော results ကို JSON file မှ ကြည့်ပါ_",
+            parse_mode='Markdown'
+        )
+        return
     except asyncio.CancelledError:
         loop.call_soon_threadsafe(progress_queue.put_nowait, None)   # stop editor
         editor_task.cancel()
@@ -26815,11 +26845,13 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Show all-done bar before report ────────────────────────
     try:
-        done_lines = [f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n"]
-        for i, (icon, label, _) in enumerate(_PAYLOAD_PHASES):
-            done_lines.append(f"✅ {icon} Phase {i+1}: {label}")
-        done_lines.append(f"\n`[{'█' * TOTAL_PHASES}]` 100% — Done!")
-        await msg.edit_text("\n".join(done_lines), parse_mode='Markdown')
+        done_msg = (
+            f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n\n"
+            f"✅ All {TOTAL_PHASES} phases completed\n"
+            f"`[{'█' * TOTAL_PHASES}]` 100%\n\n"
+            f"📄 Generating report..."
+        )
+        await msg.edit_text(done_msg, parse_mode='Markdown')
     except Exception:
         pass
 
@@ -26857,15 +26889,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def _safe_send_report(text: str):
         parts = _smart_chunks(text)
-        # First chunk replaces status msg
-        try:
-            await msg.edit_text(parts[0], parse_mode='Markdown')
-        except Exception:
-            try:
-                await msg.edit_text(parts[0])
-            except Exception:
-                pass
-        for part in parts[1:]:
+        await asyncio.sleep(1.5)  # rate-limit cooling after many progress edits
+        for part in parts:
             try:
                 await update.effective_message.reply_text(part, parse_mode='Markdown')
             except Exception:
@@ -26895,6 +26920,15 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.unlink(tmp_path)
     except Exception as e:
         logger.warning(f"payload JSON export error: {e}")
+        try:
+            await update.effective_message.reply_text(
+                f"⚠️ *JSON export failed*\n"
+                f"`{escape_md(str(e)[:120])}`\n"
+                f"_Report ကိုတော့ အပေါ်မှာ ကြည့်နိုင်ပါတယ်_",
+                parse_mode='Markdown'
+            )
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
