@@ -25935,420 +25935,416 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 # ── Formatters ────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
 
-def _format_payload_report(data: dict) -> str:
+def _format_payload_report(data: dict) -> str:  # noqa: C901
     url       = data.get('url', '')
     domain    = urlparse(url).hostname or url
     forms     = data.get('forms', [])
     requests_ = data.get('requests', [])
     gateways  = data.get('gateways', [])
 
-    lines = [
-        f"🧩 *Payload Structure — `{escape_md(domain)}`*",
-        f"🔗 `{escape_md(url[:80])}`",
-        f"🌐 *Base URL:* `{escape_md(data.get('base_url', ''))}`",
-    ]
+    # ── Field-type constants ──────────────────────────────────
+    _CARD_STRICT_TYPES = {
+        'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
+        'Expiry MM/YY', 'Cardholder Name',
+        'Routing Number', 'Account Number', 'Account Type',
+    }
+    _PAY_INFO_TYPES = {
+        'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
+        'Billing Address', 'Billing Zip', 'Billing City', 'Billing State',
+        'Billing Country', 'Billing Province', 'Billing First Name',
+        'Billing Last Name', 'Billing Company',
+    }
 
-    # ── reCAPTCHA / hCaptcha info ────────────────────────────
-    rc = data.get('recaptcha')
-    if rc:
-        lines.append("")
-        lines.append(f"🤖 *{escape_md(rc['captcha_type'])} Detected*")
-        lines.append(f"  `RECAPTCHA_SITE_KEY` = `{escape_md(rc['site_key'])}`")
-        lines.append(f"  `RECAPTCHA_PAGE_URL` = `{escape_md(rc['page_url'])}`")
+    # ── Helpers ───────────────────────────────────────────────
+    SEP = "─" * 30
 
-    # ── ENH: Sub-page sitekeys ───────────────────────────────
-    for sp_sk in data.get('subpage_sitekeys', []):
-        lines.append(f"🤖 *{escape_md(sp_sk.get('captcha_type','CAPTCHA'))}* (sub-page)")
-        lines.append(f"  `{escape_md(sp_sk.get('site_key',''))}`")
+    def _classify(fields: list):
+        card, pay, user, dyn, hidden, iframe = [], [], [], [], [], []
+        for f in fields:
+            ct  = f.get('card_type', '')
+            ft  = f.get('type', 'text')
+            if f.get('from_iframe') and ft == 'iframe':
+                iframe.append(f)
+            elif ct in _CARD_STRICT_TYPES:
+                card.append(f)
+            elif ct in _PAY_INFO_TYPES:
+                pay.append(f)
+            elif f.get('is_dynamic') and not f.get('is_card'):
+                dyn.append(f)
+            elif ft == 'hidden':
+                hidden.append(f)
+            elif ft not in ('submit', 'button', 'reset', 'iframe'):
+                user.append(f)
+        return card, pay, user, dyn, hidden, iframe
 
-    # ── ENH: 3DS / SCA signals ──────────────────────────────
-    threeds = data.get('threeds_signals', [])
-    if threeds:
-        lines.append("")
-        lines.append("🔐 *3DS / SCA Signals:*")
-        for sig in threeds:
-            lines.append(f"  • {escape_md(sig)}")
+    def _field_pill(f) -> str:
+        """Compact one-liner: `name` label [=value]"""
+        name  = raw_code(f.get('name', ''), 30)
+        label = f.get('field_label') or f.get('label', '')
+        val   = f.get('value', '')
+        pill  = f"`{name}`"
+        if label and label.lower() not in (name.lower(), 'hidden', ''):
+            pill += f" _{escape_md(label[:28])}_"
+        if val and val not in ('', '0', '0.00'):
+            pill += f" = `{raw_code(val, 30)}`"
+        return pill
 
-    # ── ENH: Wallet / Express pay ───────────────────────────
-    wallets = data.get('wallets', [])
-    if wallets:
-        lines.append("")
-        lines.append("📱 *Wallet / Express Pay:* " + " · ".join(
-            f"`{escape_md(w)}`" for w in wallets
-        ))
+    def _opts_hint(f) -> str:
+        opts = f.get('options', [])
+        if not opts:
+            return ''
+        if all(o.isdigit() and len(o) == 2 for o in opts):   # months
+            return f" _{escape_md(opts[0])}–{escape_md(opts[-1])}_"
+        if all(o.isdigit() and len(o) == 4 for o in opts):   # years
+            return f" _{escape_md(opts[0])}–{escape_md(opts[-1])}_"
+        if len(opts) <= 5:
+            return " _" + escape_md('/'.join(opts)) + "_"
+        return f" _({len(opts)} options)_"
+
+    # ── Deduplication — key on card+pay field names ───────────
+    def _form_sig(entry):
+        fields = entry.get('fields', [])
+        card, pay, *_ = _classify(fields)
+        key_names = sorted(f['name'] for f in card + pay)
+        return tuple(key_names) if key_names else tuple(
+            sorted(f['name'] for f in fields)
+        )
 
     all_entries = forms + requests_
-    total   = len(all_entries)
-    pay_cnt = sum(1 for e in all_entries if e.get('is_payment'))
-
-    # Summary line
-    summary_parts = [f"*{total}* endpoint(s)"]
-    if pay_cnt:     summary_parts.append(f"💳 *{pay_cnt}* payment")
-    if gateways:    summary_parts.append(f"🔒 *{len(gateways)}* gateway(s)")
-    lines.append(f"📊 {' · '.join(summary_parts)}")
-
-    if total == 0:
-        lines.append("\nℹ️ No forms or intercepted requests found.")
-        return '\n'.join(lines)
-
-    # ── Payment Gateway ──────────────────────────────────────
-    if gateways:
-        lines.append("")
-        for gw in gateways:
-            lines.append(f"💳 *Gateway:* {gw['icon']} {escape_md(gw['name'])}")
-            lines.append(f"🔒 {escape_md(gw['tokenization'])}")
-            if gw.get('raw_post_risk'):
-                lines.append("🚨 *Raw POST* — card data may reach server unmasked")
-
-    # ── Deduplicate identical forms ──────────────────────────
-    def _fields_sig(entry):
-        return tuple(sorted(f['name'] for f in entry.get('fields', [])))
-
-    seen_sigs = {}
+    seen_sigs: dict = {}
     unique_entries = []
     for entry in all_entries:
-        sig = _fields_sig(entry)
+        sig = _form_sig(entry)
         if sig not in seen_sigs:
-            seen_sigs[sig] = 1
+            seen_sigs[sig] = []
             unique_entries.append(entry)
-        else:
-            seen_sigs[sig] += 1
+        seen_sigs[sig].append(entry.get('source', '?'))
 
-    # Payment first
     ordered = (
         [e for e in unique_entries if e.get('is_payment')] +
         [e for e in unique_entries if not e.get('is_payment')]
     )
 
-    # ── Per-entry block ──────────────────────────────────────
-    for idx, entry in enumerate(ordered[:6], 1):
-        ep     = entry.get('endpoint', '')
-        method = entry.get('method', 'POST')
-        ct     = entry.get('enctype', '')
-        fields = entry.get('fields', [])
-        is_pay = entry.get('is_payment', False)
-        src    = '🌐 XHR' if entry.get('source') == 'playwright' else '📋 Form'
-        dup_n  = seen_sigs.get(_fields_sig(entry), 1)
+    # ── HEADER BLOCK ─────────────────────────────────────────
+    rc          = data.get('recaptcha')
+    threeds     = data.get('threeds_signals', [])
+    wallets     = data.get('wallets', [])
+    pay_cnt     = sum(1 for e in all_entries if e.get('is_payment'))
 
-        # Shorten content-type label
+    lines = [f"🧩 *{escape_md(domain)}*  `{raw_code(url[:70])}`"]
+
+    # Gateway row
+    if gateways:
+        gw = gateways[0]
+        raw_risk = " 🚨 *Raw POST*" if gw.get('raw_post_risk') else ""
+        lines.append(
+            f"💳 *{escape_md(gw['name'])}* · {escape_md(gw.get('tokenization',''))}{raw_risk}"
+        )
+
+    # CAPTCHA row
+    if rc:
+        lines.append(
+            f"🤖 *{escape_md(rc['captcha_type'])}*  `{raw_code(rc['site_key'])}`"
+        )
+    for sp in data.get('subpage_sitekeys', []):
+        lines.append(
+            f"🤖 {escape_md(sp.get('captcha_type','CAPTCHA'))} _(sub-page)_"
+            f"  `{raw_code(sp.get('site_key',''))}`"
+        )
+
+    # 3DS / Wallets inline
+    badges = []
+    if threeds:
+        badges.append(f"🔐 3DS ({len(threeds)})")
+    if wallets:
+        badges.append("📱 " + " · ".join(f"`{raw_code(w)}`" for w in wallets))
+    if badges:
+        lines.append("  ".join(badges))
+
+    # Summary
+    s_parts = [f"*{len(ordered)}* unique form(s)"]
+    if len(all_entries) > len(unique_entries):
+        s_parts.append(f"_{len(all_entries) - len(unique_entries)} dupes hidden_")
+    if pay_cnt:
+        s_parts.append(f"💳 *{pay_cnt}* payment")
+    lines.append("📊 " + " · ".join(s_parts))
+
+    if not ordered:
+        lines.append("\nℹ️ No forms or intercepted requests found.")
+        return '\n'.join(lines)
+
+    # ── PER-FORM BLOCKS ───────────────────────────────────────
+    for idx, entry in enumerate(ordered[:6], 1):
+        ep      = entry.get('endpoint', '')
+        method  = entry.get('method', 'POST')
+        ct      = entry.get('enctype', '')
+        fields  = entry.get('fields', [])
+        is_pay  = entry.get('is_payment', False)
+        src_lbl = entry.get('source', '')
+        sig     = _form_sig(entry)
+        sources = seen_sigs.get(sig, [])
+
         ct_short = (ct.replace('application/', '')
                       .replace('x-www-form-urlencoded', 'urlencoded')
-                      .replace('; charset=utf-8', '')
-                      .strip()[:40])
+                      .replace('; charset=utf-8', '').strip()[:30])
 
         pay_badge = " 💳" if is_pay else ""
-        dup_note  = f" _(×{dup_n} identical)_" if dup_n > 1 else ""
+        src_note  = ""
+        if len(sources) > 1:
+            src_note = f" _×{len(sources)} sources_"
+        elif src_lbl.startswith('subpage:'):
+            src_note = f" _sub\\-page `{escape_md(src_lbl[8:])}`_"
+        elif src_lbl == 'playwright_dom':
+            src_note = " _DOM_"
 
-        lines.append(f"\n{'━'*34}")
-        lines.append(f"{src}{pay_badge} *#{idx}*{dup_note}")
-        lines.append(f"📡 *Endpoint* : `{escape_md(ep[:70])}`")
-        lines.append(f"🔁 *Method*   : `{escape_md(method)}`")
-        lines.append(f"📦 *Format*   : `{escape_md(ct_short)}`")
+        lines.append(f"\n{SEP}")
+        lines.append(f"📋{pay_badge} *Form {idx}*{src_note}")
+        lines.append(f"  `{raw_code(method)}` `{raw_code(ep[:65])}`")
+        if ct_short:
+            lines.append(f"  _{escape_md(ct_short)}_")
 
+        # No fields case
         if not fields:
-            rb = entry.get('raw_body', '')
-            lines.append(f"📝 `{escape_md(rb[:120])}`" if rb else "⚠️ No extractable fields")
-            # Show iframe hint if present
+            rb   = entry.get('raw_body', '')
             note = entry.get('note', '')
+            lines.append(f"  📝 `{raw_code(rb[:100])}`" if rb else "  ⚠️ No extractable fields")
             if note:
-                lines.append(f"_ℹ️ {escape_md(note)}_")
+                lines.append(f"  _ℹ️ {escape_md(note[:100])}_")
             continue
 
-        # ── Show subpage source ──────────────────────────────────────────
-        src_label = entry.get('source', '')
-        if src_label.startswith('subpage:'):
-            lines.append(f"_📄 From sub-page: `{escape_md(src_label[8:])}`_")
-        elif src_label == 'playwright_dom':
-            lines.append(f"_🌐 DOM extracted (includes iframes)_")
-
-        # ── Classify fields by purpose ───────────────────────
-        _CARD_STRICT_TYPES = {
-            'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
-            'Cardholder Name', 'Routing Number', 'Account Number', 'Account Type',
-        }
-        _PAY_INFO_TYPES = {
-            'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
-            'Billing Address', 'Billing Zip', 'Billing City', 'Billing State',
-            'Billing Country', 'Billing Province', 'Billing First Name',
-            'Billing Last Name', 'Billing Company',
-        }
-        card_strict = [f for f in fields if f.get('card_type') in _CARD_STRICT_TYPES]
-        pay_info    = [f for f in fields if f.get('card_type') in _PAY_INFO_TYPES]
-        iframe_f    = [f for f in fields if f.get('from_iframe') and f.get('type') == 'iframe']
-        dyn_f       = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
-        hidden_f    = [f for f in fields
-                       if not f.get('is_card') and not f.get('is_dynamic')
-                       and f.get('type') in ('hidden',)
-                       and f not in pay_info]
-        already_classified = set(id(f) for f in card_strict + pay_info + iframe_f + dyn_f + hidden_f)
-        user_f = [f for f in fields
-                  if id(f) not in already_classified
-                  and f.get('type') not in ('hidden', 'submit', 'button', 'reset', 'iframe')
-                  and not f.get('from_iframe')]
+        card, pay, user, dyn, hidden, iframe = _classify(fields)
 
         lines.append("")
 
-        # ── ENH: Iframe hosted fields hint ─────────────────────────────
-        if iframe_f:
-            lines.append(f"🖼️ *Hosted iframe fields* ({len(iframe_f)}):")
-            for f in iframe_f:
+        # Iframe hosted fields
+        if iframe:
+            lines.append(f"🖼️ *Hosted iframe* ({len(iframe)}):")
+            for f in iframe[:3]:
                 lines.append(f"  `{raw_code(f.get('label', f['name']), 80)}`")
 
-        # ── Card fields ─────────────────────────────────────────────────
-        if card_strict:
-            lines.append(f"💳 *Card Fields* ({len(card_strict)}):")
-            card_json_lines = ["{"]
-            for f in card_strict:
-                val     = f['value'][:40] if f.get('value') else ""
-                card_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val or f["field_label"])}",')
-            card_json_lines.append("}")
-            lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
+        # Card fields — compact pill row
+        if card:
+            pill_row = "  ".join(_field_pill(f) + _opts_hint(f) for f in card)
+            lines.append(f"💳 *Card* ({len(card)}): {pill_row}")
 
-        # ── Payment info ─────────────────────────────────────────────────
-        if pay_info:
-            lines.append(f"💰 *Payment Info* ({len(pay_info)}):")
-            pay_json_lines = ["{"]
-            for f in pay_info:
-                val = f['value'][:40] if f.get('value') else f['field_label']
-                pay_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
-            pay_json_lines.append("}")
-            lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
+        # Payment info — compact pill row
+        if pay:
+            lines.append(f"💰 *Payment* ({len(pay)}): " +
+                         "  ".join(_field_pill(f) for f in pay))
 
-        # ── User fields ──────────────────────────────────────────────────
-        if user_f:
-            lines.append(f"✏️ *User Fields* ({len(user_f)}):")
-            user_json_lines = ["{"]
-            for f in user_f:
-                val  = (f['value'][:40] if f.get('value')
-                        else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
-                opts = f.get('options', [])
-                if opts:
-                    opts_str = "|".join(opts[:6])
-                    user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",  /* {raw_code(opts_str)} */')
-                else:
-                    user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
-            user_json_lines.append("}")
-            lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
+        # User fields — one per line (may have options)
+        if user:
+            lines.append(f"✏️ *User* ({len(user)}):")
+            for f in user:
+                lines.append(f"  {_field_pill(f)}{_opts_hint(f)}")
 
-        # ── Dynamic fields ───────────────────────────────────────────────
-        if dyn_f:
-            dyn_names = ", ".join(f"`{raw_code(f['name'])}`" for f in dyn_f)
-            lines.append(f"🔄 *Auto* ({len(dyn_f)}): {dyn_names}")
+        # Dynamic tokens — pill row
+        if dyn:
+            lines.append(f"🔄 *Dynamic* ({len(dyn)}): " +
+                         "  ".join(_field_pill(f) for f in dyn))
 
-        # ── Hidden fields ────────────────────────────────────────────────
-        if hidden_f:
-            hid_names = ", ".join(f"`{raw_code(f['name'])}`" for f in hidden_f[:8])
-            extra     = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
-            lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hid_names}{escape_md(extra)}")
+        # Hidden — values shown, empty names grouped
+        if hidden:
+            non_empty   = [f for f in hidden if f.get('value') not in ('', None)]
+            empty_names = [f['name'] for f in hidden if f.get('value') in ('', None)]
+            lines.append(f"📌 *Hidden* ({len(hidden)}):")
+            for f in non_empty[:6]:
+                lines.append(
+                    f"  `{raw_code(f['name'], 28)}` = `{raw_code(f.get('value',''), 40)}`"
+                )
+            if empty_names:
+                nm_row = "  ".join(f"`{raw_code(n, 22)}`" for n in empty_names[:8])
+                extra  = f" +{len(empty_names)-8}" if len(empty_names) > 8 else ""
+                lines.append(f"  {nm_row}{escape_md(extra)}")
 
-        # ── Submit buttons ───────────────────────────────────────────────
-        submit_btns = entry.get('submit_buttons', [])
-        if submit_btns:
-            btn_parts = []
-            for btn in submit_btns:
-                txt   = btn.get('text', '') or btn.get('value', '') or 'Submit'
-                name  = btn.get('name', '')
-                btype = btn.get('type', 'submit')
-                part  = f"`{raw_code(txt)}`"
-                if name and name.lower() not in ('submit', 'button', ''):
-                    part += f" _(name=`{raw_code(name)}`, type=`{raw_code(btype)}`)_"
-                btn_parts.append(part)
-            lines.append(f"🟢 *Submit*: {' · '.join(btn_parts)}")
+        # Submit button
+        btns = entry.get('submit_buttons', [])
+        if btns:
+            btn   = btns[0]
+            txt   = btn.get('text') or btn.get('value') or 'Submit'
+            nm    = btn.get('name', '')
+            b_note = (f" _(name=`{raw_code(nm)}`)_"
+                      if nm and nm.lower() not in ('submit', 'button', '') else "")
+            lines.append(f"🟢 *Submit*: `{raw_code(txt)}`{b_note}")
+
+        # Honeypots
+        honeypots = [f for f in fields if f.get('is_honeypot')]
+        if honeypots:
+            hp_row = "  ".join(f"`{raw_code(f['name'])}`" for f in honeypots[:4])
+            lines.append(f"🪤 *Honeypot* ({len(honeypots)}): {hp_row} ⛔ _leave blank_")
 
     skipped = len(ordered) - min(len(ordered), 6)
-    if skipped > 0:
-        lines.append(f"\n_... +{skipped} more endpoint(s) — see JSON file_")
+    if skipped:
+        lines.append(f"\n_... +{skipped} more form(s) — see JSON file_")
 
-    # ── Header Requirements (compact) ───────────────────────
+    # ── HEADERS ───────────────────────────────────────────────
     headers_result = data.get('headers', [])
     if headers_result:
-        req_h = [h for h in headers_result if h['status_key'] == 'required']
-        imp_h = [h for h in headers_result if h['status_key'] == 'important']
-        opt_h = [h for h in headers_result if h['status_key'] == 'optional']
+        req_h = [h for h in headers_result if h.get('status_key') == 'required']
+        imp_h = [h for h in headers_result if h.get('status_key') == 'important']
+        opt_h = [h for h in headers_result if h.get('status_key') == 'optional']
 
-        lines.append(f"\n{'━'*34}")
-        lines.append("🔍 *Required Headers*")
-        if req_h:
-            for h in req_h:
-                lines.append(f"  🔴 `{escape_md(h['header'])}` — _{escape_md(h['notes'])}_")
-        if imp_h:
-            for h in imp_h:
-                lines.append(f"  🟡 `{escape_md(h['header'])}` — _{escape_md(h['notes'])}_")
+        lines.append(f"\n{SEP}")
+        lines.append("🔍 *Headers*")
+        for h in req_h:
+            lines.append(f"  🔴 `{raw_code(h['header'])}` — _{escape_md(h.get('notes',''))}_")
+        for h in imp_h:
+            lines.append(f"  🟡 `{raw_code(h['header'])}` — _{escape_md(h.get('notes',''))}_")
         if not req_h and not imp_h:
-            lines.append("  🟢 No required headers detected")
+            lines.append("  🟢 None required")
         if opt_h:
-            opt_names = ', '.join(f"`{escape_md(h['header'])}`" for h in opt_h)
-            lines.append(f"  🟢 Optional: {opt_names}")
+            opt_row = "  ".join(f"`{raw_code(h['header'])}`" for h in opt_h)
+            lines.append(f"  🟢 Optional: {opt_row}")
 
-    # ── Token Source Section ─────────────────────────────────
+    # ── TOKEN SOURCES ─────────────────────────────────────────
     token_sources = data.get('token_sources', [])
     if token_sources:
-        lines.append(f"\n{'━'*34}")
-        lines.append("🔎 *Token Sources*")
-        lines.append("_Where dynamic tokens live in page source:_\n")
-
-        # Group by source_type
+        src_icon = {
+            'hidden_input': '🔒', 'meta_tag': '🏷️',
+            'js_variable':  '📜', 'cookie':   '🍪',
+            'server_response': '📟',
+        }
         groups: dict = {}
         for t in token_sources:
             groups.setdefault(t['source_type'], []).append(t)
 
-        src_order = ['hidden_input', 'meta_tag', 'js_variable', 'cookie', 'server_response']
-        src_icons = {
-            'hidden_input':    '🔒',
-            'meta_tag':        '🏷️',
-            'js_variable':     '📜',
-            'cookie':          '🍪',
-            'server_response': '📟',
-        }
-        for st in src_order:
+        lines.append(f"\n{SEP}")
+        lines.append("🔎 *Token Sources*")
+        for st in ('hidden_input', 'meta_tag', 'js_variable', 'cookie', 'server_response'):
             if st not in groups:
                 continue
-            grp = groups[st]
-            loc = grp[0]['location']
-            lines.append(f"{src_icons.get(st,'🔄')} *{escape_md(loc)}*")
-            for t in grp:
-                val_str = ''
-                if t.get('value_preview') and t['value_preview'] != '(runtime value)':
-                    val_str = f" = `{raw_code(t['value_preview'], 60)}`"
-                lines.append(f"  `{raw_code(t['name'])}`{val_str}")
-                lines.append(f"  _{escape_md(t['label'])}_")
+            icon = src_icon.get(st, '🔄')
+            for t in groups[st]:
+                val = t.get('value_preview', '')
+                val_str = (f" = `{raw_code(val, 50)}`"
+                           if val and val != '(runtime value)' else "")
+                lines.append(
+                    f"  {icon} `{raw_code(t['name'], 30)}`{val_str}"
+                    f"  _{escape_md(t.get('label','')[:60])}_"
+                )
 
-    # ── Honeypot fields warning ──────────────────────────────
-    _all_fields_flat = [f for e in (forms + data.get('requests', []))
-                        for f in e.get('fields', [])]
-    _honeypots = [f for f in _all_fields_flat if f.get('is_honeypot')]
-    if _honeypots:
-        lines.append(f"\n{'━'*34}")
-        lines.append(f"🪤 *Honeypot / Anti-bot Fields* ({len(_honeypots)}):")
-        lines.append("_These are CSS-hidden — do NOT fill them or you will be blocked:_")
-        for hp in _honeypots[:5]:
-            lines.append(f"  ⛔ `{raw_code(hp['name'])}` (type=`{raw_code(hp['type'])}`)")
-
-    # ── localStorage / sessionStorage dump ──────────────────
-    cs = data.get('client_storage', {})
-    _ls = cs.get('localStorage', {})
-    _ss = cs.get('sessionStorage', {})
+    # ── CLIENT STORAGE ────────────────────────────────────────
+    cs   = data.get('client_storage', {})
+    _ls  = cs.get('localStorage', {})
+    _ss  = cs.get('sessionStorage', {})
     if _ls or _ss:
-        lines.append(f"\n{'━'*34}")
-        lines.append("💾 *Client Storage Tokens*")
-        if _ls:
-            lines.append("🗄️ *localStorage:*")
-            for k, v in list(_ls.items())[:6]:
-                lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v), 60)}`")
-        if _ss:
-            lines.append("🗄️ *sessionStorage:*")
-            for k, v in list(_ss.items())[:6]:
-                lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v), 60)}`")
+        lines.append(f"\n{SEP}")
+        lines.append("💾 *Client Storage*")
+        for store_name, store in (('localStorage', _ls), ('sessionStorage', _ss)):
+            if store:
+                lines.append(f"  🗄️ _{store_name}_")
+                for k, v in list(store.items())[:5]:
+                    lines.append(f"    `{raw_code(k, 24)}` = `{raw_code(str(v), 50)}`")
 
-    # ── Rate limit headers ────────────────────────────────────
+    # ── RATE LIMIT ────────────────────────────────────────────
     rl = data.get('rate_limit')
     if rl:
-        lines.append(f"\n{'━'*34}")
+        lines.append(f"\n{SEP}")
         lines.append("📊 *Rate Limit Headers*")
-        for k, v in rl.items():
+        for k, v in list(rl.items())[:6]:
             lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v))}`")
 
-    # ── Auth cookie security ──────────────────────────────────
+    # ── AUTH COOKIES ─────────────────────────────────────────
     auth_cookies = data.get('auth_cookies', [])
     if auth_cookies:
-        lines.append(f"\n{'━'*34}")
-        lines.append("🍪 *Auth Cookie Security*")
-        for ck in auth_cookies:
-            hi = "✅" if ck['httponly'] else "❌"
-            se = "✅" if ck['secure']   else "❌"
-            ss = ck.get('samesite', 'not set')
-            lines.append(f"  `{raw_code(ck['name'])}` — HttpOnly:{hi} Secure:{se} SameSite:`{raw_code(ss)}`")
-            for iss in ck.get('issues', []):
-                lines.append(f"    ⚠️ _{escape_md(iss)}_")
+        lines.append(f"\n{SEP}")
+        lines.append("🍪 *Auth Cookies*")
+        for ck in auth_cookies[:5]:
+            hi  = "✅" if ck['httponly'] else "❌"
+            se  = "✅" if ck['secure']   else "❌"
+            ss  = ck.get('samesite', '–')
+            iss = ck.get('issues', [])
+            warn = " ⚠️" if iss else ""
+            lines.append(
+                f"  `{raw_code(ck['name'], 24)}`"
+                f"  HttpOnly:{hi} Secure:{se} SameSite:`{raw_code(ss)}`{warn}"
+            )
+            for i in iss[:2]:
+                lines.append(f"    _{escape_md(i)}_")
 
-    # ── CSP analysis ─────────────────────────────────────────
+    # ── CSP ───────────────────────────────────────────────────
     csp = data.get('csp_info')
     if csp:
-        lines.append(f"\n{'━'*34}")
-        lines.append("🛡️ *Content-Security-Policy*")
-        cs_src = csp.get('directives', {}).get('connect-src', [])
-        if cs_src:
-            lines.append(f"  `connect-src`: `{raw_code(' '.join(cs_src[:5]))}`")
-        fa = csp.get('directives', {}).get('form-action', [])
-        if fa:
-            lines.append(f"  `form-action`: `{raw_code(' '.join(fa[:5]))}`")
-        for iss in csp.get('issues', []):
+        lines.append(f"\n{SEP}")
+        lines.append("🛡️ *CSP*")
+        for directive in ('connect-src', 'form-action'):
+            vals = csp.get('directives', {}).get(directive, [])
+            if vals:
+                lines.append(f"  `{directive}`: `{raw_code(' '.join(vals[:4]))}`")
+        for iss in csp.get('issues', [])[:3]:
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not csp.get('issues'):
-            lines.append("  ✅ No critical CSP misconfigurations")
+            lines.append("  ✅ No issues")
 
-    # ── CORS analysis ─────────────────────────────────────────
+    # ── CORS ──────────────────────────────────────────────────
     cors = data.get('cors_info')
     if cors:
-        lines.append(f"\n{'━'*34}")
-        lines.append("🌐 *CORS Policy*")
-        acao = cors.get('allow_origin', '')
-        acac = cors.get('allow_credentials', '')
-        lines.append(f"  Allow-Origin: `{raw_code(acao or 'not set')}`")
-        lines.append(f"  Allow-Credentials: `{raw_code(acac or 'false')}`")
-        for iss in cors.get('issues', []):
+        lines.append(f"\n{SEP}")
+        lines.append("🌐 *CORS*")
+        acao = cors.get('allow_origin', 'not set')
+        acac = cors.get('allow_credentials', 'false')
+        lines.append(f"  Origin: `{raw_code(acao)}`  Credentials: `{raw_code(acac)}`")
+        for iss in cors.get('issues', [])[:2]:
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not cors.get('issues'):
-            lines.append("  ✅ CORS policy looks safe")
+            lines.append("  ✅ Safe")
 
-    # ── GraphQL info ──────────────────────────────────────────
+    # ── GRAPHQL ───────────────────────────────────────────────
     gql = data.get('graphql_info')
     if gql:
-        lines.append(f"\n{'━'*34}")
-        lines.append(f"🔷 *GraphQL Detected* — `{raw_code(gql['endpoint'])}`")
+        lines.append(f"\n{SEP}")
+        lines.append(f"🔷 *GraphQL* `{raw_code(gql['endpoint'])}`")
         if gql.get('introspected'):
-            types_str = ', '.join(f"`{raw_code(t)}`" for t in gql['types'][:8])
+            types_str = '  '.join(f"`{raw_code(t)}`" for t in gql['types'][:6])
             lines.append(f"  Types: {types_str}")
         else:
-            lines.append("  ⚠️ Introspection blocked (endpoint responds but schema hidden)")
+            lines.append("  ⚠️ Introspection blocked")
 
-    # ── API schema ────────────────────────────────────────────
+    # ── API SCHEMA ────────────────────────────────────────────
     schema = data.get('api_schema')
     if schema:
-        lines.append(f"\n{'━'*34}")
-        lines.append(f"📖 *API Schema Found* (v{escape_md(schema['spec_version'])})")
-        lines.append(f"  `{raw_code(schema['schema_url'])}`")
-        if schema.get('pay_endpoints'):
-            lines.append(f"  💳 Payment endpoints ({len(schema['pay_endpoints'])}):")
-            for ep in schema['pay_endpoints'][:5]:
-                lines.append(f"    `{raw_code(ep['method'])}` `{raw_code(ep['endpoint'])}`"
-                             + (f" — _{escape_md(ep['summary'])}_" if ep['summary'] else ""))
+        lines.append(f"\n{SEP}")
+        lines.append(
+            f"📖 *API Schema* v{escape_md(schema['spec_version'])}"
+            f"  `{raw_code(schema['schema_url'], 60)}`"
+        )
+        for ep in schema.get('pay_endpoints', [])[:4]:
+            lines.append(
+                f"  💳 `{raw_code(ep['method'])}` `{raw_code(ep['endpoint'], 50)}`"
+                + (f" _{escape_md(ep['summary'])}_" if ep.get('summary') else "")
+            )
 
-    # ── Framework detection ───────────────────────────────────
+    # ── FRAMEWORK ─────────────────────────────────────────────
     fws = data.get('frameworks', [])
     if fws:
-        lines.append(f"\n{'━'*34}")
-        lines.append("⚙️ *JS Framework Detected*")
-        for fw in fws:
-            lines.append(f"  • *{escape_md(fw['name'])}*")
+        lines.append(f"\n{SEP}")
+        fw_row = "  ".join(f"*{escape_md(fw['name'])}*" for fw in fws[:4])
+        lines.append(f"⚙️ *Framework*: {fw_row}")
+        for fw in fws[:2]:
             if fw.get('note'):
-                lines.append(f"    _{escape_md(fw['note'])}_")
+                lines.append(f"  _{escape_md(fw['note'][:80])}_")
 
-    # ── Multi-step detection ──────────────────────────────────
+    # ── MULTI-STEP ────────────────────────────────────────────
     ms = data.get('multistep')
     if ms:
-        lines.append(f"\n{'━'*34}")
-        lines.append("🪜 *Multi-step Checkout Detected*")
-        for sig in ms.get('signals', []):
+        lines.append(f"\n{SEP}")
+        lines.append("🪜 *Multi-step Checkout*")
+        for sig in ms.get('signals', [])[:3]:
             lines.append(f"  • {escape_md(sig)}")
-        if ms.get('likely_step_urls'):
-            lines.append("  _Likely step URLs:_")
-            for su in ms['likely_step_urls'][:3]:
-                lines.append(f"  `{raw_code(su)}`")
+        for su in ms.get('likely_step_urls', [])[:3]:
+            lines.append(f"  `{raw_code(su, 70)}`")
 
-    # ── curl / Python snippet ─────────────────────────────────
+    # ── CURL / PYTHON SNIPPET ─────────────────────────────────
     snip = data.get('curl_snippet')
     if snip:
-        lines.append(f"\n{'━'*34}")
-        lines.append("📋 *Ready-to-run Request Snippet*")
-        lines.append("\n*cURL:*")
-        lines.append("```")
-        lines.append(snip['curl'][:800])
-        lines.append("```")
-        lines.append("\n🐍 *Python:*")
-        lines.append("```")
-        lines.append(snip['python'][:600])
-        lines.append("```")
+        lines.append(f"\n{SEP}")
+        lines.append("📋 *Request Snippets*")
+        if snip.get('curl'):
+            lines.append("*cURL:*")
+            lines.append("```\n" + snip['curl'][:700] + "\n```")
+        if snip.get('python'):
+            lines.append("🐍 *Python:*")
+            lines.append("```\n" + snip['python'][:500] + "\n```")
 
     lines.append(f"\n⚠️ _Authorized testing only._")
     return '\n'.join(lines)
@@ -26859,32 +26855,80 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = _format_payload_report(data)
 
     # ── Smart chunk splitter — code block aware ────────────────
-    MAX_LEN = 4000
+    MAX_LEN  = 3900   # safe margin below Telegram's 4096 hard limit
+    HARD_MAX = 4090   # absolute ceiling — force-flush even inside a block
 
     def _smart_chunks(text: str) -> list:
         """
-        4000 char ကျော်ရင် ``` code block အလယ်ဝင်မဖြတ်ဘဲ
-        block boundary မှာပဲ ခွဲသည်။
+        3900 char ကျော်ရင် split လုပ်သည်။
+        ``` code block အတွင်းမှာ ဖြတ်ရမယ်ဆိုရင် fence ကို
+        close/reopen လုပ်ပြီး ဆက်ပြသည်။
+        Single line ကိုယ်တိုင် MAX_LEN ထက်ကြီးနေရင်
+        hard-split (fence-safe) လုပ်သည်။
         """
         if len(text) <= MAX_LEN:
             return [text]
-        chunks   = []
-        current  = []
-        cur_len  = 0
-        in_block = False
+
+        chunks     = []
+        current    = []
+        cur_len    = 0
+        in_block   = False
+        fence_lang = ""   # language tag of the currently open fence, e.g. "python"
+
+        def flush(reopen: bool = False):
+            nonlocal current, cur_len, in_block
+            if not current:
+                return
+            # Close any open fence before flushing
+            if in_block:
+                current.append("```\n")
+            chunks.append("".join(current))
+            current = []
+            cur_len = 0
+            # Re-open the fence in the next chunk if we're still inside a block
+            if reopen and in_block:
+                opener = f"```{fence_lang}\n"
+                current.append(opener)
+                cur_len = len(opener)
+
         for line in text.splitlines(keepends=True):
-            if line.strip().startswith("```"):
-                in_block = not in_block
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if not in_block:
+                    fence_lang = stripped[3:].strip()
+                    in_block   = True
+                else:
+                    in_block   = False
+                    fence_lang = ""
+
             line_len = len(line)
-            # If adding this line would exceed limit AND we're not inside a code block
-            if cur_len + line_len > MAX_LEN and not in_block and current:
-                chunks.append("".join(current))
-                current  = []
-                cur_len  = 0
+
+            # Single line longer than MAX_LEN: hard-split it in pieces
+            if line_len > MAX_LEN:
+                flush(reopen=True)
+                pos = 0
+                while pos < line_len:
+                    piece = line[pos:pos + MAX_LEN]
+                    pos  += MAX_LEN
+                    if pos < line_len:
+                        chunks.append(piece)
+                    else:
+                        current.append(piece)
+                        cur_len = len(piece)
+                continue
+
+            # Normal line: flush if adding it would exceed the safe limit
+            if cur_len + line_len > MAX_LEN and current:
+                flush(reopen=True)
+
+            # Force-flush if we somehow still hit the hard ceiling
+            if cur_len + line_len > HARD_MAX and current:
+                flush(reopen=True)
+
             current.append(line)
             cur_len += line_len
-        if current:
-            chunks.append("".join(current))
+
+        flush(reopen=False)
         return chunks
 
     async def _safe_send_report(text: str):
