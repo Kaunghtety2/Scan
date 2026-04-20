@@ -26093,9 +26093,9 @@ def _format_payload_report(data: dict) -> str:
             card_json_lines = ["{"]
             for f in card_strict:
                 val     = f['value'][:40] if f.get('value') else ""
-                card_json_lines.append(f'  "{raw_code(f["name"])}: "{val or f["field_label"]}",')
+                card_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val or f["field_label"])}",')
             card_json_lines.append("}")
-            lines.append("```json\n" + "\n".join(card_json_lines) + "\n```")
+            lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
 
         # ── Payment info ─────────────────────────────────────────────────
         if pay_info:
@@ -26105,7 +26105,7 @@ def _format_payload_report(data: dict) -> str:
                 val = f['value'][:40] if f.get('value') else f['field_label']
                 pay_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
             pay_json_lines.append("}")
-            lines.append("```json\n" + "\n".join(pay_json_lines) + "\n```")
+            lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
 
         # ── User fields ──────────────────────────────────────────────────
         if user_f:
@@ -26121,7 +26121,7 @@ def _format_payload_report(data: dict) -> str:
                 else:
                     user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
             user_json_lines.append("}")
-            lines.append("```json\n" + "\n".join(user_json_lines) + "\n```")
+            lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
 
         # ── Dynamic fields ───────────────────────────────────────────────
         if dyn_f:
@@ -26144,7 +26144,7 @@ def _format_payload_report(data: dict) -> str:
                 btype = btn.get('type', 'submit')
                 part  = f"`{raw_code(txt)}`"
                 if name and name.lower() not in ('submit', 'button', ''):
-                    part += f" _(name=`{raw_code(name)}`, type=`{raw_code(btype)}`)_"
+                    part += f" (name=`{raw_code(name)}`, type={raw_code(btype)})"
                 btn_parts.append(part)
             lines.append(f"🟢 *Submit*: {' · '.join(btn_parts)}")
 
