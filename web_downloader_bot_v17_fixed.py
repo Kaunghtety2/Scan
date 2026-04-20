@@ -26355,9 +26355,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 if validation:
                     obj["validation"] = validation
 
-                # ── select options (months, years, countries …) ───────
-                if f.get("options"):
-                    obj["options"] = f["options"][:10]
+                # ── select options — hidden from output (use _opts_hint for compact display) ──
 
                 # ── prefilled/live value (amount, currency, etc.) ─────
                 val = f.get("value", "")
@@ -26531,8 +26529,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             val = f.get("value", "")
             if val and val not in ("", "0", "0.00"):
                 obj["value"] = val[:80]
-            if f.get("options"):
-                obj["options"] = f["options"][:10]
+            # options hidden from output to keep display clean
             return obj
 
         merged_obj: dict = {}
@@ -26809,8 +26806,6 @@ def _build_json_export(data: dict) -> str:
                 'value':    f.get('value', ''),
                 'required': f.get('required', False),
             }
-            if f.get('options'):
-                entry['options'] = f['options']
             if f.get('placeholder'):
                 entry['placeholder'] = f['placeholder']
 
