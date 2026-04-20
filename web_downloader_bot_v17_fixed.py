@@ -26803,22 +26803,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     editor_task = asyncio.create_task(progress_editor())
 
-    SCAN_TIMEOUT = 300   # 5 minutes max — prevent infinite hang
     try:
-        data = await asyncio.wait_for(
-            run_scan(uid, _payload_sync, url, progress_cb),
-            timeout=SCAN_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
-        editor_task.cancel()
-        await msg.edit_text(
-            f"⏱️ *Scan timed out* ({SCAN_TIMEOUT}s)\n"
-            f"`{escape_md(domain)}` — Server responses နှေးလွန်းတယ်\n"
-            f"_ရရှိပြီးသော results ကို JSON file မှ ကြည့်ပါ_",
-            parse_mode='Markdown'
-        )
-        return
+        data = await run_scan(uid, _payload_sync, url, progress_cb)
     except asyncio.CancelledError:
         loop.call_soon_threadsafe(progress_queue.put_nowait, None)   # stop editor
         editor_task.cancel()
