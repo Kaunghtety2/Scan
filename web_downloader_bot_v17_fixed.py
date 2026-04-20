@@ -24324,8 +24324,9 @@ def _smart_placeholder(name: str, label: str, ftype: str) -> str:
         return f'<{slug}>'
 
     # ── Name-based snake_case fallback ────────────────────────
-    slug = re.sub(r'([A-Z])', r'_', name).lower().strip('_')
+    slug = re.sub(r'([A-Z])', r'_\1', name).lower().strip('_')
     slug = re.sub(r'[^a-z0-9_]', '_', slug).strip('_')
+    slug = re.sub(r'_+', '_', slug)   # collapse double underscores
     return f'<{slug}>'
 
 
@@ -24422,6 +24423,35 @@ def _extract_forms_static(html: str, page_url: str) -> list:
         label, icon, is_dyn, card_type = _classify_field(
             name, value, ftype, placeholder, aria_label, label_text
         )
+
+        # ── False positive filter for card fields ──────────────────────────
+        # Reject card classification if:
+        #  1. Value is a short non-card string (Y/N/true/false/0/1 flag) — NOT empty
+        #  2. Name starts with 'old'/'prev'/'existing'/'saved' (token/history fields)
+        #  3. Field type is hidden AND value is clearly a flag (1-2 chars, non-numeric)
+        if card_type in ('Card Number', 'CVV/CVC', 'Routing Number', 'Account Number'):
+            _name_lo  = name.lower()
+            _val_lo   = value.strip().lower()
+            # A flag value is a short, clearly boolean/non-card string (not empty — empty is normal)
+            _flag_val = bool(_val_lo) and _val_lo in (
+                'y', 'n', 'yes', 'no', 'true', 'false',
+                '0', '1', 'on', 'off', 'enabled', 'disabled',
+            )
+            _is_old_field = bool(re.match(
+                r'^(old|prev|previous|existing|saved|stored|last|former)',
+                _name_lo
+            ))
+            # Hidden field with a flag-like value (1-2 chars that are non-numeric) is a flag
+            _is_hidden_flag = (
+                ftype == 'hidden'
+                and bool(_val_lo)
+                and len(_val_lo) <= 2
+                and not _val_lo.isdigit()
+            )
+            if _flag_val or _is_old_field or _is_hidden_flag:
+                card_type = None
+                label     = label_text or 'User Input'
+                icon      = '✏️'
         entry = {
             'name': name, 'type': ftype, 'value': value[:80],
             'required': req,
