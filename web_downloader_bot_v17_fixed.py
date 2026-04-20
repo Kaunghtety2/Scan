@@ -26144,7 +26144,7 @@ def _format_payload_report(data: dict) -> str:
                 btype = btn.get('type', 'submit')
                 part  = f"`{raw_code(txt)}`"
                 if name and name.lower() not in ('submit', 'button', ''):
-                    part += f" (name=`{raw_code(name)}`, type={raw_code(btype)})"
+                    part += f" _(name=`{raw_code(name)}`, type=`{raw_code(btype)}`)_"
                 btn_parts.append(part)
             lines.append(f"🟢 *Submit*: {' · '.join(btn_parts)}")
 
@@ -26334,11 +26334,12 @@ def _format_payload_report(data: dict) -> str:
     if snip:
         lines.append(f"\n{'━'*34}")
         lines.append("📋 *Ready-to-run Request Snippet*")
+        lines.append("\n*cURL:*")
         lines.append("```")
         lines.append(snip['curl'][:800])
         lines.append("```")
-        lines.append("_Python:_")
-        lines.append("```python")
+        lines.append("\n🐍 *Python:*")
+        lines.append("```")
         lines.append(snip['python'][:600])
         lines.append("```")
 
