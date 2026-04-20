@@ -249,8 +249,9 @@ def safe_local_path(domain_dir: str, url: str) -> str:
 
 def escape_md(text: str) -> str:
     """
-    Escape special Markdown v1 characters in dynamic/user-controlled content.
-    Safe to embed inside * * bold or ` ` code spans.
+    Escape special Markdown v1 characters for text OUTSIDE backtick spans.
+    For text inside `code` spans use raw_code() instead — Telegram renders
+    backslash escapes literally inside backticks, so \\_ shows as \\_ not _.
     Escapes: _ * ` [ ]
     """
     if not isinstance(text, str):
@@ -259,6 +260,18 @@ def escape_md(text: str) -> str:
     for ch in ('\\', '_', '*', '`', '[', ']'):
         text = text.replace(ch, '\\' + ch)
     return text
+
+
+def raw_code(text, maxlen: int = 200) -> str:
+    """
+    Sanitize text for display inside Telegram `backtick` code spans.
+    Inside backticks, Telegram renders text literally — do NOT call escape_md()
+    or backslash escapes like \\_ will show as \\_ instead of _.
+    Only strips backticks (which would break the code span) and truncates.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace('`', "'")[:maxlen]
 
 
 def _truncate_safe_md(text: str, limit: int = 4000) -> str:
@@ -26072,7 +26085,7 @@ def _format_payload_report(data: dict) -> str:
         if iframe_f:
             lines.append(f"🖼️ *Hosted iframe fields* ({len(iframe_f)}):")
             for f in iframe_f:
-                lines.append(f"  `{escape_md(f.get('label', f['name'])[:80])}`")
+                lines.append(f"  `{raw_code(f.get('label', f['name']), 80)}`")
 
         # ── Card fields ─────────────────────────────────────────────────
         if card_strict:
@@ -26080,10 +26093,9 @@ def _format_payload_report(data: dict) -> str:
             card_json_lines = ["{"]
             for f in card_strict:
                 val     = f['value'][:40] if f.get('value') else ""
-                comment = "  // required" if f.get('required') else ""
-                card_json_lines.append(f'  "{f["name"]}": "{val or f["field_label"]}",{comment}')
+                card_json_lines.append(f'  "{raw_code(f["name"])}: "{val or f["field_label"]}",')
             card_json_lines.append("}")
-            lines.append("```\n" + "\n".join(card_json_lines) + "\n```")
+            lines.append("```json\n" + "\n".join(card_json_lines) + "\n```")
 
         # ── Payment info ─────────────────────────────────────────────────
         if pay_info:
@@ -26091,36 +26103,34 @@ def _format_payload_report(data: dict) -> str:
             pay_json_lines = ["{"]
             for f in pay_info:
                 val = f['value'][:40] if f.get('value') else f['field_label']
-                pay_json_lines.append(f'  "{f["name"]}": "{val}",')
+                pay_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
             pay_json_lines.append("}")
-            lines.append("```\n" + "\n".join(pay_json_lines) + "\n```")
+            lines.append("```json\n" + "\n".join(pay_json_lines) + "\n```")
 
         # ── User fields ──────────────────────────────────────────────────
         if user_f:
             lines.append(f"✏️ *User Fields* ({len(user_f)}):")
             user_json_lines = ["{"]
             for f in user_f:
-                val     = (f['value'][:40] if f.get('value')
-                           else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
-                comment = "  // required" if f.get('required') else ""
-                # ENH: Show select options
+                val  = (f['value'][:40] if f.get('value')
+                        else _smart_placeholder(f['name'], f.get('field_label',''), f.get('type','text')))
                 opts = f.get('options', [])
                 if opts:
                     opts_str = "|".join(opts[:6])
-                    user_json_lines.append(f'  "{f["name"]}": "{val}",{comment}  /* options: {opts_str} */')
+                    user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",  /* {raw_code(opts_str)} */')
                 else:
-                    user_json_lines.append(f'  "{f["name"]}": "{val}",{comment}')
+                    user_json_lines.append(f'  "{raw_code(f["name"])}": "{raw_code(val)}",')
             user_json_lines.append("}")
-            lines.append("```\n" + "\n".join(user_json_lines) + "\n```")
+            lines.append("```json\n" + "\n".join(user_json_lines) + "\n```")
 
         # ── Dynamic fields ───────────────────────────────────────────────
         if dyn_f:
-            dyn_names = ", ".join(f"`{escape_md(f['name'])}`" for f in dyn_f)
+            dyn_names = ", ".join(f"`{raw_code(f['name'])}`" for f in dyn_f)
             lines.append(f"🔄 *Auto* ({len(dyn_f)}): {dyn_names}")
 
         # ── Hidden fields ────────────────────────────────────────────────
         if hidden_f:
-            hid_names = ", ".join(f"`{escape_md(f['name'])}`" for f in hidden_f[:8])
+            hid_names = ", ".join(f"`{raw_code(f['name'])}`" for f in hidden_f[:8])
             extra     = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
             lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hid_names}{escape_md(extra)}")
 
@@ -26129,12 +26139,12 @@ def _format_payload_report(data: dict) -> str:
         if submit_btns:
             btn_parts = []
             for btn in submit_btns:
-                txt  = btn.get('text', '') or btn.get('value', '') or 'Submit'
-                name = btn.get('name', '')
+                txt   = btn.get('text', '') or btn.get('value', '') or 'Submit'
+                name  = btn.get('name', '')
                 btype = btn.get('type', 'submit')
-                part  = f"`{escape_md(txt)}`"
+                part  = f"`{raw_code(txt)}`"
                 if name and name.lower() not in ('submit', 'button', ''):
-                    part += f" _(name=`{escape_md(name)}`, type={escape_md(btype)})_"
+                    part += f" _(name=`{raw_code(name)}`, type=`{raw_code(btype)}`)_"
                 btn_parts.append(part)
             lines.append(f"🟢 *Submit*: {' · '.join(btn_parts)}")
 
@@ -26192,8 +26202,8 @@ def _format_payload_report(data: dict) -> str:
             for t in grp:
                 val_str = ''
                 if t.get('value_preview') and t['value_preview'] != '(runtime value)':
-                    val_str = f" = `{escape_md(t['value_preview'])}`"
-                lines.append(f"  `{escape_md(t['name'])}`{val_str}")
+                    val_str = f" = `{raw_code(t['value_preview'], 60)}`"
+                lines.append(f"  `{raw_code(t['name'])}`{val_str}")
                 lines.append(f"  _{escape_md(t['label'])}_")
 
     # ── Honeypot fields warning ──────────────────────────────
@@ -26205,7 +26215,7 @@ def _format_payload_report(data: dict) -> str:
         lines.append(f"🪤 *Honeypot / Anti-bot Fields* ({len(_honeypots)}):")
         lines.append("_These are CSS-hidden — do NOT fill them or you will be blocked:_")
         for hp in _honeypots[:5]:
-            lines.append(f"  ⛔ `{escape_md(hp['name'])}` (type=`{escape_md(hp['type'])}`)")
+            lines.append(f"  ⛔ `{raw_code(hp['name'])}` (type=`{raw_code(hp['type'])}`)")
 
     # ── localStorage / sessionStorage dump ──────────────────
     cs = data.get('client_storage', {})
@@ -26217,11 +26227,11 @@ def _format_payload_report(data: dict) -> str:
         if _ls:
             lines.append("🗄️ *localStorage:*")
             for k, v in list(_ls.items())[:6]:
-                lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v)[:60])}`")
+                lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v), 60)}`")
         if _ss:
             lines.append("🗄️ *sessionStorage:*")
             for k, v in list(_ss.items())[:6]:
-                lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v)[:60])}`")
+                lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v), 60)}`")
 
     # ── Rate limit headers ────────────────────────────────────
     rl = data.get('rate_limit')
@@ -26229,7 +26239,7 @@ def _format_payload_report(data: dict) -> str:
         lines.append(f"\n{'━'*34}")
         lines.append("📊 *Rate Limit Headers*")
         for k, v in rl.items():
-            lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v))}`")
+            lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v))}`")
 
     # ── Auth cookie security ──────────────────────────────────
     auth_cookies = data.get('auth_cookies', [])
@@ -26240,7 +26250,7 @@ def _format_payload_report(data: dict) -> str:
             hi = "✅" if ck['httponly'] else "❌"
             se = "✅" if ck['secure']   else "❌"
             ss = ck.get('samesite', 'not set')
-            lines.append(f"  `{escape_md(ck['name'])}` — HttpOnly:{hi} Secure:{se} SameSite:`{escape_md(ss)}`")
+            lines.append(f"  `{raw_code(ck['name'])}` — HttpOnly:{hi} Secure:{se} SameSite:`{raw_code(ss)}`")
             for iss in ck.get('issues', []):
                 lines.append(f"    ⚠️ _{escape_md(iss)}_")
 
@@ -26251,10 +26261,10 @@ def _format_payload_report(data: dict) -> str:
         lines.append("🛡️ *Content-Security-Policy*")
         cs_src = csp.get('directives', {}).get('connect-src', [])
         if cs_src:
-            lines.append(f"  `connect-src`: `{escape_md(' '.join(cs_src[:5]))}`")
+            lines.append(f"  `connect-src`: `{raw_code(' '.join(cs_src[:5]))}`")
         fa = csp.get('directives', {}).get('form-action', [])
         if fa:
-            lines.append(f"  `form-action`: `{escape_md(' '.join(fa[:5]))}`")
+            lines.append(f"  `form-action`: `{raw_code(' '.join(fa[:5]))}`")
         for iss in csp.get('issues', []):
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not csp.get('issues'):
@@ -26267,8 +26277,8 @@ def _format_payload_report(data: dict) -> str:
         lines.append("🌐 *CORS Policy*")
         acao = cors.get('allow_origin', '')
         acac = cors.get('allow_credentials', '')
-        lines.append(f"  Allow-Origin: `{escape_md(acao or 'not set')}`")
-        lines.append(f"  Allow-Credentials: `{escape_md(acac or 'false')}`")
+        lines.append(f"  Allow-Origin: `{raw_code(acao or 'not set')}`")
+        lines.append(f"  Allow-Credentials: `{raw_code(acac or 'false')}`")
         for iss in cors.get('issues', []):
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not cors.get('issues'):
@@ -26278,9 +26288,9 @@ def _format_payload_report(data: dict) -> str:
     gql = data.get('graphql_info')
     if gql:
         lines.append(f"\n{'━'*34}")
-        lines.append(f"🔷 *GraphQL Detected* — `{escape_md(gql['endpoint'])}`")
+        lines.append(f"🔷 *GraphQL Detected* — `{raw_code(gql['endpoint'])}`")
         if gql.get('introspected'):
-            types_str = ', '.join(f"`{escape_md(t)}`" for t in gql['types'][:8])
+            types_str = ', '.join(f"`{raw_code(t)}`" for t in gql['types'][:8])
             lines.append(f"  Types: {types_str}")
         else:
             lines.append("  ⚠️ Introspection blocked (endpoint responds but schema hidden)")
@@ -26290,11 +26300,11 @@ def _format_payload_report(data: dict) -> str:
     if schema:
         lines.append(f"\n{'━'*34}")
         lines.append(f"📖 *API Schema Found* (v{escape_md(schema['spec_version'])})")
-        lines.append(f"  `{escape_md(schema['schema_url'])}`")
+        lines.append(f"  `{raw_code(schema['schema_url'])}`")
         if schema.get('pay_endpoints'):
             lines.append(f"  💳 Payment endpoints ({len(schema['pay_endpoints'])}):")
             for ep in schema['pay_endpoints'][:5]:
-                lines.append(f"    `{escape_md(ep['method'])}` `{escape_md(ep['endpoint'])}`"
+                lines.append(f"    `{raw_code(ep['method'])}` `{raw_code(ep['endpoint'])}`"
                              + (f" — _{escape_md(ep['summary'])}_" if ep['summary'] else ""))
 
     # ── Framework detection ───────────────────────────────────
@@ -26317,7 +26327,7 @@ def _format_payload_report(data: dict) -> str:
         if ms.get('likely_step_urls'):
             lines.append("  _Likely step URLs:_")
             for su in ms['likely_step_urls'][:3]:
-                lines.append(f"  `{escape_md(su)}`")
+                lines.append(f"  `{raw_code(su)}`")
 
     # ── curl / Python snippet ─────────────────────────────────
     snip = data.get('curl_snippet')
