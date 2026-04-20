@@ -26265,6 +26265,14 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         lines.append("\nℹ️ No forms or intercepted requests found.")
         return '\n'.join(lines)
 
+    # ── Merged-summary accumulators (populated inside per-form loop) ─
+    _summary_card:      list = []
+    _summary_pay:       list = []
+    _summary_user:      list = []
+    _summary_card_seen: set  = set()
+    _summary_pay_seen:  set  = set()
+    _summary_user_seen: set  = set()
+
     # ── PER-FORM BLOCKS ───────────────────────────────────────
     for idx, entry in enumerate(ordered[:6], 1):
         ep      = entry.get('endpoint', '')
@@ -26316,21 +26324,142 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             for f in iframe[:3]:
                 lines.append(f"  `{raw_code(f.get('label', f['name']), 80)}`")
 
-        # Card fields — compact pill row
-        if card:
-            pill_row = "  ".join(_field_pill(f) + _opts_hint(f) for f in card)
-            lines.append(f"💳 *Card* ({len(card)}): {pill_row}")
+        # ── Card / Payment / User → JSON block ──────────────────
+        if card or pay or user:
+            def _field_to_obj(f: dict) -> dict:
+                """Convert a field dict → clean, rich JSON-serializable object.
+                ENH: Includes autocomplete hint, HTML5 validation rules, source tag.
+                """
+                name  = f.get("name", "")
+                label = f.get("field_label") or f.get("label", "")
+                ftype = f.get("type", "text")
+                obj: dict = {
+                    "name":        name,
+                    "label":       label,
+                    "type":        ftype,
+                    "placeholder": _smart_placeholder(name, label, ftype),
+                    "required":    bool(f.get("required", False)),
+                }
+                # ── autocomplete hint (browser/CC manager uses this) ──
+                ac = f.get("autocomplete", "")
+                if ac and ac.lower() not in ("", "on", "off"):
+                    obj["autocomplete"] = ac
 
-        # Payment info — compact pill row
-        if pay:
-            lines.append(f"💰 *Payment* ({len(pay)}): " +
-                         "  ".join(_field_pill(f) for f in pay))
+                # ── HTML5 validation constraints ──────────────────────
+                validation: dict = {}
+                if f.get("pattern"):    validation["pattern"]   = f["pattern"]
+                if f.get("minlength"):  validation["minlength"] = f["minlength"]
+                if f.get("maxlength"):  validation["maxlength"] = f["maxlength"]
+                if f.get("min"):        validation["min"]       = f["min"]
+                if f.get("max"):        validation["max"]       = f["max"]
+                if validation:
+                    obj["validation"] = validation
 
-        # User fields — one per line (may have options)
-        if user:
-            lines.append(f"✏️ *User* ({len(user)}):")
+                # ── select options (months, years, countries …) ───────
+                if f.get("options"):
+                    obj["options"] = f["options"][:10]
+
+                # ── prefilled/live value (amount, currency, etc.) ─────
+                val = f.get("value", "")
+                if val and val not in ("", "0", "0.00"):
+                    obj["value"] = val[:80]
+
+                # ── field origin (static HTML / DOM / iframe / live) ──
+                src = f.get("source", "") or entry.get("source", "")
+                if src:
+                    _SRC_LABELS = {
+                        "static":           "html",
+                        "static_orphan":    "html_orphan",
+                        "playwright":       "xhr_intercept",
+                        "playwright_dom":   "dom",
+                        "live_intercept":   "live",
+                    }
+                    obj["source"] = _SRC_LABELS.get(src, src)
+
+                return obj
+
+            json_obj: dict = {}
+            if card:
+                json_obj["card_fields"] = [_field_to_obj(f) for f in card]
+            if pay:
+                json_obj["payment_fields"] = [_field_to_obj(f) for f in pay]
+            if user:
+                json_obj["user_fields"] = [_field_to_obj(f) for f in user]
+
+            # pretty-print — 2-space indent fits Telegram code block nicely
+            json_str = json.dumps(json_obj, ensure_ascii=False, indent=2)
+            # section header (counts)
+            hdr_parts = []
+            if card:
+                hdr_parts.append(f"💳 {len(card)} card")
+            if pay:
+                hdr_parts.append(f"💰 {len(pay)} payment")
+            if user:
+                hdr_parts.append(f"✏️ {len(user)} user")
+            lines.append("  ".join(hdr_parts))
+            lines.append(f"```json\n{json_str}\n```")
+
+            # ── ENH: POST body template — flat {name: placeholder} ───
+            # Only for payment forms (card fields present) — practical POST payload
+            if card or pay:
+                _FIELD_ORDER = [
+                    # user identity first
+                    "Email", "Phone", "Cardholder Name",
+                    "Billing First Name", "Billing Last Name", "Billing Company",
+                    # address block
+                    "Billing Address", "Billing City", "Billing State",
+                    "Billing Zip", "Billing Country", "Billing Province",
+                    # card block
+                    "Card Number", "Expiry Month", "Expiry Year",
+                    "CVV/CVC", "Routing Number", "Account Number", "Account Type",
+                    # transaction
+                    "Amount", "Currency", "Order/Txn ID", "Customer ID",
+                ]
+                def _order_key(f):
+                    ct = f.get("card_type") or f.get("field_label", "")
+                    try:    return _FIELD_ORDER.index(ct)
+                    except: return 99
+
+                all_fields = sorted(card + pay + user, key=_order_key)
+                tpl: dict = {}
+                for f in all_fields:
+                    fname = f.get("name", "")
+                    if not fname:
+                        continue
+                    ph = _smart_placeholder(
+                        fname,
+                        f.get("field_label") or f.get("label", ""),
+                        f.get("type", "text")
+                    )
+                    tpl[fname] = ph
+                # add any dynamic tokens (CSRF/nonce) the server will check
+                for f in dyn:
+                    fname = f.get("name", "")
+                    if fname and fname not in tpl:
+                        tpl[fname] = f.get("value", "") or "<token>"
+                tpl_str = json.dumps(tpl, ensure_ascii=False, indent=2)
+                lines.append("📤 *POST body template:*")
+                lines.append(f"```json\n{tpl_str}\n```")
+
+            # Accumulate for merged summary (defined outside per-form loop)
+            _merged_card_seen: set  # forward-ref — populated in outer scope
+            _merged_pay_seen: set
+            _merged_user_seen: set
+            for f in card:
+                nm = f.get("name", "")
+                if nm and nm not in _summary_card_seen:
+                    _summary_card_seen.add(nm)
+                    _summary_card.append(f)
+            for f in pay:
+                nm = f.get("name", "")
+                if nm and nm not in _summary_pay_seen:
+                    _summary_pay_seen.add(nm)
+                    _summary_pay.append(f)
             for f in user:
-                lines.append(f"  {_field_pill(f)}{_opts_hint(f)}")
+                nm = f.get("name", "")
+                if nm and nm not in _summary_user_seen:
+                    _summary_user_seen.add(nm)
+                    _summary_user.append(f)
 
         # Dynamic tokens — pill row
         if dyn:
@@ -26370,6 +26499,85 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     skipped = len(ordered) - min(len(ordered), 6)
     if skipped:
         lines.append(f"\n_... +{skipped} more form(s) — see JSON file_")
+
+    # ── MERGED FIELDS SUMMARY (cross-form, deduped) ──────────
+    if _summary_card or _summary_pay or _summary_user:
+        lines.append(f"\n{SEP}")
+        total_fields = len(_summary_card) + len(_summary_pay) + len(_summary_user)
+        lines.append(
+            f"📦 *Merged Field Summary* — {total_fields} unique field(s) across all forms"
+        )
+
+        def _field_to_obj_summary(f: dict) -> dict:
+            name  = f.get("name", "")
+            label = f.get("field_label") or f.get("label", "")
+            ftype = f.get("type", "text")
+            obj: dict = {
+                "name":        name,
+                "label":       label,
+                "type":        ftype,
+                "placeholder": _smart_placeholder(name, label, ftype),
+                "required":    bool(f.get("required", False)),
+            }
+            ac = f.get("autocomplete", "")
+            if ac and ac.lower() not in ("", "on", "off"):
+                obj["autocomplete"] = ac
+            validation: dict = {}
+            if f.get("pattern"):   validation["pattern"]   = f["pattern"]
+            if f.get("minlength"): validation["minlength"] = f["minlength"]
+            if f.get("maxlength"): validation["maxlength"] = f["maxlength"]
+            if validation:
+                obj["validation"] = validation
+            val = f.get("value", "")
+            if val and val not in ("", "0", "0.00"):
+                obj["value"] = val[:80]
+            if f.get("options"):
+                obj["options"] = f["options"][:10]
+            return obj
+
+        merged_obj: dict = {}
+        if _summary_card:
+            merged_obj["card_fields"]    = [_field_to_obj_summary(f) for f in _summary_card]
+        if _summary_pay:
+            merged_obj["payment_fields"] = [_field_to_obj_summary(f) for f in _summary_pay]
+        if _summary_user:
+            merged_obj["user_fields"]    = [_field_to_obj_summary(f) for f in _summary_user]
+
+        merged_json = json.dumps(merged_obj, ensure_ascii=False, indent=2)
+        lines.append(f"```json\n{merged_json}\n```")
+
+        # ── Flat POST template from merged fields ─────────────
+        _FIELD_ORDER_M = [
+            "Email", "Phone", "Cardholder Name",
+            "Billing First Name", "Billing Last Name", "Billing Company",
+            "Billing Address", "Billing City", "Billing State",
+            "Billing Zip", "Billing Country", "Billing Province",
+            "Card Number", "Expiry Month", "Expiry Year",
+            "CVV/CVC", "Routing Number", "Account Number",
+            "Amount", "Currency", "Order/Txn ID", "Customer ID",
+        ]
+        def _ord_key_m(f):
+            ct = f.get("card_type") or f.get("field_label", "")
+            try:    return _FIELD_ORDER_M.index(ct)
+            except: return 99
+
+        all_merged = sorted(
+            _summary_card + _summary_pay + _summary_user,
+            key=_ord_key_m
+        )
+        flat_tpl: dict = {}
+        for f in all_merged:
+            nm = f.get("name", "")
+            if nm:
+                flat_tpl[nm] = _smart_placeholder(
+                    nm,
+                    f.get("field_label") or f.get("label", ""),
+                    f.get("type", "text")
+                )
+        if flat_tpl:
+            flat_str = json.dumps(flat_tpl, ensure_ascii=False, indent=2)
+            lines.append("📤 *Merged POST template:*")
+            lines.append(f"```json\n{flat_str}\n```")
 
     # ── HEADERS ───────────────────────────────────────────────
     headers_result = data.get('headers', [])
@@ -26544,6 +26752,33 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     return '\n'.join(lines)
 
 
+def _sanitize_for_json(obj, _seen=None):
+    """Recursively sanitize an object so it is JSON-serializable.
+    Handles circular references, non-serializable types (BS4 Tags,
+    Playwright objects, compiled regexes, etc.).
+    """
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if isinstance(obj, dict):
+        if obj_id in _seen:
+            return "__circular_ref__"
+        _seen = _seen | {obj_id}
+        return {str(k): _sanitize_for_json(v, _seen) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        if obj_id in _seen:
+            return []
+        _seen = _seen | {obj_id}
+        return [_sanitize_for_json(i, _seen) for i in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    # Anything else → safe string representation
+    try:
+        return str(obj)
+    except Exception:
+        return "__unserializable__"
+
+
 def _build_json_export(data: dict) -> str:
     """Full JSON export — fields categorized: card / payment / user / dynamic / hidden + submit buttons."""
 
@@ -26710,7 +26945,8 @@ def _build_json_export(data: dict) -> str:
         }
         if _attr_map:
             form_obj['field_validation_attrs'] = _attr_map
-    return json.dumps(clean, indent=2, ensure_ascii=False)
+    safe = _sanitize_for_json(clean)
+    return json.dumps(safe, indent=2, ensure_ascii=False)
 
 
 # ══════════════════════════════════════════════════════════════
