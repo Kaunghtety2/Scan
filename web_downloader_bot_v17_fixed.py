@@ -24409,12 +24409,29 @@ def _extract_forms_static(html: str, page_url: str) -> list:
         name  = inp.get('name') or inp.get('id') or ''
         if not name:
             return None
-        ftype       = inp.get('type', 'text').lower()
-        value       = inp.get('value', '')
-        placeholder = inp.get('placeholder', '')
-        aria_label  = inp.get('aria-label', '') or inp.get('title', '')
-        label_text  = label_override or _get_label(inp)
-        req         = inp.has_attr('required') or inp.get('required') == 'required'
+        ftype        = inp.get('type', 'text').lower()
+        value        = inp.get('value', '')
+        placeholder  = inp.get('placeholder', '')
+        aria_label   = inp.get('aria-label', '') or inp.get('title', '')
+        label_text   = label_override or _get_label(inp)
+        req          = inp.has_attr('required') or inp.get('required') == 'required'
+        autocomplete = inp.get('autocomplete', '')
+        pattern      = inp.get('pattern', '')
+        minlength    = inp.get('minlength', '') or inp.get('minLength', '')
+        maxlength    = inp.get('maxlength', '') or inp.get('maxLength', '')
+        inp_min      = inp.get('min', '')
+        inp_max      = inp.get('max', '')
+        # ── Honeypot detection (inline CSS hiding) ──────────────────────
+        _style       = (inp.get('style', '') or '').lower().replace(' ', '')
+        _is_honeypot = (
+            'display:none' in _style or
+            'visibility:hidden' in _style or
+            'opacity:0' in _style or
+            ('position:absolute' in _style and
+             any(x in _style for x in ('left:-', 'top:-', 'left:-999', 'top:-999'))) or
+            inp.get('tabindex') == '-1' or
+            inp.get('aria-hidden') == 'true'
+        )
         # Select options
         options = []
         if inp.name == 'select':
@@ -24454,14 +24471,21 @@ def _extract_forms_static(html: str, page_url: str) -> list:
                 icon      = '✏️'
         entry = {
             'name': name, 'type': ftype, 'value': value[:80],
-            'required': req,
-            'field_label': label_text or label,
-            'icon': icon,
-            'is_dynamic': is_dyn,
-            'is_card': card_type is not None,
-            'card_type': card_type,
-            'placeholder': placeholder,
+            'required':     req,
+            'field_label':  label_text or label,
+            'icon':         icon,
+            'is_dynamic':   is_dyn,
+            'is_card':      card_type is not None,
+            'card_type':    card_type,
+            'placeholder':  placeholder,
+            'autocomplete': autocomplete,
+            'is_honeypot':  _is_honeypot,
         }
+        if pattern:    entry['pattern']    = pattern
+        if minlength:  entry['minlength']  = minlength
+        if maxlength:  entry['maxlength']  = maxlength
+        if inp_min:    entry['min']        = inp_min
+        if inp_max:    entry['max']        = inp_max
         if options:
             entry['options'] = options
         return entry
@@ -24679,14 +24703,35 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                             const opts = el.tagName === 'SELECT'
                                 ? Array.from(el.options).map(o=>o.value||o.text).filter(Boolean).slice(0,20)
                                 : [];
+                            // ── Honeypot detection via computedStyle ──
+                            let is_honeypot = false;
+                            try {
+                                const cs = window.getComputedStyle(el);
+                                is_honeypot = (
+                                    cs.display === 'none' ||
+                                    cs.visibility === 'hidden' ||
+                                    parseFloat(cs.opacity) === 0 ||
+                                    el.getAttribute('tabindex') === '-1' ||
+                                    el.getAttribute('aria-hidden') === 'true' ||
+                                    (parseInt(cs.left) < -100 && cs.position === 'absolute') ||
+                                    (parseInt(cs.top)  < -100 && cs.position === 'absolute')
+                                );
+                            } catch(e) {}
                             fields.push({
                                 name, type,
-                                value:       (el.value||'').slice(0,80),
-                                placeholder: el.placeholder||'',
-                                required:    el.required || el.getAttribute('required')!==null,
-                                label:       getLabel(el).slice(0,80),
-                                options:     opts,
-                                from_iframe: prefix !== 'main',
+                                value:        (el.value||'').slice(0,80),
+                                placeholder:  el.placeholder||'',
+                                required:     el.required || el.getAttribute('required')!==null,
+                                label:        getLabel(el).slice(0,80),
+                                options:      opts,
+                                from_iframe:  prefix !== 'main',
+                                autocomplete: el.autocomplete || el.getAttribute('autocomplete') || '',
+                                pattern:      el.pattern      || el.getAttribute('pattern')      || '',
+                                minlength:    el.minLength    != null ? String(el.minLength) : '',
+                                maxlength:    el.maxLength    != null ? String(el.maxLength) : '',
+                                min:          el.min          || '',
+                                max:          el.max          || '',
+                                is_honeypot:  is_honeypot,
                             });
                         });
                     }
@@ -24773,6 +24818,34 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
             except Exception as dom_err:
                 if progress_cb:
                     progress_cb(f"⚠️ DOM extract: {dom_err}")
+
+            # ── ENH: localStorage / sessionStorage live dump ──────────────
+            try:
+                _storage_raw = page.evaluate("""() => {
+                    const _tok_keys = /token|auth|jwt|session|csrf|nonce|key|secret|bearer/i;
+                    const ls = {}, ss = {};
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        const v = localStorage.getItem(k) || '';
+                        if (_tok_keys.test(k) || _tok_keys.test(v.slice(0,80)))
+                            ls[k] = v.slice(0, 200);
+                    }
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const k = sessionStorage.key(i);
+                        const v = sessionStorage.getItem(k) || '';
+                        if (_tok_keys.test(k) || _tok_keys.test(v.slice(0,80)))
+                            ss[k] = v.slice(0, 200);
+                    }
+                    return { localStorage: ls, sessionStorage: ss };
+                }""")
+                if _storage_raw:
+                    captured.append({
+                        '_storage_dump': True,
+                        'localStorage':  _storage_raw.get('localStorage', {}),
+                        'sessionStorage': _storage_raw.get('sessionStorage', {}),
+                    })
+            except Exception:
+                pass
 
             # Grab JS source for gateway detection
             try:
@@ -25211,19 +25284,379 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
     return results
 
 
+
+# ══════════════════════════════════════════════════════════════
+# ── /payload Enhancement Helpers (Features 1, 5–12) ──────────
+# ══════════════════════════════════════════════════════════════
+
+def _generate_curl_snippet(endpoint: str, method: str, enctype: str,
+                           all_fields: list, headers_required: list = None) -> dict:
+    """Generate curl + Python requests snippet from extracted form fields."""
+    _CARD_PLACEHOLDERS = {
+        'Card Number':    '4111111111111111',
+        'CVV/CVC':        '123',
+        'Expiry Month':   '12/2025',
+        'Expiry Year':    '2025',
+        'Cardholder Name': 'John Doe',
+        'Routing Number': '021000021',
+        'Account Number': '000123456789',
+        'Account Type':   'checking',
+        'Amount':         '100.00',
+        'Currency':       'USD',
+    }
+    field_map = {}
+    for f in all_fields:
+        name = f.get('name', '')
+        if not name or f.get('type') in ('submit', 'button', 'reset', 'image'):
+            continue
+        if f.get('is_honeypot'):
+            continue   # skip honeypot fields
+        ct  = f.get('card_type') or ''
+        val = f.get('value', '')
+        if val and len(val) > 1 and not f.get('is_dynamic'):
+            field_map[name] = val
+        elif ct in _CARD_PLACEHOLDERS:
+            field_map[name] = _CARD_PLACEHOLDERS[ct]
+        elif f.get('is_dynamic'):
+            field_map[name] = f'<{name}_runtime>'
+        else:
+            field_map[name] = f.get('placeholder') or f'<{name}>'
+
+    # Build header strings
+    h_parts, h_dict = [], {}
+    if headers_required:
+        for h in (headers_required or []):
+            if h.get('status_key') in ('required', 'important'):
+                hname = h['header']
+                h_parts.append(f'  -H "{hname}: <value>"')
+                h_dict[hname] = '<value>'
+
+    is_json = 'json' in enctype.lower()
+    if is_json:
+        import json as _json
+        body_json = _json.dumps(field_map, indent=2)
+        curl_body = f"--data-raw '{body_json}'"
+        h_parts.insert(0, '  -H "Content-Type: application/json"')
+    else:
+        from urllib.parse import urlencode as _ue
+        curl_body = f"--data-urlencode '{_ue(field_map)}'"
+        h_parts.insert(0, '  -H "Content-Type: application/x-www-form-urlencoded"')
+
+    h_str  = ' \\\n'.join(h_parts)
+    curl   = f"curl -X {method} '{endpoint}' \\\n{h_str} \\\n  {curl_body}"
+
+    # Python snippet
+    py_lines = [
+        'import requests', '',
+        f"url     = '{endpoint}'",
+        f'payload = {repr(field_map)}',
+    ]
+    if h_dict:
+        py_lines.append(f'headers = {repr(h_dict)}')
+    kwargs = 'json=payload' if is_json else 'data=payload'
+    if h_dict:
+        kwargs += ', headers=headers'
+    py_lines += [
+        f'resp    = requests.{method.lower()}(url, {kwargs})',
+        'print(resp.status_code, resp.text[:500])',
+    ]
+    return {'curl': curl, 'python': '\n'.join(py_lines)}
+
+
+def _analyze_auth_cookies(url: str) -> list:
+    """Fetch URL and analyze Set-Cookie security flags on auth-looking cookies."""
+    results = []
+    _AUTH_NAMES = re.compile(
+        r'session|sess|auth|token|jwt|access|refresh|login|remember|sid|uid',
+        re.I
+    )
+    try:
+        resp = requests.get(url, headers=_get_headers(), timeout=10,
+                            verify=False, allow_redirects=True)
+        raw_cookies = resp.headers.get_all('set-cookie') if hasattr(resp.headers, 'get_all') \
+                      else [v for k, v in resp.headers.items() if k.lower() == 'set-cookie']
+        for raw in (raw_cookies or []):
+            parts = [p.strip() for p in raw.split(';')]
+            if not parts:
+                continue
+            name_val = parts[0].split('=', 1)
+            cname = name_val[0].strip()
+            if not _AUTH_NAMES.search(cname):
+                continue
+            flags     = [p.lower() for p in parts[1:]]
+            http_only = any('httponly' in f for f in flags)
+            secure    = any(f == 'secure' for f in flags)
+            same_site = next((p.split('=',1)[1].strip() if '=' in p else 'None'
+                              for p in flags if 'samesite' in p), None)
+            issues = []
+            if not http_only: issues.append('No HttpOnly — XSS can steal this cookie')
+            if not secure:    issues.append('No Secure flag — visible over HTTP')
+            if same_site in (None, 'None', 'none'):
+                issues.append('SameSite=None — CSRF possible if not Secure')
+            results.append({
+                'name':      cname,
+                'httponly':  http_only,
+                'secure':    secure,
+                'samesite':  same_site or 'not set',
+                'issues':    issues,
+                'raw':       raw[:120],
+            })
+    except Exception:
+        pass
+    return results
+
+
+def _detect_graphql(origin: str) -> dict | None:
+    """Probe common GraphQL paths and attempt introspection."""
+    _GQL_PATHS = ['/graphql', '/api/graphql', '/v1/graphql', '/gql',
+                  '/query', '/api/query']
+    _INTROSPECTION = ('{"query":"{ __schema { queryType { name } types { name kind } } }"}')
+    headers = {**_get_headers(), 'Content-Type': 'application/json', 'Accept': 'application/json'}
+    for path in _GQL_PATHS:
+        url = origin + path
+        try:
+            r = requests.post(url, data=_INTROSPECTION, headers=headers,
+                              timeout=8, verify=False)
+            if r.status_code not in (200, 400):
+                continue
+            try:
+                body = r.json()
+            except Exception:
+                continue
+            if 'data' not in body and 'errors' not in body:
+                continue
+            types   = []
+            ops     = []
+            schema  = (body.get('data') or {}).get('__schema') or {}
+            if schema:
+                types = [t['name'] for t in schema.get('types', [])
+                         if not t['name'].startswith('__')][:20]
+                qt = (schema.get('queryType') or {}).get('name', '')
+                ops = [qt] if qt else []
+            return {
+                'endpoint':    url,
+                'status':      r.status_code,
+                'introspected': bool(schema),
+                'types':        types,
+                'operations':   ops,
+                'raw_preview':  str(body)[:300],
+            }
+        except Exception:
+            continue
+    return None
+
+
+def _check_api_schema(origin: str) -> dict | None:
+    """Try common OpenAPI / Swagger schema paths and extract payment endpoints."""
+    _SCHEMA_PATHS = [
+        '/openapi.json', '/swagger.json', '/api-docs',
+        '/api/docs', '/v1/openapi.json', '/docs/openapi.json',
+        '/swagger/v1/swagger.json',
+    ]
+    _PAY_KEYS = re.compile(r'payment|checkout|order|billing|card|purchase|charge', re.I)
+    for path in _SCHEMA_PATHS:
+        url = origin + path
+        try:
+            r = requests.get(url, headers=_get_headers(), timeout=8, verify=False)
+            if r.status_code != 200:
+                continue
+            try:
+                spec = r.json()
+            except Exception:
+                continue
+            if 'paths' not in spec and 'openapi' not in spec and 'swagger' not in spec:
+                continue
+            pay_endpoints = []
+            for ep, methods in (spec.get('paths') or {}).items():
+                if _PAY_KEYS.search(ep):
+                    for method, detail in (methods or {}).items():
+                        if method.lower() in ('get', 'post', 'put', 'patch', 'delete'):
+                            pay_endpoints.append({
+                                'endpoint': ep,
+                                'method':   method.upper(),
+                                'summary':  (detail or {}).get('summary', ''),
+                            })
+            return {
+                'schema_url':     url,
+                'spec_version':   spec.get('openapi') or spec.get('swagger', '?'),
+                'title':          (spec.get('info') or {}).get('title', ''),
+                'pay_endpoints':  pay_endpoints[:10],
+                'total_endpoints': len(spec.get('paths') or {}),
+            }
+        except Exception:
+            continue
+    return None
+
+
+def _detect_frameworks(html: str, js_text: str) -> list:
+    """Detect JS frameworks — affects how form fields and requests work."""
+    combined = html + js_text
+    _SIGS = [
+        ('React',        re.compile(r'react\.(?:development|production)|__REACT_DEVTOOLS|_reactFiber|React\.createElement', re.I)),
+        ('Next.js',      re.compile(r'__NEXT_DATA__|/_next/static|next/router', re.I)),
+        ('Vue.js',       re.compile(r'vue\.(?:runtime|esm)|__vue_|new Vue\(|createApp\(', re.I)),
+        ('Nuxt.js',      re.compile(r'__nuxt|_nuxt/', re.I)),
+        ('Angular',      re.compile(r'ng-version|angular\.min|NgModule|platformBrowser', re.I)),
+        ('jQuery',       re.compile(r'jquery[-./][\d.]+(?:\.min)?\.js|jQuery\.fn\.jquery', re.I)),
+        ('Svelte',       re.compile(r'__svelte|SvelteComponent', re.I)),
+        ('Ember.js',     re.compile(r'Ember\.VERSION|ember-source', re.I)),
+        ('Alpine.js',    re.compile(r'x-data=|Alpine\.version|alpinejs', re.I)),
+        ('HTMX',         re.compile(r'hx-post=|hx-get=|htmx\.min', re.I)),
+    ]
+    _NOTES = {
+        'React':   '⚛️  Controlled inputs — static HTML value= always empty, use XHR intercept',
+        'Next.js': '▲  SSR/CSR hybrid — check both static HTML and hydrated DOM',
+        'Vue.js':  '🟢 v-model binding — value not in HTML, use DOM extraction',
+        'Angular': '🔴 Reactive forms — ngModel/FormControl, fields dynamic at runtime',
+        'jQuery':  '💲 $.ajax / $.post likely — intercept XHR for real endpoint',
+        'HTMX':    '⚡ hx-post attributes define endpoints — check HTML attrs',
+    }
+    found = []
+    for name, pat in _SIGS:
+        if pat.search(combined):
+            found.append({'name': name, 'note': _NOTES.get(name, '')})
+    return found
+
+
+def _analyze_csp(url: str) -> dict | None:
+    """Fetch URL headers and parse Content-Security-Policy."""
+    try:
+        r = requests.get(url, headers=_get_headers(), timeout=8, verify=False)
+        csp_raw = (r.headers.get('Content-Security-Policy') or
+                   r.headers.get('Content-Security-Policy-Report-Only') or '')
+        if not csp_raw:
+            return None
+        directives = {}
+        for part in csp_raw.split(';'):
+            part = part.strip()
+            if not part:
+                continue
+            tokens = part.split()
+            if tokens:
+                directives[tokens[0].lower()] = tokens[1:]
+        issues = []
+        if "'unsafe-inline'" in ' '.join(directives.get('script-src', [])):
+            issues.append("script-src allows 'unsafe-inline' — XSS risk")
+        if "'unsafe-eval'" in ' '.join(directives.get('script-src', [])):
+            issues.append("script-src allows 'unsafe-eval' — eval() XSS risk")
+        if '*' in directives.get('script-src', []):
+            issues.append("script-src wildcard (*) — any script can load")
+        connect_src = directives.get('connect-src', [])
+        return {
+            'raw':         csp_raw[:300],
+            'directives':  {k: v for k, v in directives.items()
+                            if k in ('script-src', 'connect-src', 'form-action',
+                                     'frame-src', 'default-src')},
+            'connect_src': connect_src,
+            'issues':      issues,
+        }
+    except Exception:
+        return None
+
+
+def _analyze_cors(url: str, endpoint: str = None) -> dict | None:
+    """OPTIONS preflight to check CORS policy on form endpoint."""
+    target = endpoint or url
+    try:
+        r = requests.options(
+            target,
+            headers={
+                **_get_headers(),
+                'Origin':                        'https://evil.example.com',
+                'Access-Control-Request-Method': 'POST',
+                'Access-Control-Request-Headers':'Content-Type, Authorization',
+            },
+            timeout=8, verify=False
+        )
+        acao  = r.headers.get('Access-Control-Allow-Origin', '')
+        acac  = r.headers.get('Access-Control-Allow-Credentials', '').lower()
+        acam  = r.headers.get('Access-Control-Allow-Methods', '')
+        acah  = r.headers.get('Access-Control-Allow-Headers', '')
+        issues = []
+        if acao == '*':
+            issues.append('ACAO: * — any origin allowed (safe only if no credentials)')
+        if acao == 'https://evil.example.com':
+            issues.append('ACAO reflects Origin — wildcard reflection CORS misconfiguration!')
+        if acac == 'true' and acao in ('*', 'https://evil.example.com'):
+            issues.append('ACAC: true + ACAO wildcard/reflect — credentials exposed cross-origin!')
+        return {
+            'endpoint':   target,
+            'status':     r.status_code,
+            'allow_origin': acao,
+            'allow_credentials': acac,
+            'allow_methods': acam,
+            'allow_headers': acah,
+            'issues':     issues,
+        }
+    except Exception:
+        return None
+
+
+def _detect_rate_limit_headers(resp_headers: dict) -> dict | None:
+    """Extract rate limit info from response headers."""
+    _RL_HEADERS = {
+        'X-RateLimit-Limit':     'limit',
+        'X-RateLimit-Remaining': 'remaining',
+        'X-RateLimit-Reset':     'reset',
+        'Retry-After':           'retry_after',
+        'X-Rate-Limit-Limit':    'limit',
+        'X-Rate-Limit-Remaining':'remaining',
+        'RateLimit-Limit':       'limit',
+        'RateLimit-Remaining':   'remaining',
+        'RateLimit-Reset':       'reset',
+    }
+    found = {}
+    for hname, key in _RL_HEADERS.items():
+        val = resp_headers.get(hname) or resp_headers.get(hname.lower())
+        if val:
+            found[key] = val
+    return found if found else None
+
+
+def _detect_multistep(html: str, js_text: str, url: str) -> dict | None:
+    """Detect multi-step / wizard checkout forms."""
+    combined = html + js_text
+    _STEP_SIGS = [
+        (re.compile(r'data-step=["\'](\d+)["\']', re.I),             'data-step attribute'),
+        (re.compile(r'step[_-](\d+)|checkout[_-]step[_-](\d+)', re.I), 'URL/class step pattern'),
+        (re.compile(r'class=["\'][^"\']*(?:step|wizard|progress)[^"\']*["\']', re.I), 'CSS step/wizard class'),
+        (re.compile(r'<[^>]+aria-label=["\'][^"\']*step[^"\']*["\']', re.I), 'aria-label step'),
+        (re.compile(r'currentStep|activeStep|stepIndex|wizardStep', re.I),  'JS step variable'),
+    ]
+    _STEP_URLS = ['/checkout/step', '/checkout/address', '/checkout/shipping',
+                  '/checkout/payment', '/checkout/review', '/checkout/confirm']
+    signals = []
+    for pat, label in _STEP_SIGS:
+        if pat.search(combined):
+            signals.append(label)
+    step_urls = [_origin_from_url(url) + p for p in _STEP_URLS
+                 if _origin_from_url(url)][:5]
+    return {'signals': signals, 'likely_step_urls': step_urls} if signals else None
+
+
+def _origin_from_url(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}" if p.netloc else ''
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
-    """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet."""
+    """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
 
-    static_html = ''
+    static_html   = ''
+    _resp_headers = {}
+    _initial_resp = None
     try:
-        resp = requests.get(url, headers=_get_headers(),
+        _initial_resp = requests.get(url, headers=_get_headers(),
                             timeout=TIMEOUT, verify=False, allow_redirects=True)
-        static_html = resp.text
+        static_html   = _initial_resp.text
+        _resp_headers = dict(_initial_resp.headers)
     except Exception:
         pass
 
     static_forms = _extract_forms_static(static_html, url) if static_html else []
+    for _sf in static_forms:
+        _sf.setdefault('source', 'static_html')
     if progress_cb: progress_cb(f"📋 {len(static_forms)} static form(s) — Playwright launching...")
 
     pw_requests = _extract_requests_playwright(url, progress_cb)
@@ -25237,14 +25670,19 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         for f in js_forms:
             f['source'] = 'js_render'
 
-    # ── Split pw_requests: js_text | DOM forms | network requests ────────
+    # ── Split pw_requests: js_text | DOM forms | network requests | storage ─
     js_text       = ''
     real_requests = []
     dom_forms     = []
+    client_storage = {'localStorage': {}, 'sessionStorage': {}}
 
     for r in pw_requests:
         if r.pop('_js_only', False):
             js_text = r.pop('_js_text', '')
+            continue
+        if r.pop('_storage_dump', False):
+            client_storage['localStorage'].update(r.get('localStorage', {}))
+            client_storage['sessionStorage'].update(r.get('sessionStorage', {}))
             continue
         js_text += r.pop('_js_text', '')
         if r.get('source') == 'playwright_dom':
@@ -25310,7 +25748,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🤖 Extracting CAPTCHA site key...")
     recaptcha_info = _extract_recaptcha_info(static_html + js_html, js_text, url)
 
-    # ── ENH Phase 8: Sub-page scan ────────────────────────────────────────
+    # ── ENH Phase 8: Sub-page scan (parallel) ────────────────────────────
     _SUBPAGES = [
         "/checkout", "/checkout/payment", "/cart", "/pay", "/payment",
         "/billing", "/order", "/donate", "/donation", "/subscribe",
@@ -25324,32 +25762,42 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     _origin = f"{_parsed.scheme}://{_parsed.netloc}"
     _existing_eps = {f.get('endpoint', '') for f in static_forms + js_forms}
 
-    for _sp in _SUBPAGES[:12]:
-        _sub_url = _origin + _sp
+    def _fetch_subpage(sp: str):
+        _sub_url = _origin + sp
         try:
             _sr = requests.get(_sub_url, headers=_get_headers(),
                                timeout=8, verify=False, allow_redirects=True)
             if _sr.status_code != 200:
-                continue
+                return None
             if 'text/html' not in _sr.headers.get('content-type', ''):
-                continue
+                return None
             _sub_forms = _extract_forms_static(_sr.text, _sub_url)
+            _sk = _extract_recaptcha_info(_sr.text, '', _sub_url)
+            return sp, _sub_forms, _sk
+        except Exception:
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=6) as _pool:
+        _futs = {_pool.submit(_fetch_subpage, sp): sp for sp in _SUBPAGES[:12]}
+        for _fut in as_completed(_futs):
+            _res = _fut.result()
+            if not _res:
+                continue
+            _sp, _sub_forms, _sk = _res
             for sf in _sub_forms:
                 if sf.get('endpoint') not in _existing_eps and sf.get('fields'):
                     sf['source'] = f'subpage:{_sp}'
                     subpage_forms.append(sf)
                     _existing_eps.add(sf.get('endpoint', ''))
-            # Sitekey scan on sub-page
-            _sk = _extract_recaptcha_info(_sr.text, '', _sub_url)
             if _sk and _sk.get('site_key'):
                 subpage_sitekeys.append(_sk)
-        except Exception:
-            pass
 
-    if subpage_forms and progress_cb:
-        progress_cb(f"✅ Sub-pages: {len(subpage_forms)} extra form(s)")
+    if progress_cb:
+        progress_cb(f"🔗 Sub-page scan complete: {len(subpage_forms)} extra form(s)")
 
     # ── ENH Phase 9: 3DS / SCA signal detection ───────────────────────────
+    if progress_cb: progress_cb("🔐 3DS / SCA signal detection...")
     _combined_text = static_html + js_html + js_text
     _3DS_SIGS = [
         (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction'), "Stripe 3DS confirmPayment"),
@@ -25364,6 +25812,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     threeds_signals = [lbl for pat, lbl in _3DS_SIGS if pat.search(_combined_text)]
 
     # ── ENH Phase 10: Wallet / express pay detection ──────────────────────
+    if progress_cb: progress_cb("📱 Wallet / express pay detection...")
     _WALLET_SIGS = [
         (re.compile(r'(?i)ApplePaySession|apple.?pay'),       "Apple Pay"),
         (re.compile(r'(?i)new\s+PaymentRequest|google.?pay'), "Google Pay / Payment Request API"),
@@ -25377,6 +25826,59 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         (re.compile(r'(?i)samsung.?pay'),                     "Samsung Pay"),
     ]
     wallets = [lbl for pat, lbl in _WALLET_SIGS if pat.search(_combined_text)]
+
+    # ── ENH: Rate limit headers (from initial response) ──────────────────
+    if progress_cb: progress_cb("📊 Checking rate limit headers...")
+    rate_limit = _detect_rate_limit_headers(_resp_headers)
+
+    # ── ENH: Cookie security analysis ────────────────────────────────────
+    if progress_cb: progress_cb("🍪 Analyzing auth cookie security flags...")
+    auth_cookies = _analyze_auth_cookies(url)
+
+    # ── ENH: CSP header analysis ──────────────────────────────────────────
+    if progress_cb: progress_cb("🛡️ Parsing Content-Security-Policy...")
+    csp_info = _analyze_csp(url)
+
+    # ── ENH: CORS analysis (on first payment form endpoint if found) ──────
+    if progress_cb: progress_cb("🌐 Testing CORS policy...")
+    _cors_ep = next(
+        (f.get('endpoint') for f in (static_forms + js_forms + subpage_forms)
+         if f.get('is_payment') and f.get('endpoint')),
+        url
+    )
+    cors_info = _analyze_cors(url, _cors_ep)
+
+    # ── ENH: GraphQL detection ─────────────────────────────────────────────
+    if progress_cb: progress_cb("🔷 Probing GraphQL endpoint...")
+    graphql_info = _detect_graphql(base_url)
+
+    # ── ENH: API schema discovery ──────────────────────────────────────────
+    if progress_cb: progress_cb("📖 Checking OpenAPI/Swagger schema...")
+    api_schema = _check_api_schema(base_url)
+
+    # ── ENH: Framework detection ───────────────────────────────────────────
+    if progress_cb: progress_cb("🔍 Detecting JS framework...")
+    frameworks = _detect_frameworks(static_html + js_html, js_text)
+
+    # ── ENH: Multi-step form detection ────────────────────────────────────
+    if progress_cb: progress_cb("🪜 Checking for multi-step checkout...")
+    multistep = _detect_multistep(static_html + js_html, js_text, url)
+
+    # ── ENH: curl/Python snippet (first payment form or first form) ───────
+    _snippet_form = next(
+        (f for f in (static_forms + js_forms + subpage_forms + real_requests)
+         if f.get('is_payment')),
+        next(iter(static_forms + js_forms + real_requests), None)
+    )
+    curl_snippet = None
+    if _snippet_form:
+        curl_snippet = _generate_curl_snippet(
+            endpoint       = _snippet_form.get('endpoint', url),
+            method         = _snippet_form.get('method', 'POST'),
+            enctype        = _snippet_form.get('enctype', 'application/x-www-form-urlencoded'),
+            all_fields     = _snippet_form.get('fields', []),
+            headers_required = headers_result,
+        )
 
     parsed   = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -25393,6 +25895,16 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'subpage_sitekeys': subpage_sitekeys,
         'threeds_signals':  threeds_signals,
         'wallets':          wallets,
+        'client_storage':   client_storage,
+        'rate_limit':       rate_limit,
+        'auth_cookies':     auth_cookies,
+        'csp_info':         csp_info,
+        'cors_info':        cors_info,
+        'graphql_info':     graphql_info,
+        'api_schema':       api_schema,
+        'frameworks':       frameworks,
+        'multistep':        multistep,
+        'curl_snippet':     curl_snippet,
     }
 
 
@@ -25675,6 +26187,142 @@ def _format_payload_report(data: dict) -> str:
                 lines.append(f"  `{escape_md(t['name'])}`{val_str}")
                 lines.append(f"  _{escape_md(t['label'])}_")
 
+    # ── Honeypot fields warning ──────────────────────────────
+    _all_fields_flat = [f for e in (forms + data.get('requests', []))
+                        for f in e.get('fields', [])]
+    _honeypots = [f for f in _all_fields_flat if f.get('is_honeypot')]
+    if _honeypots:
+        lines.append(f"\n{'━'*34}")
+        lines.append(f"🪤 *Honeypot / Anti-bot Fields* ({len(_honeypots)}):")
+        lines.append("_These are CSS-hidden — do NOT fill them or you will be blocked:_")
+        for hp in _honeypots[:5]:
+            lines.append(f"  ⛔ `{escape_md(hp['name'])}` (type=`{escape_md(hp['type'])}`)")
+
+    # ── localStorage / sessionStorage dump ──────────────────
+    cs = data.get('client_storage', {})
+    _ls = cs.get('localStorage', {})
+    _ss = cs.get('sessionStorage', {})
+    if _ls or _ss:
+        lines.append(f"\n{'━'*34}")
+        lines.append("💾 *Client Storage Tokens*")
+        if _ls:
+            lines.append("🗄️ *localStorage:*")
+            for k, v in list(_ls.items())[:6]:
+                lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v)[:60])}`")
+        if _ss:
+            lines.append("🗄️ *sessionStorage:*")
+            for k, v in list(_ss.items())[:6]:
+                lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v)[:60])}`")
+
+    # ── Rate limit headers ────────────────────────────────────
+    rl = data.get('rate_limit')
+    if rl:
+        lines.append(f"\n{'━'*34}")
+        lines.append("📊 *Rate Limit Headers*")
+        for k, v in rl.items():
+            lines.append(f"  `{escape_md(k)}` = `{escape_md(str(v))}`")
+
+    # ── Auth cookie security ──────────────────────────────────
+    auth_cookies = data.get('auth_cookies', [])
+    if auth_cookies:
+        lines.append(f"\n{'━'*34}")
+        lines.append("🍪 *Auth Cookie Security*")
+        for ck in auth_cookies:
+            hi = "✅" if ck['httponly'] else "❌"
+            se = "✅" if ck['secure']   else "❌"
+            ss = ck.get('samesite', 'not set')
+            lines.append(f"  `{escape_md(ck['name'])}` — HttpOnly:{hi} Secure:{se} SameSite:`{escape_md(ss)}`")
+            for iss in ck.get('issues', []):
+                lines.append(f"    ⚠️ _{escape_md(iss)}_")
+
+    # ── CSP analysis ─────────────────────────────────────────
+    csp = data.get('csp_info')
+    if csp:
+        lines.append(f"\n{'━'*34}")
+        lines.append("🛡️ *Content-Security-Policy*")
+        cs_src = csp.get('directives', {}).get('connect-src', [])
+        if cs_src:
+            lines.append(f"  `connect-src`: `{escape_md(' '.join(cs_src[:5]))}`")
+        fa = csp.get('directives', {}).get('form-action', [])
+        if fa:
+            lines.append(f"  `form-action`: `{escape_md(' '.join(fa[:5]))}`")
+        for iss in csp.get('issues', []):
+            lines.append(f"  ⚠️ _{escape_md(iss)}_")
+        if not csp.get('issues'):
+            lines.append("  ✅ No critical CSP misconfigurations")
+
+    # ── CORS analysis ─────────────────────────────────────────
+    cors = data.get('cors_info')
+    if cors:
+        lines.append(f"\n{'━'*34}")
+        lines.append("🌐 *CORS Policy*")
+        acao = cors.get('allow_origin', '')
+        acac = cors.get('allow_credentials', '')
+        lines.append(f"  Allow-Origin: `{escape_md(acao or 'not set')}`")
+        lines.append(f"  Allow-Credentials: `{escape_md(acac or 'false')}`")
+        for iss in cors.get('issues', []):
+            lines.append(f"  ⚠️ _{escape_md(iss)}_")
+        if not cors.get('issues'):
+            lines.append("  ✅ CORS policy looks safe")
+
+    # ── GraphQL info ──────────────────────────────────────────
+    gql = data.get('graphql_info')
+    if gql:
+        lines.append(f"\n{'━'*34}")
+        lines.append(f"🔷 *GraphQL Detected* — `{escape_md(gql['endpoint'])}`")
+        if gql.get('introspected'):
+            types_str = ', '.join(f"`{escape_md(t)}`" for t in gql['types'][:8])
+            lines.append(f"  Types: {types_str}")
+        else:
+            lines.append("  ⚠️ Introspection blocked (endpoint responds but schema hidden)")
+
+    # ── API schema ────────────────────────────────────────────
+    schema = data.get('api_schema')
+    if schema:
+        lines.append(f"\n{'━'*34}")
+        lines.append(f"📖 *API Schema Found* (v{escape_md(schema['spec_version'])})")
+        lines.append(f"  `{escape_md(schema['schema_url'])}`")
+        if schema.get('pay_endpoints'):
+            lines.append(f"  💳 Payment endpoints ({len(schema['pay_endpoints'])}):")
+            for ep in schema['pay_endpoints'][:5]:
+                lines.append(f"    `{escape_md(ep['method'])}` `{escape_md(ep['endpoint'])}`"
+                             + (f" — _{escape_md(ep['summary'])}_" if ep['summary'] else ""))
+
+    # ── Framework detection ───────────────────────────────────
+    fws = data.get('frameworks', [])
+    if fws:
+        lines.append(f"\n{'━'*34}")
+        lines.append("⚙️ *JS Framework Detected*")
+        for fw in fws:
+            lines.append(f"  • *{escape_md(fw['name'])}*")
+            if fw.get('note'):
+                lines.append(f"    _{escape_md(fw['note'])}_")
+
+    # ── Multi-step detection ──────────────────────────────────
+    ms = data.get('multistep')
+    if ms:
+        lines.append(f"\n{'━'*34}")
+        lines.append("🪜 *Multi-step Checkout Detected*")
+        for sig in ms.get('signals', []):
+            lines.append(f"  • {escape_md(sig)}")
+        if ms.get('likely_step_urls'):
+            lines.append("  _Likely step URLs:_")
+            for su in ms['likely_step_urls'][:3]:
+                lines.append(f"  `{escape_md(su)}`")
+
+    # ── curl / Python snippet ─────────────────────────────────
+    snip = data.get('curl_snippet')
+    if snip:
+        lines.append(f"\n{'━'*34}")
+        lines.append("📋 *Ready-to-run Request Snippet*")
+        lines.append("```")
+        lines.append(snip['curl'][:800])
+        lines.append("```")
+        lines.append("_Python:_")
+        lines.append("```python")
+        lines.append(snip['python'][:600])
+        lines.append("```")
+
     lines.append(f"\n⚠️ _Authorized testing only._")
     return '\n'.join(lines)
 
@@ -25683,8 +26331,9 @@ def _build_json_export(data: dict) -> str:
     """Full JSON export — fields categorized: card / payment / user / dynamic / hidden + submit buttons."""
 
     _CARD_TYPES = {'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
-                   'Expiry MM/YY', 'Cardholder Name'}
-    _PAY_TYPES  = {'Amount', 'Currency', 'Order/Txn ID',
+                   'Expiry MM/YY', 'Cardholder Name',
+                   'Routing Number', 'Account Number', 'Account Type'}
+    _PAY_TYPES  = {'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
                    'Billing Address', 'Billing Zip', 'Billing City',
                    'Billing State', 'Billing Country', 'Billing Province',
                    'Billing First Name', 'Billing Last Name', 'Billing Company'}
@@ -25733,14 +26382,15 @@ def _build_json_export(data: dict) -> str:
         }
 
     clean = {
-        'url':      data.get('url'),
-        'base_url': data.get('base_url', ''),
-        'recaptcha': data.get('recaptcha'),
-        'threeds_signals': data.get('threeds_signals', []),
-        'wallets':   data.get('wallets', []),
-        'gateways': data.get('gateways', []),
-        'forms':    [],
-        'requests': [],
+        'url':               data.get('url'),
+        'base_url':          data.get('base_url', ''),
+        'recaptcha':         data.get('recaptcha'),
+        'subpage_sitekeys':  data.get('subpage_sitekeys', []),
+        'threeds_signals':   data.get('threeds_signals', []),
+        'wallets':           data.get('wallets', []),
+        'gateways':          data.get('gateways', []),
+        'forms':             [],
+        'requests':          [],
     }
 
     for entry in data.get('forms', []):
@@ -25809,6 +26459,40 @@ def _build_json_export(data: dict) -> str:
         }
         for t in data.get('token_sources', [])
     ]
+    # ── New enhancement fields ────────────────────────────────
+    clean['client_storage']  = data.get('client_storage', {})
+    clean['rate_limit']      = data.get('rate_limit')
+    clean['auth_cookies']    = data.get('auth_cookies', [])
+    clean['csp_info']        = data.get('csp_info')
+    clean['cors_info']       = data.get('cors_info')
+    clean['graphql_info']    = data.get('graphql_info')
+    clean['api_schema']      = data.get('api_schema')
+    clean['frameworks']      = data.get('frameworks', [])
+    clean['multistep']       = data.get('multistep')
+    clean['curl_snippet']    = data.get('curl_snippet')
+    # ── Per-field enhancements: include honeypot + HTML5 attrs ─
+    for form_obj in clean['forms']:
+        src_entry = next(
+            (e for e in data.get('forms', [])
+             if e.get('endpoint') == form_obj.get('endpoint')),
+            None
+        )
+        if not src_entry:
+            continue
+        honeypots = [
+            {'name': f['name'], 'type': f.get('type'), 'reason': 'css_hidden'}
+            for f in src_entry.get('fields', []) if f.get('is_honeypot')
+        ]
+        if honeypots:
+            form_obj['honeypot_fields'] = honeypots
+        # Attach HTML5 validation attrs to each field category
+        _attr_map = {
+            f['name']: {k: f[k] for k in ('autocomplete','pattern','minlength','maxlength','min','max')
+                        if f.get(k)}
+            for f in src_entry.get('fields', [])
+        }
+        if _attr_map:
+            form_obj['field_validation_attrs'] = _attr_map
     return json.dumps(clean, indent=2, ensure_ascii=False)
 
 
@@ -25945,16 +26629,24 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📌 *Usage:* `/payload https://example.com`\n\n"
             "🧩 *Extracts:*\n"
             "  • Form endpoints + HTTP methods\n"
-            "  • All fields (name, type, value)\n"
+            "  • All fields (name, type, value, HTML5 validation)\n"
             "  • 💳 Card fields (number, CVV, expiry)\n"
             "  • 🔄 Dynamic fields (CSRF, Nonce, Session, OTP)\n"
-            "  • 📌 Static fields (IDs, redirect URLs)\n"
-            "  • 💳 Payment gateway detection\n"
-            "     (Stripe / PayPal / Braintree / Square / Adyen…)\n"
-            "  • Tokenization method analysis\n\n"
-            "🔬 *Methods:* Static HTML + Playwright JS render + XHR intercept\n"
+            "  • 📌 Static/hidden fields\n"
+            "  • 💳 Payment gateway detection (23+ gateways)\n"
+            "  • 🪤 Honeypot / anti-bot field detection\n"
+            "  • 💾 localStorage / sessionStorage token dump\n\n"
+            "🔬 *Analysis:*\n"
             "  • 🔍 Header requirements\n"
-            "     (X-CSRF-Token, Referer, User-Agent, X-Requested-With…)\n\n"
+            "  • 🍪 Auth cookie security (HttpOnly/Secure/SameSite)\n"
+            "  • 🛡️ CSP header analysis\n"
+            "  • 🌐 CORS policy probe\n"
+            "  • 🔷 GraphQL endpoint detection\n"
+            "  • 📖 OpenAPI/Swagger schema discovery\n"
+            "  • ⚙️ JS Framework detection (React/Vue/Angular…)\n"
+            "  • 📊 Rate limit header detection\n"
+            "  • 🪜 Multi-step checkout detection\n"
+            "  • 📋 Auto-generated curl + Python snippet\n\n"
             "📄 *Exports full JSON file*\n\n"
             "⚠️ _For authorized security testing only._",
             parse_mode='Markdown'
@@ -25987,6 +26679,18 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("🔍", "Header requirement probing",       ["Probing header", "header"]),
         ("🔎", "Token source detection",           ["token source", "Locating token"]),
         ("🤖", "CAPTCHA site key extraction",      ["CAPTCHA", "site key", "reCAPTCHA"]),
+        ("🔗", "Sub-page scan",                   ["sub-page", "Sub-page", "subpage"]),
+        ("🔐", "3DS / SCA signal detection",      ["3DS", "SCA", "3d secure"]),
+        ("📱", "Wallet / Express pay detection",   ["wallet", "Wallet", "express pay"]),
+        ("📊", "Rate limit headers",               ["rate limit", "Rate limit"]),
+        ("🍪", "Auth cookie security",             ["cookie", "Cookie"]),
+        ("🛡️", "CSP analysis",                    ["Content-Security", "CSP"]),
+        ("🌐", "CORS policy",                     ["CORS", "cors"]),
+        ("🔷", "GraphQL probe",                   ["GraphQL", "graphql"]),
+        ("📖", "API schema discovery",             ["OpenAPI", "Swagger", "schema"]),
+        ("⚙️", "Framework detection",              ["framework", "Framework"]),
+        ("🪜", "Multi-step checkout",              ["multi-step", "multi step", "checkout"]),
+        ("📋", "Request snippet generation",       ["snippet", "curl"]),
     ]
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
 
