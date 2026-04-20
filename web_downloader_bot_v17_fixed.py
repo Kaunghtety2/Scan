@@ -25765,9 +25765,46 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🔎 Locating token sources...")
     token_sources = _find_token_sources(static_html + js_html, js_text)
 
-    # Phase 7: CAPTCHA sitekeys
-    if progress_cb: progress_cb("🤖 Extracting CAPTCHA site key...")
-    recaptcha_info = _extract_recaptcha_info(static_html + js_html, js_text, url)
+    # Phase 7: CAPTCHA sitekeys — full Playwright scan (action/invisible/score/theme)
+    if progress_cb: progress_cb("🤖 Running full Playwright CAPTCHA sitekey scan...")
+    # Primary: full Playwright-powered scan (captures network requests, DOM, JS evals)
+    _sk_full = {}
+    _sk_findings = []
+    if PLAYWRIGHT_OK:
+        try:
+            _sk_result = _sitekey_playwright(url, progress_cb)
+            _sk_findings = _sk_result.get('findings', [])
+            # Build recaptcha_info from best finding for backward-compat
+            if _sk_findings:
+                _best = next(
+                    (f for f in _sk_findings if 'reCAPTCHA' in f.get('type','')),
+                    _sk_findings[0]
+                )
+                _sk_full = {
+                    'site_key':    _best.get('site_key', ''),
+                    'page_url':    _best.get('page_url', url),
+                    'base_url':    f"{urlparse(url).scheme}://{urlparse(url).netloc}",
+                    'captcha_type': _best.get('type', 'CAPTCHA'),
+                    'action':      _best.get('action', ''),
+                    'invisible':   _best.get('invisible', False),
+                    'theme':       _best.get('theme', ''),
+                    'min_score':   _best.get('min_score', ''),
+                    'enterprise':  _best.get('enterprise', False),
+                    'callback':    _best.get('callback', ''),
+                    'all_keys':    _sk_findings,   # all captcha types found
+                }
+        except Exception as _sk_err:
+            logger.debug("sitekey_playwright error: %s", _sk_err)
+    # Fallback: static parse if Playwright unavailable or found nothing
+    if not _sk_full:
+        _sk_static = _extract_recaptcha_info(static_html + js_html, js_text, url)
+        if _sk_static:
+            _sk_full = _sk_static
+            _sk_full['all_keys'] = [_sk_static] if _sk_static else []
+    recaptcha_info = _sk_full if _sk_full.get('site_key') else None
+    if progress_cb:
+        _nk = len(_sk_findings)
+        progress_cb(f"🤖 Sitekeys found: {_nk} ({', '.join(set(f.get('type','') for f in _sk_findings))})" if _nk else "🤖 No CAPTCHA sitekeys found")
 
     # ── ENH Phase 8: Sub-page scan (parallel) ────────────────────────────
     _SUBPAGES = [
@@ -25812,6 +25849,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                     subpage_forms.append(sf)
                     _existing_eps.add(sf.get('endpoint', ''))
             if _sk and _sk.get('site_key'):
+                # Enrich subpage sitekey with all_keys list if available
+                _sk.setdefault('all_keys', [_sk])
                 subpage_sitekeys.append(_sk)
 
     if progress_cb:
@@ -25906,6 +25945,52 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             headers_required = headers_result,
         )
 
+    # ── ENH: Live network intercept — capture real tokens & sitekeys ─────
+    # Combined pattern: payment keys + sitekeys + hidden tokens
+    _PAYLOAD_LIVE_PATTERNS = _LIVE_PAY_PATTERNS + [
+        p for p in _LIVE_SITEKEY_PATTERNS if p not in _LIVE_PAY_PATTERNS
+    ] + [
+        p for p in _LIVE_HIDDEN_PATTERNS if p not in _LIVE_PAY_PATTERNS
+    ]
+    live_result = {"live_requests": [], "live_findings": [], "sse_frames": [],
+                   "ws_frames": [], "response_bodies": {}, "error": None}
+    if PLAYWRIGHT_OK:
+        if progress_cb: progress_cb("🔴 Live intercept: capturing real network tokens...")
+        try:
+            live_result = _stream_intercept_sync(url, progress_cb,
+                                                 extra_patterns=_PAYLOAD_LIVE_PATTERNS)
+            if live_result.get("error"):
+                if progress_cb:
+                    progress_cb(f"⚠️ Live intercept: {live_result['error'][:60]}")
+            else:
+                _lf = live_result.get("live_findings", [])
+                _lr = live_result.get("live_requests", [])
+                _ws = live_result.get("ws_frames", [])
+                if progress_cb:
+                    progress_cb(
+                        f"🔴 Live: {len(_lr)} requests | {len(_lf)} secrets | {len(_ws)} WS frames"
+                    )
+                # ── Cross-ref: confirm any static sitekey against live traffic ──
+                _live_text = " ".join(
+                    r.get("body","") + r.get("url","")
+                    for r in _lr
+                )
+                if recaptcha_info and recaptcha_info.get('site_key'):
+                    _sk_val = recaptcha_info['site_key']
+                    if _sk_val in _live_text:
+                        recaptcha_info['confirmed_live'] = True
+                    # Also try to pull v3 action from live requests
+                    _v3_action_m = re.search(
+                        rf'{re.escape(_sk_val)}.{{0,200}}"action"\s*:\s*"([^"]+)"',
+                        _live_text
+                    )
+                    if _v3_action_m and not recaptcha_info.get('action'):
+                        recaptcha_info['action'] = _v3_action_m.group(1)
+        except Exception as _live_err:
+            logger.debug("payload live intercept error: %s", _live_err)
+    else:
+        if progress_cb: progress_cb("⚠️ Live intercept skipped (Playwright not installed)")
+
     return {
         'url':              url,
         'base_url':         base_url,
@@ -25928,6 +26013,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'frameworks':       frameworks,
         'multistep':        multistep,
         'curl_snippet':     curl_snippet,
+        'live_result':      live_result,     # NEW: full live intercept data
+        'live_findings':    live_result.get('live_findings', []),  # NEW: extracted secrets
     }
 
 
@@ -26041,16 +26128,67 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             f"💳 *{escape_md(gw['name'])}* · {escape_md(gw.get('tokenization',''))}{raw_risk}"
         )
 
-    # CAPTCHA row
-    if rc:
-        lines.append(
-            f"🤖 *{escape_md(rc['captcha_type'])}*  `{raw_code(rc['site_key'])}`"
-        )
-    for sp in data.get('subpage_sitekeys', []):
-        lines.append(
-            f"🤖 {escape_md(sp.get('captcha_type','CAPTCHA'))} _(sub-page)_"
-            f"  `{raw_code(sp.get('site_key',''))}`"
-        )
+    # ── CAPTCHA / Sitekey block — full detail ────────────────
+    _all_sitekeys = []
+    if rc and rc.get('all_keys'):
+        _all_sitekeys = rc['all_keys']
+    elif rc and rc.get('site_key'):
+        _all_sitekeys = [rc]
+    # Add subpage sitekeys (deduplicate by site_key value)
+    _seen_sk = {f.get('site_key','') for f in _all_sitekeys}
+    for sp_sk in data.get('subpage_sitekeys', []):
+        for _sk_entry in (sp_sk.get('all_keys') or [sp_sk]):
+            if _sk_entry.get('site_key','') not in _seen_sk:
+                _all_sitekeys.append({**_sk_entry, '_subpage': True})
+                _seen_sk.add(_sk_entry.get('site_key',''))
+
+    if _all_sitekeys:
+        lines.append(f"\n{SEP}")
+        lines.append(f"🤖 *CAPTCHA / Anti-bot* ({len(_all_sitekeys)} key(s) found)")
+        for _sk in _all_sitekeys:
+            _sk_type  = _sk.get('type') or _sk.get('captcha_type', 'CAPTCHA')
+            _sk_key   = _sk.get('site_key', '')
+            _sk_act   = _sk.get('action', '')
+            _sk_inv   = _sk.get('invisible', False)
+            _sk_score = _sk.get('min_score', '')
+            _sk_ent   = _sk.get('enterprise', False)
+            _sk_cb    = _sk.get('callback', '')
+            _sk_live  = _sk.get('confirmed_live', False) or rc and rc.get('confirmed_live') and _sk_key == rc.get('site_key')
+            _sk_src   = _sk.get('source', '')
+            _sp_note  = " _(sub-page)_" if _sk.get('_subpage') else ""
+            _live_tag = " ✅ _confirmed live_" if _sk_live else ""
+            lines.append(f"  🔑 *{escape_md(_sk_type)}*{_sp_note}{_live_tag}")
+            jlines = ["{"]
+            jlines.append(f'  "site_key": "{raw_code(_sk_key)}",')
+            if _sk_act:
+                jlines.append(f'  "action": "{raw_code(_sk_act)}",')
+            if _sk_inv:
+                jlines.append(f'  "invisible": true,')
+            if _sk_score:
+                jlines.append(f'  "min_score": "{raw_code(str(_sk_score))}",')
+            if _sk_ent:
+                jlines.append(f'  "enterprise": true,')
+            if _sk_cb:
+                jlines.append(f'  "callback": "{raw_code(_sk_cb)}",')
+            if _sk_src:
+                jlines.append(f'  "source": "{raw_code(_sk_src[:80])}",')
+            jlines.append("}")
+            lines.append("```json\n" + "\n".join(jlines) + "\n```")
+
+    # ── LIVE INTERCEPT FINDINGS ───────────────────────────────
+    live_findings = data.get('live_findings', [])
+    if live_findings:
+        lines.append(f"\n{SEP}")
+        lines.append(f"🔴 *Live Network Secrets* ({len(live_findings)} found)")
+        jlines = ["{"]
+        for lf in live_findings:
+            ltype  = raw_code(lf.get('type', 'secret'), 40)
+            lval   = raw_code(lf.get('value', ''), 120)
+            lsrc   = raw_code(lf.get('source', '')[:60])
+            lconf  = lf.get('confidence', 'HIGH')
+            jlines.append(f'  "{ltype}": "{lval}",  // {lconf} — {lsrc}')
+        jlines.append("}")
+        lines.append("```json\n" + "\n".join(jlines) + "\n```")
 
     # 3DS / Wallets inline
     badges = []
