@@ -988,58 +988,7 @@ def pbar(done: int, total: int, width: int = 18) -> str:
 # 🌐  JS RENDERER  (Playwright — Python native)
 # ══════════════════════════════════════════════════
 
-def fetch_with_playwright(url: str) -> str | None:
-    """
-    Playwright ဖြင့် JS render လုပ်ပြီး HTML ထုတ်ပေးသည်။
-    SECURITY: URL validate ပြီးမှသာ browser ဖွင့်သည်။
-    """
-    if not PLAYWRIGHT_OK:
-        return None
-
-    safe, reason = is_safe_url(url)
-    if not safe:
-        logger.warning(f"Playwright blocked unsafe URL: {reason}")
-        return None
-
-    if not re.match(r'^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+$', url):
-        logger.warning("Playwright blocked URL with invalid characters")
-        return None
-
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled", "--disable-gpu"]
-            )
-            ctx = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-                ignore_https_errors=True,
-            )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                "window.chrome={runtime:{}};"
-            )
-            page = ctx.new_page()
-            try:
-                page.goto(url, wait_until="networkidle", timeout=40_000)
-            except Exception:
-                try:
-                    page.goto(url, wait_until="load", timeout=25_000)
-                except Exception:
-                    pass
-            html = page.content()
-            browser.close()
-            return html if html and html.strip() else None
-    except Exception as e:
-        logger.warning(f"Playwright exception: {type(e).__name__}: {e}")
-        return None
+# NOTE: fetch_with_playwright canonical definition is below (~line 21577).
 
 def fetch_page(url: str, use_js: bool = False) -> tuple:
     """Returns: (html | None, js_used: bool)"""
@@ -9496,7 +9445,7 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                             try {
                                 const raw = xhr.getAllResponseHeaders() || '';
                                 raw.trim().split(/[\r\n]+/).forEach(line => {
-                                    const parts = line.split(/:\s*/);
+                                    const parts = line.split(/:\\s*/);
                                     if (parts[0]) respHdrs[parts[0].toLowerCase()] = parts.slice(1).join(': ');
                                 });
                             } catch(e) {}
@@ -24175,15 +24124,22 @@ _PAYMENT_GATEWAYS = [
 # ── Card Field Patterns ────────────────────────────────────────
 _CARD_FIELDS = [
     # ── Card number variants ───────────────────────────────────
-    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|card$|^number$', re.I),
+    (re.compile(r'card.?num|cc.?num|card.?no|cardnumber|ccnumber|pan$|'
+                r'card$|^number$|^acctnum$|^accountnum$|^acct_num$|'
+                r'credit.?card|debit.?card|card.?field', re.I),
      "Card Number", "💳", True),
     # ── CVV ───────────────────────────────────────────────────
-    (re.compile(r'cvv|cvc|csc|card.?code|security.?code|cvv2', re.I),
+    (re.compile(r'cvv|cvc|csc|card.?code|security.?code|cvv2|'
+                r'sec.?code|verification.?value', re.I),
      "CVV/CVC", "🔐", True),
-    # ── Expiry ────────────────────────────────────────────────
-    (re.compile(r'exp.?year|expirationDateYear|card.?year|expyear', re.I),
+    # ── Expiry Year ───────────────────────────────────────────
+    (re.compile(r'exp.?year|expirationDateYear|card.?year|expyear|'
+                r'cc.?year|ccyear|yr$', re.I),
      "Expiry Year", "📅", True),
-    (re.compile(r'exp.?date|expiry|exp.?month|expirationDateMonth|card.?exp|mm.?yy|valid.?thru', re.I),
+    # ── Expiry Month / full date ──────────────────────────────
+    (re.compile(r'exp.?date|expiry|exp.?month|expirationDateMonth|'
+                r'card.?exp|mm.?yy|valid.?thru|cc.?exp|ccexp|'
+                r'expiration$|expirydate', re.I),
      "Expiry Month", "📅", True),
     # ── Cardholder ────────────────────────────────────────────
     (re.compile(r'card.?holder|cardholder|name.?on.?card|billing.?name', re.I),
@@ -24191,14 +24147,14 @@ _CARD_FIELDS = [
     # ── Banking (ACH) ─────────────────────────────────────────
     (re.compile(r'routing.?num|routingnumber|aba.?num|transit.?num', re.I),
      "Routing Number", "🏦", True),
-    (re.compile(r'account.?num|accountnumber|acct.?num|bank.?acct', re.I),
+    (re.compile(r'bank.?acct|bank.?account|ach.?account', re.I),
      "Account Number", "🏦", True),
     (re.compile(r'account.?type|acct.?type', re.I),
      "Account Type", "🏦", False),
     # ── Customer/Merchant ID ──────────────────────────────────
     (re.compile(r'customer.?id|cust.?id|merchant.?id|client.?id$', re.I),
      "Customer ID", "🆔", False),
-    # ── Billing address fields ─────────────────────────────────
+    # ── Billing address — with billing/bill prefix ─────────────
     (re.compile(r'billing.?zip|billing.?postal|bill.?zip|bill.?postal', re.I),
      "Billing Zip", "🏠", False),
     (re.compile(r'billing.?address|billing.?addr|bill.?addr|bill.?address', re.I),
@@ -24217,8 +24173,30 @@ _CARD_FIELDS = [
      "Billing Last Name", "👤", False),
     (re.compile(r'bill.?company|billing.?company', re.I),
      "Billing Company", "🏢", False),
+    # ── Generic billing address (no prefix) — matches when form is payment ──
+    (re.compile(r'^(zip|postal|zipcode|postalcode|zip_code|postal_code)$', re.I),
+     "Billing Zip", "🏠", False),
+    (re.compile(r'^(address1?|addr1?|street|streetaddress|street_address)$', re.I),
+     "Billing Address", "🏠", False),
+    (re.compile(r'^(address2|addr2|apt|suite|unit|address_2)$', re.I),
+     "Billing Address", "🏠", False),
+    (re.compile(r'^(city|town|municipality)$', re.I),
+     "Billing City", "🏠", False),
+    (re.compile(r'^(state|province|region|stateCode|state_code)$', re.I),
+     "Billing State", "🏠", False),
+    (re.compile(r'^(country|countryCode|country_code)$', re.I),
+     "Billing Country", "🏠", False),
+    (re.compile(r'^(fname|firstname|first_name|givenname|given_name)$', re.I),
+     "Billing First Name", "👤", False),
+    (re.compile(r'^(lname|lastname|last_name|surname|familyname|family_name)$', re.I),
+     "Billing Last Name", "👤", False),
+    (re.compile(r'^(fullname|full_name|yourname|your_name)$', re.I),
+     "Cardholder Name", "👤", False),
+    (re.compile(r'^(company|companyname|company_name|organisation|organization)$', re.I),
+     "Billing Company", "🏢", False),
     # ── Amount / Currency ─────────────────────────────────────
-    (re.compile(r'amount|total|price|subtotal|grand.?total', re.I),
+    (re.compile(r'amount|total|price|subtotal|grand.?total|totalamount|'
+                r'amountdue|amount_due|paymentamount', re.I),
      "Amount", "💰", False),
     (re.compile(r'currency|cur$', re.I),
      "Currency", "💱", False),
@@ -24473,12 +24451,41 @@ def _extract_forms_static(html: str, page_url: str) -> list:
             if f:
                 fields.append(f)
                 in_form_names.add(f['name'])
+
+        # ── ENH: Capture submit buttons ───────────────────────────────────
+        submit_buttons = []
+        # <input type="submit"> and <input type="button">
+        for inp in form.find_all('input', type=lambda t: t and t.lower() in ('submit', 'button')):
+            btn_text  = inp.get('value', '') or inp.get('aria-label', '') or 'Submit'
+            btn_name  = inp.get('name', '') or inp.get('id', '') or 'submit'
+            submit_buttons.append({
+                'tag':   'input',
+                'type':  inp.get('type', 'submit').lower(),
+                'name':  btn_name,
+                'text':  btn_text,
+                'value': inp.get('value', ''),
+            })
+        # <button> elements
+        for btn in form.find_all('button'):
+            btype = btn.get('type', 'submit').lower()
+            if btype in ('submit', 'button', ''):
+                btn_text = btn.get_text(strip=True) or btn.get('aria-label', '') or btn.get('value', '') or 'Submit'
+                btn_name = btn.get('name', '') or btn.get('id', '') or 'button'
+                submit_buttons.append({
+                    'tag':   'button',
+                    'type':  btype,
+                    'name':  btn_name,
+                    'text':  btn_text[:80],
+                    'value': btn.get('value', ''),
+                })
+
         card_fields = [f for f in fields if f.get('is_card')]
         results.append({
             'source': 'static', 'form_idx': idx + 1,
             'endpoint': endpoint, 'method': method, 'enctype': enctype,
             'fields': fields, 'card_fields': card_fields,
             'is_payment': len(card_fields) > 0,
+            'submit_buttons': submit_buttons,
         })
 
     # ── ENH: Capture inputs OUTSIDE any <form> (orphan fields) ───────────
@@ -25484,22 +25491,29 @@ def _format_payload_report(data: dict) -> str:
             lines.append(f"_🌐 DOM extracted (includes iframes)_")
 
         # ── Classify fields by purpose ───────────────────────
-        card_strict = [f for f in fields if f.get('card_type') in
-                       ('Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year', 'Cardholder Name')]
-        pay_info    = [f for f in fields if f.get('card_type') in
-                       ('Amount', 'Currency', 'Order/Txn ID', 'Billing Address',
-                        'Billing Zip', 'Billing City', 'Billing State', 'Billing Country',
-                        'Billing Province', 'Billing First Name', 'Billing Last Name', 'Billing Company')]
+        _CARD_STRICT_TYPES = {
+            'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
+            'Cardholder Name', 'Routing Number', 'Account Number', 'Account Type',
+        }
+        _PAY_INFO_TYPES = {
+            'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
+            'Billing Address', 'Billing Zip', 'Billing City', 'Billing State',
+            'Billing Country', 'Billing Province', 'Billing First Name',
+            'Billing Last Name', 'Billing Company',
+        }
+        card_strict = [f for f in fields if f.get('card_type') in _CARD_STRICT_TYPES]
+        pay_info    = [f for f in fields if f.get('card_type') in _PAY_INFO_TYPES]
         iframe_f    = [f for f in fields if f.get('from_iframe') and f.get('type') == 'iframe']
-        user_f      = [f for f in fields
-                       if not f.get('is_card') and not f.get('is_dynamic')
-                       and f.get('type') not in ('hidden', 'submit', 'button', 'reset', 'iframe')
-                       and f not in pay_info and not f.get('from_iframe')]
         dyn_f       = [f for f in fields if f.get('is_dynamic') and not f.get('is_card')]
         hidden_f    = [f for f in fields
                        if not f.get('is_card') and not f.get('is_dynamic')
-                       and f.get('type') in ('hidden', 'submit', 'button')
-                       and f not in pay_info and f not in user_f]
+                       and f.get('type') in ('hidden',)
+                       and f not in pay_info]
+        already_classified = set(id(f) for f in card_strict + pay_info + iframe_f + dyn_f + hidden_f)
+        user_f = [f for f in fields
+                  if id(f) not in already_classified
+                  and f.get('type') not in ('hidden', 'submit', 'button', 'reset', 'iframe')
+                  and not f.get('from_iframe')]
 
         lines.append("")
 
@@ -25558,6 +25572,20 @@ def _format_payload_report(data: dict) -> str:
             hid_names = ", ".join(f"`{escape_md(f['name'])}`" for f in hidden_f[:8])
             extra     = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
             lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hid_names}{escape_md(extra)}")
+
+        # ── Submit buttons ───────────────────────────────────────────────
+        submit_btns = entry.get('submit_buttons', [])
+        if submit_btns:
+            btn_parts = []
+            for btn in submit_btns:
+                txt  = btn.get('text', '') or btn.get('value', '') or 'Submit'
+                name = btn.get('name', '')
+                btype = btn.get('type', 'submit')
+                part  = f"`{escape_md(txt)}`"
+                if name and name.lower() not in ('submit', 'button', ''):
+                    part += f" _(name=`{escape_md(name)}`, type={escape_md(btype)})_"
+                btn_parts.append(part)
+            lines.append(f"🟢 *Submit*: {' · '.join(btn_parts)}")
 
     skipped = len(ordered) - min(len(ordered), 6)
     if skipped > 0:
@@ -25622,51 +25650,110 @@ def _format_payload_report(data: dict) -> str:
 
 
 def _build_json_export(data: dict) -> str:
-    """Full JSON export — clean version."""
+    """Full JSON export — fields categorized: card / payment / user / dynamic / hidden + submit buttons."""
+
+    _CARD_TYPES = {'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
+                   'Expiry MM/YY', 'Cardholder Name'}
+    _PAY_TYPES  = {'Amount', 'Currency', 'Order/Txn ID',
+                   'Billing Address', 'Billing Zip', 'Billing City',
+                   'Billing State', 'Billing Country', 'Billing Province',
+                   'Billing First Name', 'Billing Last Name', 'Billing Company'}
+    _DYN_TYPES  = {'CSRF Token', 'Nonce', 'Session Token', 'OTP/Verification',
+                   'Timestamp', 'Anti-Bot Token', 'Request ID'}
+
+    def _categorize(fields: list) -> dict:
+        card_f    = {}
+        pay_f     = {}
+        user_f    = {}
+        dyn_f     = {}
+        hidden_f  = {}
+        for f in fields:
+            ct  = f.get('card_type') or ''
+            ft  = f.get('type', 'text')
+            dyn = f.get('is_dynamic', False)
+            name = f['name']
+            entry = {
+                'label':    f.get('field_label') or name,
+                'type':     ft,
+                'value':    f.get('value', ''),
+                'required': f.get('required', False),
+            }
+            if f.get('options'):
+                entry['options'] = f['options']
+            if f.get('placeholder'):
+                entry['placeholder'] = f['placeholder']
+
+            if ct in _CARD_TYPES:
+                card_f[name] = entry
+            elif ct in _PAY_TYPES:
+                pay_f[name] = entry
+            elif dyn or ct in _DYN_TYPES:
+                dyn_f[name] = entry
+            elif ft in ('hidden',):
+                hidden_f[name] = entry
+            elif ft not in ('submit', 'button', 'reset', 'image'):
+                user_f[name] = entry
+
+        return {
+            'card_fields':    card_f,
+            'payment_fields': pay_f,
+            'user_fields':    user_f,
+            'dynamic_fields': dyn_f,
+            'hidden_fields':  hidden_f,
+        }
+
     clean = {
         'url':      data.get('url'),
         'base_url': data.get('base_url', ''),
         'recaptcha': data.get('recaptcha'),
-        'gateways': data.get('gateways',[]),
+        'threeds_signals': data.get('threeds_signals', []),
+        'wallets':   data.get('wallets', []),
+        'gateways': data.get('gateways', []),
         'forms':    [],
         'requests': [],
     }
-    for entry in data.get('forms',[]):
-        clean['forms'].append({
-            'source':     entry.get('source'),
-            'endpoint':   entry.get('endpoint'),
-            'method':     entry.get('method'),
-            'enctype':    entry.get('enctype'),
-            'is_payment': entry.get('is_payment', False),
-            'fields': [{
-                'name':        f['name'],
-                'type':        f['type'],
-                'value':       f['value'],
-                'required':    f['required'],
-                'field_label': f['field_label'],
-                'is_dynamic':  f['is_dynamic'],
-                'is_card':     f.get('is_card', False),
-                'card_type':   f.get('card_type'),
-            } for f in entry.get('fields', [])]
-        })
-    for entry in data.get('requests',[]):
+
+    for entry in data.get('forms', []):
+        cats = _categorize(entry.get('fields', []))
+        # Submit buttons
+        submit_btns = entry.get('submit_buttons', [])
+        if not submit_btns:
+            # Fallback: check hidden fields named 'submit' or similar
+            pass
+        form_obj = {
+            'source':          entry.get('source'),
+            'form_idx':        entry.get('form_idx'),
+            'endpoint':        entry.get('endpoint'),
+            'method':          entry.get('method'),
+            'enctype':         entry.get('enctype'),
+            'is_payment':      entry.get('is_payment', False),
+            'submit_buttons':  submit_btns,
+            'card_fields':     cats['card_fields'],
+            'payment_fields':  cats['payment_fields'],
+            'user_fields':     cats['user_fields'],
+            'dynamic_fields':  cats['dynamic_fields'],
+            'hidden_fields':   cats['hidden_fields'],
+        }
+        if entry.get('note'):
+            form_obj['note'] = entry['note']
+        clean['forms'].append(form_obj)
+
+    for entry in data.get('requests', []):
+        cats = _categorize(entry.get('fields', []))
         clean['requests'].append({
-            'endpoint':   entry.get('endpoint'),
-            'method':     entry.get('method'),
-            'enctype':    entry.get('enctype'),
-            'is_payment': entry.get('is_payment', False),
-            'raw_body':   entry.get('raw_body',''),
-            'fields': [{
-                'name':        f['name'],
-                'type':        f['type'],
-                'value':       f['value'],
-                'required':    f['required'],
-                'field_label': f['field_label'],
-                'is_dynamic':  f['is_dynamic'],
-                'is_card':     f.get('is_card', False),
-                'card_type':   f.get('card_type'),
-            } for f in entry.get('fields', [])]
+            'endpoint':        entry.get('endpoint'),
+            'method':          entry.get('method'),
+            'enctype':         entry.get('enctype'),
+            'is_payment':      entry.get('is_payment', False),
+            'raw_body':        entry.get('raw_body', ''),
+            'submit_buttons':  entry.get('submit_buttons', []),
+            'card_fields':     cats['card_fields'],
+            'payment_fields':  cats['payment_fields'],
+            'user_fields':     cats['user_fields'],
+            'dynamic_fields':  cats['dynamic_fields'],
+            'hidden_fields':   cats['hidden_fields'],
         })
+
     # Headers
     clean['headers'] = [
         {
@@ -25953,18 +26040,18 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await run_scan(uid, _payload_sync, url, progress_cb)
     except asyncio.CancelledError:
-        await progress_queue.put(None)   # stop editor
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)   # stop editor
         editor_task.cancel()
         await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
         return
     except Exception as e:
-        await progress_queue.put(None)   # stop editor
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)   # stop editor
         editor_task.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(str(e))}`", parse_mode='Markdown')
         return
-    finally:
-        # Signal editor task to stop and show all phases complete
-        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+
+    # Signal editor task to stop (normal flow only — exceptions handle their own sentinel above)
+    loop.call_soon_threadsafe(progress_queue.put_nowait, None)
 
     # Wait for editor to finish (max 2s)
     try:
@@ -25977,8 +26064,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done_lines = [f"🧩 *Payload Extractor — `{escape_md(domain)}`*\n"]
         for i, (icon, label, _) in enumerate(_PAYLOAD_PHASES):
             done_lines.append(f"✅ {icon} Phase {i+1}: {label}")
-        done_lines.append(f"\n`[{'█' * TOTAL_PHASES}]` 100% — Done\!")
-        await msg.edit_text("\n".join(done_lines), parse_mode='MarkdownV2')
+        done_lines.append(f"\n`[{'█' * TOTAL_PHASES}]` 100% — Done!")
+        await msg.edit_text("\n".join(done_lines), parse_mode='Markdown')
     except Exception:
         pass
 
