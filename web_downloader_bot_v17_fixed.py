@@ -25654,10 +25654,35 @@ _SUCCESS_PATTERNS: list[tuple] = [
     (re.compile(r'RESULT=APPROVED|result=approved', re.I),           "Result=APPROVED query param"),
     (re.compile(r'"RESULT"\s*:\s*"APPROVED"', re.I),                 "JSON RESULT=APPROVED"),
     (re.compile(r'\bACCEPTED\b.*\bpayment\b|\bpayment\b.*\bACCEPTED\b', re.I), "Payment ACCEPTED"),
-    (re.compile(r'class=["\'][^"\']*(?:success|approved|confirmed)[^"\']*["\']', re.I), "CSS success/approved class"),
+    # PATCHED: require payment-context word within 200 chars of the class
+    (re.compile(
+        r'class=["\'][^"\']*(?:payment|checkout|order|transaction)[^"\']*'
+        r'(?:success|approved|confirmed)[^"\']*["\']'
+        r'|class=["\'][^"\']*(?:success|approved|confirmed)[^"\']*["\']'
+        r'(?=.{0,200}(?:payment|checkout|order|transaction))',
+        re.I | re.S
+    ), "CSS success class (payment context)"),
     # Redirect/URL indicators
     (re.compile(r'/(?:order[-_]?confirm|checkout[-_]?success|payment[-_]?success|thank[-_]?you)', re.I), "Success redirect URL"),
     (re.compile(r'[?&](?:status|result|state)=(?:success|approved|paid|completed)', re.I), "Success URL query param"),
+    # PATCHED: Adyen
+    (re.compile(r'"resultCode"\s*:\s*"Authorised"', re.I),             "Adyen resultCode=Authorised"),
+    (re.compile(r'"resultCode"\s*:\s*"Pending"', re.I),                "Adyen resultCode=Pending"),
+    # PATCHED: Braintree
+    (re.compile(r'"processorResponseCode"\s*:\s*"1000"', re.I),        "Braintree approved (1000)"),
+    (re.compile(r'"status"\s*:\s*"submitted_for_settlement"', re.I),   "Braintree submitted for settlement"),
+    # PATCHED: PayPal
+    (re.compile(r'"status"\s*:\s*"COMPLETED"', re.I),                  "PayPal order COMPLETED"),
+    (re.compile(r'"status"\s*:\s*"APPROVED"', re.I),                   "PayPal order APPROVED"),
+    # PATCHED: Worldpay
+    (re.compile(r'"paymentStatus"\s*:\s*"AUTHORIZED"', re.I),          "Worldpay AUTHORIZED"),
+    (re.compile(r'"paymentStatus"\s*:\s*"CAPTURED"', re.I),            "Worldpay CAPTURED"),
+    # PATCHED: Square
+    (re.compile(r'"status"\s*:\s*"COMPLETED".*"payment"', re.I | re.S), "Square payment COMPLETED"),
+    # PATCHED: Authorize.Net
+    (re.compile(r'"approval_code"\s*:\s*"[A-Z0-9]{4,8}"', re.I),      "Authorize.Net approval code"),
+    # PATCHED: Partial approval
+    (re.compile(r'"partialAuth(?:orization)?"\s*:\s*true', re.I),      "Partial authorization approved"),
 ]
 
 # ── Decline patterns ──────────────────────────────────────────
@@ -25695,10 +25720,43 @@ _DECLINE_PATTERNS: list[tuple] = [
     (re.compile(r'\bRESPONSE\s*:\s*(?:2|3|5)\b', re.I),             "Gateway response code 2/3/5 (decline/error)"),
     (re.compile(r'\bAVS\s+(?:MISMATCH|FAIL)\b', re.I),              "AVS mismatch (address verification failed)"),
     (re.compile(r'\bCVV2?\s+(?:MISMATCH|FAIL|NO\s+MATCH)\b', re.I), "CVV mismatch"),
-    (re.compile(r'class=["\'][^"\']*(?:error|declined|failed|rejected)[^"\']*["\']', re.I), "CSS error/declined class"),
+    # PATCHED: require payment-context word near the class attribute
+    (re.compile(
+        r'class=["\'][^"\']*(?:payment|checkout|order|transaction)[^"\']*'
+        r'(?:error|declined|failed|rejected)[^"\']*["\']'
+        r'|class=["\'][^"\']*(?:error|declined|failed|rejected)[^"\']*["\']'
+        r'(?=.{0,200}(?:payment|checkout|order|transaction))',
+        re.I | re.S
+    ), "CSS error/declined class (payment context)"),
     # Redirect/URL indicators
     (re.compile(r'/(?:payment[-_]?failed|checkout[-_]?failed|order[-_]?failed|payment[-_]?error)', re.I), "Failure redirect URL"),
     (re.compile(r'[?&](?:status|result|state)=(?:declined|failed|error|rejected)', re.I), "Failure URL query param"),
+    # PATCHED: Adyen
+    (re.compile(r'"resultCode"\s*:\s*"Refused"', re.I),                "Adyen resultCode=Refused"),
+    (re.compile(r'"resultCode"\s*:\s*"Error"', re.I),                  "Adyen resultCode=Error"),
+    (re.compile(r'"resultCode"\s*:\s*"Cancelled"', re.I),              "Adyen resultCode=Cancelled"),
+    (re.compile(r'"resultCode"\s*:\s*"ChallengeShopper"', re.I),       "Adyen 3DS challenge required"),
+    (re.compile(r'"resultCode"\s*:\s*"IdentifyShopper"', re.I),        "Adyen shopper identification required"),
+    # PATCHED: Braintree
+    (re.compile(r'"status"\s*:\s*"processor_declined"', re.I),         "Braintree processor_declined"),
+    (re.compile(r'"status"\s*:\s*"gateway_rejected"', re.I),           "Braintree gateway_rejected"),
+    (re.compile(r'"status"\s*:\s*"settlement_declined"', re.I),        "Braintree settlement_declined"),
+    # PATCHED: PayPal
+    (re.compile(r'\bINSTRUMENT_DECLINED\b', re.I),                     "PayPal INSTRUMENT_DECLINED"),
+    (re.compile(r'\bPAYER_CANNOT_PAY\b', re.I),                        "PayPal PAYER_CANNOT_PAY"),
+    (re.compile(r'\bPAYMENT_DENIED\b', re.I),                          "PayPal PAYMENT_DENIED"),
+    # PATCHED: Square
+    (re.compile(r'\bCARD_DECLINED\b', re.I),                           "Square CARD_DECLINED"),
+    (re.compile(r'\bCVV_FAILURE\b', re.I),                             "Square CVV_FAILURE"),
+    (re.compile(r'\bADDRESS_VERIFICATION_FAILURE\b', re.I),            "Square AVS failure"),
+    # PATCHED: Worldpay
+    (re.compile(r'"paymentStatus"\s*:\s*"REFUSED"', re.I),             "Worldpay REFUSED"),
+    (re.compile(r'"paymentStatus"\s*:\s*"FAILED"', re.I),              "Worldpay FAILED"),
+    # PATCHED: Authorize.Net
+    (re.compile(r'"response_reason_code"\s*:\s*"?[23]\b', re.I),       "Authorize.Net declined/error (code 2/3)"),
+    # PATCHED: Velocity / rate limit
+    (re.compile(r'\bcard_velocity_exceeded\b', re.I),                  "Card velocity exceeded (retryable)"),
+    (re.compile(r'\btoo_many_(?:attempts|requests)\b.*(?:card|payment)', re.I), "Rate limit on payment (retryable)"),
 ]
 
 # ── ISO 8583 / common gateway response codes ──────────────────
@@ -25745,6 +25803,21 @@ _RESPONSE_CODE_MAP: dict[str, tuple[str, str]] = {
     "94": ("Duplicate transmission",      "⚠️ Soft decline"),
     "96": ("System malfunction",          "⚠️ Soft decline"),
     "N7": ("CVV2 mismatch",               "🔴 Hard decline"),
+    # PATCHED: missing ISO 8583 codes
+    "03": ("Invalid merchant",              "🔴 Hard decline"),
+    "10": ("Partial approval",              "⚠️ Partial"),
+    "17": ("Customer cancellation",         "⚠️ Soft decline"),
+    "33": ("Expired card (alt)",            "🔴 Hard decline"),
+    "39": ("No credit account",             "🔴 Hard decline"),
+    "40": ("Function not supported",        "🔴 Hard decline"),
+    "46": ("Closed account",               "🔴 Hard decline"),
+    "56": ("No card record",               "🔴 Hard decline"),
+    "68": ("Response received too late",    "⚠️ Soft decline"),
+    "79": ("Already reversed",             "⚠️ Soft decline"),
+    "82": ("CVV2 declined",               "🔴 Hard decline"),
+    "88": ("Unable to authorize",          "🔴 Hard decline"),
+    "90": ("Cutoff in progress",           "⚠️ Soft decline"),
+    "95": ("Reconcile error",              "🔴 Error"),
 }
 
 # ── Stripe-specific decline codes ────────────────────────────
@@ -25830,7 +25903,10 @@ def _scan_response_patterns(
     found_codes:   list[dict] = []
     found_stripe:  list[dict] = []
 
-    _seen_labels: set[str] = set()
+    # PATCHED: dedup by label only, accumulate sources, extract decline_code once per source
+    _seen_success: dict[str, dict] = {}   # label → entry
+    _seen_decline: dict[str, dict] = {}   # label → entry
+    _seen_labels:  set[str]        = set()  # numeric-code + stripe standalone scan dedup
 
     def _snippet(text: str, m: re.Match, ctx: int = 80) -> str:
         start = max(0, m.start() - ctx)
@@ -25841,40 +25917,44 @@ def _scan_response_patterns(
         if not src_text:
             continue
 
+        # ── Pre-extract decline_code once per source (not inside pattern loop) ──
+        _dc_m  = re.search(r'"decline_code"\s*:\s*"([^"]+)"', src_text)
+        _dc_val = _dc_m.group(1) if _dc_m else None
+
         # ── Success patterns ──────────────────────────
         for pat, label in _SUCCESS_PATTERNS:
-            key = f"s:{label}:{src_name}"
-            if key in _seen_labels:
-                continue
             m = pat.search(src_text)
-            if m:
-                _seen_labels.add(key)
-                found_success.append({
+            if not m:
+                continue
+            if label not in _seen_success:
+                _seen_success[label] = {
                     'label':   label,
-                    'source':  src_name,
+                    'sources': [],
                     'snippet': _snippet(src_text, m),
-                })
+                    'source':  src_name,    # first-found source (compat)
+                }
+            if src_name not in _seen_success[label]['sources']:
+                _seen_success[label]['sources'].append(src_name)
 
         # ── Decline patterns ──────────────────────────
         for pat, label in _DECLINE_PATTERNS:
-            key = f"d:{label}:{src_name}"
-            if key in _seen_labels:
-                continue
             m = pat.search(src_text)
-            if m:
-                _seen_labels.add(key)
+            if not m:
+                continue
+            if label not in _seen_decline:
                 entry: dict = {
                     'label':   label,
-                    'source':  src_name,
+                    'sources': [],
                     'snippet': _snippet(src_text, m),
+                    'source':  src_name,    # first-found source (compat)
                 }
-                # Stripe decline_code extraction
-                _dc_m = re.search(r'"decline_code"\s*:\s*"([^"]+)"', src_text)
-                if _dc_m:
-                    dc = _dc_m.group(1)
-                    entry['stripe_decline_code'] = dc
-                    entry['stripe_meaning']       = _STRIPE_DECLINE_CODES.get(dc, '(unknown)')
-                found_decline.append(entry)
+                if _dc_val:
+                    entry['stripe_decline_code'] = _dc_val
+                    entry['stripe_meaning']      = _STRIPE_DECLINE_CODES.get(
+                        _dc_val, '(unknown)')
+                _seen_decline[label] = entry
+            if src_name not in _seen_decline[label]['sources']:
+                _seen_decline[label]['sources'].append(src_name)
 
         # ── Numeric response codes scan ───────────────
         for code_pat in [
@@ -25910,13 +25990,39 @@ def _scan_response_patterns(
                     'snippet':     _snippet(src_text, sdm, 60),
                 })
 
-    # ── Overall verdict ───────────────────────────────
-    if found_success and found_decline:
+    # Materialise dedup dicts into lists for downstream consumption
+    found_success = list(_seen_success.values())
+    found_decline = list(_seen_decline.values())
+
+    # PATCHED: weight verdict by source reliability
+    # Priority: xhr_response / live_intercept > js_source > static_html
+    _RELIABLE = {'xhr_response', 'live_intercept'}
+    _MEDIUM   = {'js_source'}
+
+    def _has_reliable(entries: list) -> bool:
+        return any(
+            s in _RELIABLE or s in _MEDIUM
+            for e in entries
+            for s in e.get('sources', [e.get('source', '')])
+        )
+
+    reliable_success = _has_reliable(found_success)
+    reliable_decline = _has_reliable(found_decline)
+    any_success      = bool(found_success)
+    any_decline      = bool(found_decline)
+
+    if reliable_success and reliable_decline:
         verdict = 'mixed'
-    elif found_success:
+    elif reliable_success:
         verdict = 'success'
-    elif found_decline:
+    elif reliable_decline:
         verdict = 'decline'
+    elif any_success and any_decline:
+        verdict = 'mixed'
+    elif any_success:
+        verdict = 'likely_success'   # HTML-only — lower confidence
+    elif any_decline:
+        verdict = 'likely_decline'   # HTML-only — lower confidence
     else:
         verdict = 'unknown'
 
@@ -26032,18 +26138,50 @@ def _analyze_auth_cookies(url: str) -> list:
             secure    = any(f == 'secure' for f in flags)
             same_site = next((p.split('=',1)[1].strip() if '=' in p else 'None'
                               for p in flags if 'samesite' in p), None)
-            issues = []
-            if not http_only: issues.append('No HttpOnly — XSS can steal this cookie')
-            if not secure:    issues.append('No Secure flag — visible over HTTP')
-            if same_site in (None, 'None', 'none'):
-                issues.append('SameSite=None — CSRF possible if not Secure')
+            # PATCHED: per-flag severity tiers; SameSite Lax ≠ None; Max-Age +
+            # Partitioned (CHIPS) detection; structured severity roll-up
+            issues      = []
+            severity    = []
+
+            if not http_only:
+                issues.append('No HttpOnly — XSS can steal this cookie')
+                severity.append('HIGH')
+            if not secure:
+                issues.append('No Secure flag — transmitted over plain HTTP')
+                severity.append('HIGH')
+
+            # SameSite — None is CSRF risk, Lax is medium, Strict is safe
+            ss_lower = (same_site or '').lower()
+            if ss_lower in ('none', '') or same_site is None:
+                issues.append('SameSite=None — CSRF risk (cross-site requests allowed)')
+                severity.append('HIGH')
+            elif ss_lower == 'lax':
+                issues.append('SameSite=Lax — top-level navigations allowed (medium risk)')
+                severity.append('MEDIUM')
+
+            # Max-Age / Expires — absence means session cookie (fixation risk)
+            has_expiry   = any('max-age' in f or 'expires' in f for f in flags)
+            partitioned  = any('partitioned' in f for f in flags)
+            if not has_expiry:
+                issues.append('No Max-Age/Expires — session cookie, fixation risk if not rotated')
+                severity.append('MEDIUM')
+
+            top_severity = (
+                'HIGH'   if 'HIGH'   in severity else
+                'MEDIUM' if 'MEDIUM' in severity else
+                'LOW'
+            )
+
             results.append({
-                'name':      cname,
-                'httponly':  http_only,
-                'secure':    secure,
-                'samesite':  same_site or 'not set',
-                'issues':    issues,
-                'raw':       raw[:120],
+                'name':        cname,
+                'httponly':    http_only,
+                'secure':      secure,
+                'samesite':    same_site or 'not set',
+                'partitioned': partitioned,
+                'persistent':  has_expiry,
+                'severity':    top_severity,
+                'issues':      issues,
+                'raw':         raw[:120],
             })
     except Exception:
         pass
@@ -27057,13 +27195,13 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     }
 
     # ── Helpers ───────────────────────────────────────────────
-    SEP       = "━" * 32   # major section divider
-    SEP_MINOR = "┈" * 28   # minor / sub-section divider
+    # UI/UX refactor: dropped major SEP divider; _sec() now renders as plain bold label
+    SEP_MINOR = "─" * 24
 
     def _sec(title: str, icon: str = "") -> str:
-        """Pro-style section header."""
+        """Lightweight section header — no decorative rule."""
         prefix = f"{icon} " if icon else ""
-        return f"\n{SEP}\n▌ *{prefix}{escape_md(title)}*"
+        return f"\n{prefix}*{escape_md(title)}*"
 
     def _classify(fields: list):
         card, pay, user, dyn, hidden, iframe = [], [], [], [], [], []
@@ -27109,13 +27247,25 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         return f" _({len(opts)} options)_"
 
     # ── Deduplication — key on card+pay field names ───────────
+    # PATCHED: include endpoint hash so same-fields/different-endpoint forms are
+    # not merged; truly empty forms each get a unique id-based key
     def _form_sig(entry):
-        fields = entry.get('fields', [])
+        fields   = entry.get('fields', [])
         card, pay, *_ = _classify(fields)
         key_names = sorted(f['name'] for f in card + pay)
-        return tuple(key_names) if key_names else tuple(
-            sorted(f['name'] for f in fields)
-        )
+        if not key_names:
+            key_names = sorted(f['name'] for f in fields)
+
+        # Include endpoint hash so same-fields/different-endpoint forms
+        # are NOT deduplicated
+        endpoint = entry.get('action') or entry.get('url', '')
+        ep_hash  = str(hash(endpoint) & 0xFFFF)  # short 4-hex discriminator
+
+        if not key_names:
+            # Truly empty form — use object id as unique key to avoid merging
+            return (f'__empty_{id(entry)}',)
+
+        return (ep_hash, *tuple(key_names))
 
     all_entries = forms + requests_
     seen_sigs: dict = {}
@@ -27163,11 +27313,10 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── Gateway row ───────────────────────────────────────────
     if gateways:
         gw = gateways[0]
-        raw_risk = "  🚨 *Raw POST*" if gw.get('raw_post_risk') else ""
         tok = gw.get('tokenization', '')
         tok_str = f" · _{escape_md(tok)}_" if tok else ""
         lines.append(
-            f"💳 *{escape_md(gw['name'])}*{tok_str}{raw_risk}"
+            f"💳 *{escape_md(gw['name'])}*{tok_str}"
         )
 
     # ── CAPTCHA / Sitekey block — full detail ────────────────
@@ -27195,17 +27344,16 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     total_forms   = len(ordered)
     total_xhr     = len(requests_)
 
-    lines.append(f"\n{SEP}")
-    lines.append("▌ *OVERVIEW*")
-    lines.append(
-        f"`{'Forms':<10}` `{total_forms}` {'  💳 ' + str(pay_cnt) + ' payment' if pay_cnt else ''}"
-    )
-    lines.append(f"`{'XHR/fetch':<10}` `{total_xhr}`")
-    lines.append(f"`{'Gateway':<10}` `{raw_code(gw_label, 30)}`")
-    lines.append(f"`{'CAPTCHA':<10}` `{raw_code(captcha_label, 30)}`")
-    lines.append(f"`{'3DS':<10}` `{raw_code(_3ds_label)}`")
-    lines.append(f"`{'Wallets':<10}` `{raw_code(wallet_label, 40)}`")
-    lines.append(f"`{'Risk':<10}` {risk_badge} — _{escape_md(risk_note)}_")
+    # UI/UX refactor: icon-prefixed rows replace fixed-width backtick column table
+    lines.append("*── Overview ──────────────────*")
+    lines.append(f"💳 Gateway   `{raw_code(gw_label, 28)}`")
+    lines.append(f"🤖 CAPTCHA   `{raw_code(captcha_label, 28)}`")
+    lines.append(f"🔐 3DS       `{raw_code(_3ds_label)}`")
+    lines.append(f"📱 Wallets   `{raw_code(wallet_label, 28)}`")
+    lines.append(f"📋 Forms     `{total_forms}`" +
+                 (f"  _({pay_cnt} payment)_" if pay_cnt else ""))
+    lines.append(f"📡 XHR       `{total_xhr}` intercepted")
+    lines.append(f"⚠️  Risk      {risk_badge}  _{escape_md(risk_note)}_")
 
     if _all_sitekeys:
         lines.append(_sec(f"CAPTCHA / Anti-bot  ·  {len(_all_sitekeys)} key(s) found", "🤖"))
@@ -27775,11 +27923,23 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         lines.append(_sec("Response Patterns", "🔎"))
 
         # Overall verdict banner
+        # PATCHED: handle likely_success / likely_decline from weighted verdict
         _v = rp.get('verdict', 'unknown')
         _verdict_icon = {
-            'success': '✅', 'decline': '🔴', 'mixed': '⚠️', 'unknown': '❓'
+            'success':        '✅',
+            'likely_success': '🟢',
+            'decline':        '🔴',
+            'likely_decline': '🟠',
+            'mixed':          '⚠️',
+            'unknown':        '❓',
         }.get(_v, '❓')
-        lines.append(f"{_verdict_icon} *Verdict:* `{escape_md(_v.upper())}`\n")
+        _conf_note = (
+            '  _\\(HTML only — lower confidence\\)_'
+            if _v in ('likely_success', 'likely_decline') else ''
+        )
+        lines.append(
+            f"{_verdict_icon} *Verdict:* `{escape_md(_v.upper())}`{_conf_note}\n"
+        )
 
         # ── Success patterns ──────────────────────────────────
         _succ = rp.get('success', [])
@@ -27870,16 +28030,18 @@ def _sanitize_for_json(obj, _seen=None):
 
 
 def _build_json_export(data: dict) -> str:
+    # PATCHED: replaced nested forms[]/xhr_requests[] with 3-layer flat
+    # post_body + field_map; kept captcha/security/tokens/snippets unchanged
     """Full JSON export — clean structured format.
 
     Top-level sections:
-      meta · gateway · captcha · signals · forms · xhr_requests
-      security · tokens · client_storage · endpoints · framework
-      snippets · live_findings
+      meta · gateway · post_body · field_map · tokens · captcha · signals
+      security · client_storage · endpoints · framework · snippets
+      live_findings · response_patterns
     """
     from datetime import timezone
 
-    # ── Field-type sets (same as report) ─────────────────────
+    # ── Field-type sets ───────────────────────────────────────
     _CARD_TYPES = {'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
                    'Expiry MM/YY', 'Cardholder Name',
                    'Routing Number', 'Account Number', 'Account Type'}
@@ -27887,20 +28049,18 @@ def _build_json_export(data: dict) -> str:
                    'Billing Address', 'Billing Zip', 'Billing City',
                    'Billing State', 'Billing Country', 'Billing Province',
                    'Billing First Name', 'Billing Last Name', 'Billing Company'}
-    _DYN_TYPES  = {'CSRF Token', 'Nonce', 'Session Token', 'OTP/Verification',
-                   'Timestamp', 'Anti-Bot Token', 'Request ID'}
-
-    _SRC_LABELS = {
-        'static':         'html',
-        'static_orphan':  'html_orphan',
-        'playwright':     'xhr_intercept',
-        'playwright_dom': 'dom',
-        'live_intercept': 'live',
+    _TOKEN_CARD_TYPES = {'CSRF Token', 'Nonce', 'Session Token',
+                         'Anti-Bot Token', 'OTP/Verification', 'Request ID'}
+    _BILLING_CTYPES = {
+        'Billing Address', 'Billing Zip', 'Billing City', 'Billing State',
+        'Billing Country', 'Billing Province', 'Billing First Name',
+        'Billing Last Name', 'Billing Company',
     }
 
+    # ── _ph helper ────────────────────────────────────────────
     _SMART_PH = None
     try:
-        _SMART_PH = _smart_placeholder  # may be defined in outer scope
+        _SMART_PH = _smart_placeholder
     except NameError:
         pass
 
@@ -27910,104 +28070,9 @@ def _build_json_export(data: dict) -> str:
                 return _SMART_PH(name, label, ftype)
             except Exception:
                 pass
-        return ''
+        return f'<{name}>'
 
-    # ── Convert one raw field → clean dict (array element) ───
-    def _field_obj(f: dict, src_override: str = '') -> dict:
-        name  = f.get('name', '')
-        label = f.get('field_label') or f.get('label', '') or name
-        ftype = f.get('type', 'text')
-        obj: dict = {'name': name, 'label': label, 'type': ftype}
-
-        # placeholder
-        ph = f.get('placeholder') or _ph(name, label, ftype)
-        if ph:
-            obj['placeholder'] = ph
-
-        # required
-        obj['required'] = bool(f.get('required', False))
-
-        # prefilled value (skip trivial)
-        val = f.get('value', '')
-        if val and val not in ('', '0', '0.00'):
-            obj['value'] = val[:120]
-
-        # autocomplete hint
-        ac = f.get('autocomplete', '')
-        if ac and ac.lower() not in ('', 'on', 'off'):
-            obj['autocomplete'] = ac
-
-        # HTML5 validation — only non-empty attrs
-        vd = {k: f[k] for k in ('pattern', 'minlength', 'maxlength', 'min', 'max') if f.get(k)}
-        if vd:
-            obj['validation'] = vd
-
-        # field origin
-        src = f.get('source', '') or src_override
-        if src:
-            obj['source'] = _SRC_LABELS.get(src, src)
-
-        return obj
-
-    # ── Categorize fields into 5 groups (arrays, not dicts) ──
-    def _categorize(fields: list, entry_src: str = '') -> dict:
-        card_f, pay_f, user_f, dyn_f, hidden_f = [], [], [], [], []
-        for f in fields:
-            ct  = f.get('card_type') or ''
-            ft  = f.get('type', 'text')
-            dyn = f.get('is_dynamic', False)
-            if f.get('is_honeypot'):
-                continue   # honeypots handled separately
-            obj = _field_obj(f, entry_src)
-            if ct in _CARD_TYPES:
-                card_f.append(obj)
-            elif ct in _PAY_TYPES:
-                pay_f.append(obj)
-            elif dyn or ct in _DYN_TYPES:
-                dyn_f.append(obj)
-            elif ft == 'hidden':
-                hidden_f.append(obj)
-            elif ft not in ('submit', 'button', 'reset', 'image'):
-                user_f.append(obj)
-        return {
-            'card_fields':    card_f,
-            'payment_fields': pay_f,
-            'user_fields':    user_f,
-            'dynamic_fields': dyn_f,
-            'hidden_fields':  hidden_f,
-        }
-
-    # ── POST body template builder ────────────────────────────
-    _FIELD_ORDER = [
-        'Email', 'Phone', 'Cardholder Name',
-        'Billing First Name', 'Billing Last Name', 'Billing Company',
-        'Billing Address', 'Billing City', 'Billing State',
-        'Billing Zip', 'Billing Country', 'Billing Province',
-        'Card Number', 'Expiry Month', 'Expiry Year', 'CVV/CVC',
-        'Routing Number', 'Account Number', 'Account Type',
-        'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
-    ]
-
-    def _post_template(fields: list, dyn_fields: list) -> dict:
-        def _order_key(f_raw):
-            ct = f_raw.get('card_type') or f_raw.get('field_label', '')
-            try:    return _FIELD_ORDER.index(ct)
-            except: return 99
-        tpl = {}
-        for f_raw in sorted(fields, key=_order_key):
-            nm = f_raw.get('name', '')
-            ft = f_raw.get('type', 'text')
-            if not nm or ft in ('submit', 'button', 'reset', 'image'):
-                continue
-            tpl[nm] = _ph(nm, f_raw.get('field_label') or f_raw.get('label', ''), ft) or ''
-        # dynamic tokens (CSRF/nonce) — include live values if available
-        for f_raw in dyn_fields:
-            nm = f_raw.get('name', '')
-            if nm and nm not in tpl:
-                tpl[nm] = f_raw.get('value', '') or '<token>'
-        return tpl
-
-    # ── Risk assessment (mirrors report) ──────────────────────
+    # ── Risk assessment ───────────────────────────────────────
     gateways    = data.get('gateways', [])
     threeds     = data.get('threeds_signals', [])
     wallets     = data.get('wallets', [])
@@ -28027,17 +28092,19 @@ def _build_json_export(data: dict) -> str:
     domain = urlparse(url).hostname or url
 
     # ── [1] meta ─────────────────────────────────────────────
-    out: dict = {
-        'meta': {
-            'url':        url,
-            'domain':     domain,
-            'scanned_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'risk':       risk,
-            'risk_reason': risk_reason,
-        }
+    _gw_name = gateways[0].get('name', '') if gateways else None
+    meta: dict = {
+        'url':        url,
+        'domain':     domain,
+        'scanned_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'risk':       risk,
+        'risk_reason': risk_reason,
     }
+    if _gw_name:
+        meta['gateway'] = _gw_name
+    out: dict = {'meta': meta}
 
-    # ── [2] gateway ───────────────────────────────────────────
+    # ── [2] gateway (detail) ─────────────────────────────────
     if gateways:
         gw = gateways[0]
         gw_obj: dict = {'name': gw.get('name', '')}
@@ -28048,7 +28115,154 @@ def _build_json_export(data: dict) -> str:
             gw_obj['additional'] = [g.get('name') for g in gateways[1:]]
         out['gateway'] = gw_obj
 
-    # ── [3] captcha ───────────────────────────────────────────
+    # ── [3] post_body + field_map ─────────────────────────────
+    all_entries     = data.get('forms', []) + data.get('requests', [])
+    resolved_tokens = data.get('resolved_tokens', {})
+
+    # Per-layer dicts (first-wins across all entries)
+    _pb_static:  dict[str, str] = {}   # layer 1 — known static values
+    _pb_tokens:  dict[str, str] = {}   # layer 2 — runtime tokens / CSRF
+    _pb_card:    dict[str, str] = {}   # layer 3 — card data placeholders
+    _pb_billing: dict[str, str] = {}   # layer 4 — billing / user inputs
+    _field_meta: dict[str, dict] = {}  # name → first-seen raw field (for field_map)
+
+    _SKIP_FTYPES       = ('submit', 'button', 'reset', 'image', 'iframe')
+    _STATIC_SKIP_VALS  = {'', '<token>', '0', '0.00'}
+
+    for entry in all_entries:
+        for f in entry.get('fields', []):
+            nm  = f.get('name', '')
+            ft  = f.get('type', 'text')
+            ct  = f.get('card_type') or ''
+            val = f.get('value', '')
+            dyn = bool(f.get('is_dynamic', False))
+
+            if not nm or ft in _SKIP_FTYPES:
+                continue
+
+            if nm not in _field_meta:
+                _field_meta[nm] = f
+
+            # First-wins: skip if already placed in any layer
+            if (nm in _pb_static or nm in _pb_tokens
+                    or nm in _pb_card  or nm in _pb_billing):
+                continue
+
+            label = f.get('field_label') or f.get('label', '') or nm
+
+            # Layer 1 — Static: real prefilled value, not dynamic, not card
+            if (val
+                    and val not in _STATIC_SKIP_VALS
+                    and ft != 'hidden'
+                    and not dyn
+                    and not f.get('is_card', False)):
+                _pb_static[nm] = val
+                continue
+
+            # Layer 2 — Token: dynamic fields or known token card_types
+            if dyn or ct in _TOKEN_CARD_TYPES:
+                res = resolved_tokens.get(nm, {})
+                _pb_tokens[nm] = res.get('value') or f'<{nm}>'
+                continue
+
+            # Layer 3 — Card data: placeholder via _smart_placeholder
+            if ct in _CARD_TYPES:
+                _pb_card[nm] = _ph(nm, label, ft)
+                continue
+
+            # Layer 4 — Billing / generic user inputs
+            if ct in _PAY_TYPES or ft in ('text', 'email', 'tel', 'select-one'):
+                _pb_billing[nm] = _ph(nm, label, ft)
+                continue
+
+    # ── Sort and assemble post_body ───────────────────────────
+    # Layer 3 sort: match common card field name patterns
+    _CARD_KEY_ORDER = [
+        'number', 'cardnumber', 'cardnum', 'ccnumber', 'cc_number', 'pan',
+        'expirationdatemonth', 'expmonth', 'exp_month', 'cardexpirymonth',
+        'expirationdateyear',  'expyear',  'exp_year',  'cardexpiryyear',
+        'cvv2', 'cvv', 'cvc', 'csc', 'securitycode',
+    ]
+    # Layer 4 sort: billing address → card holder → contact
+    _BILLING_KEY_ORDER = [
+        'billfname', 'bill_fname', 'billing_first_name', 'firstname', 'first_name',
+        'billlname', 'bill_lname', 'billing_last_name',  'lastname',  'last_name',
+        'billaddress1', 'bill_address', 'billing_address', 'address', 'address1',
+        'billaddress2', 'address2',
+        'billcity', 'bill_city', 'billing_city', 'city',
+        'tempbillstate', 'billstate', 'bill_state', 'billing_state', 'state',
+        'billzip', 'bill_zip', 'billing_zip', 'zip', 'postal', 'postalcode',
+        'billcountry', 'bill_country', 'billing_country', 'country',
+        'email', 'phone', 'telephone', 'mobile',
+    ]
+
+    def _card_rank(k: str) -> int:
+        kl = k.lower().replace('-', '').replace('_', '')
+        try:    return _CARD_KEY_ORDER.index(kl)
+        except: return 99
+
+    def _billing_rank(k: str) -> int:
+        kl = k.lower().replace('-', '').replace('_', '')
+        try:    return _BILLING_KEY_ORDER.index(kl)
+        except: return 99
+
+    post_body: dict = {}
+    for k in sorted(_pb_static):
+        post_body[k] = _pb_static[k]
+    for k in _pb_tokens:                               # insertion order (form order)
+        post_body[k] = _pb_tokens[k]
+    for k in sorted(_pb_card,    key=_card_rank):
+        post_body[k] = _pb_card[k]
+    for k in sorted(_pb_billing, key=_billing_rank):
+        post_body[k] = _pb_billing[k]
+
+    if post_body:
+        out['post_body'] = post_body
+
+    # ── Build field_map (name → semantic type) ────────────────
+    _CT_TO_SEMANTIC: dict[str, str] = {
+        'Card Number':      'card_number',
+        'CVV/CVC':          'cvv',
+        'Expiry Month':     'expiry_month',
+        'Expiry Year':      'expiry_year',
+        'Cardholder Name':  'cardholder_name',
+        'CSRF Token':       'csrf_token',
+        'Nonce':            'nonce',
+        'Anti-Bot Token':   'antibot_token',
+        'OTP/Verification': 'otp',
+        'Amount':           'amount',
+        'Currency':         'currency',
+    }
+
+    field_map: dict = {}
+    for nm in post_body:
+        f   = _field_meta.get(nm, {})
+        ct  = f.get('card_type') or ''
+        ft  = f.get('type', 'text')
+        nm_l = nm.lower()
+
+        if ct in _CT_TO_SEMANTIC:
+            sem = _CT_TO_SEMANTIC[ct]
+        elif ct in _BILLING_CTYPES:
+            # 'Billing First Name' → 'billing_first_name'
+            sem = ct.lower().replace(' ', '_')
+        elif re.search(r'recaptcha|g-recaptcha', nm_l):
+            sem = 'recaptcha_token'
+        elif re.search(r'cardtoken|card_token', nm_l):
+            sem = 'gateway_token'
+        elif ft == 'email':
+            sem = 'email'
+        elif ft == 'tel':
+            sem = 'phone'
+        else:
+            sem = 'text_field'
+
+        field_map[nm] = sem
+
+    if field_map:
+        out['field_map'] = field_map
+
+    # ── [4] captcha ───────────────────────────────────────────
     rc = data.get('recaptcha')
     all_keys = []
     if rc and rc.get('all_keys'):
@@ -28079,7 +28293,7 @@ def _build_json_export(data: dict) -> str:
             captcha_list.append(ck)
         out['captcha'] = captcha_list
 
-    # ── [4] signals ───────────────────────────────────────────
+    # ── [5] signals ───────────────────────────────────────────
     signals: dict = {}
     if threeds:
         signals['3ds'] = threeds
@@ -28088,87 +28302,13 @@ def _build_json_export(data: dict) -> str:
     ms = data.get('multistep')
     if ms:
         ms_obj: dict = {}
-        if ms.get('signals'):       ms_obj['signals']   = ms['signals']
+        if ms.get('signals'):          ms_obj['signals']   = ms['signals']
         if ms.get('likely_step_urls'): ms_obj['step_urls'] = ms['likely_step_urls']
         signals['multistep'] = ms_obj
     if signals:
         out['signals'] = signals
 
-    # ── [5] forms ─────────────────────────────────────────────
-    def _build_form_obj(entry: dict, idx: int) -> dict:
-        fields   = entry.get('fields', [])
-        src_lbl  = entry.get('source', '')
-        cats     = _categorize(fields, src_lbl)
-        dyn_raw  = [f for f in fields if f.get('is_dynamic')]
-
-        fo: dict = {'id': idx}
-        if entry.get('endpoint'):  fo['endpoint']     = entry['endpoint']
-        if entry.get('method'):    fo['method']        = entry['method']
-        if entry.get('enctype'):   fo['content_type']  = (
-            entry['enctype']
-            .replace('application/', '')
-            .replace('x-www-form-urlencoded', 'urlencoded')
-            .replace('; charset=utf-8', '').strip()
-        )
-        fo['is_payment'] = bool(entry.get('is_payment', False))
-        if src_lbl:
-            fo['source'] = _SRC_LABELS.get(src_lbl, src_lbl)
-
-        # field groups — omit empty arrays
-        for key in ('card_fields', 'payment_fields', 'user_fields',
-                    'dynamic_fields', 'hidden_fields'):
-            if cats[key]:
-                fo[key] = cats[key]
-
-        # honeypots
-        hp = [{'name': f['name'], 'type': f.get('type', 'text')}
-              for f in fields if f.get('is_honeypot')]
-        if hp:
-            fo['honeypot_fields'] = hp
-
-        # submit button text (concise)
-        btns = entry.get('submit_buttons', [])
-        if btns:
-            fo['submit'] = btns[0].get('text') or btns[0].get('value') or 'Submit'
-
-        # POST body template (only for payment / card forms)
-        all_pay_card = cats['card_fields'] or cats['payment_fields']
-        if all_pay_card:
-            tpl = _post_template(fields, dyn_raw)
-            if tpl:
-                fo['post_template'] = tpl
-
-        if entry.get('note'):
-            fo['note'] = entry['note']
-
-        return fo
-
-    forms_out = []
-    for i, entry in enumerate(data.get('forms', []), 1):
-        forms_out.append(_build_form_obj(entry, i))
-    if forms_out:
-        out['forms'] = forms_out
-
-    # ── [6] xhr_requests ─────────────────────────────────────
-    xhr_out = []
-    for i, entry in enumerate(data.get('requests', []), 1):
-        fields  = entry.get('fields', [])
-        src_lbl = entry.get('source', '')
-        cats    = _categorize(fields, src_lbl)
-        xo: dict = {'id': i}
-        if entry.get('endpoint'):  xo['endpoint']    = entry['endpoint']
-        if entry.get('method'):    xo['method']       = entry['method']
-        xo['is_payment'] = bool(entry.get('is_payment', False))
-        if entry.get('raw_body'):  xo['raw_body']     = entry['raw_body'][:300]
-        for key in ('card_fields', 'payment_fields', 'user_fields',
-                    'dynamic_fields', 'hidden_fields'):
-            if cats[key]:
-                xo[key] = cats[key]
-        xhr_out.append(xo)
-    if xhr_out:
-        out['xhr_requests'] = xhr_out
-
-    # ── [7] security ─────────────────────────────────────────
+    # ── [6] security ─────────────────────────────────────────
     sec: dict = {}
 
     headers_raw = data.get('headers', [])
@@ -28201,17 +28341,17 @@ def _build_json_export(data: dict) -> str:
     if csp:
         csp_obj: dict = {}
         directives = {k: v for k, v in (csp.get('directives') or {}).items() if v}
-        if directives:  csp_obj['directives'] = directives
-        if csp.get('issues'): csp_obj['issues'] = csp['issues']
+        if directives:        csp_obj['directives'] = directives
+        if csp.get('issues'): csp_obj['issues']     = csp['issues']
         if csp_obj:
             sec['csp'] = csp_obj
 
     cors = data.get('cors_info')
     if cors:
         cors_obj = {k: v for k, v in {
-            'allow_origin':       cors.get('allow_origin'),
-            'allow_credentials':  cors.get('allow_credentials'),
-            'issues':             cors.get('issues') or None,
+            'allow_origin':      cors.get('allow_origin'),
+            'allow_credentials': cors.get('allow_credentials'),
+            'issues':            cors.get('issues') or None,
         }.items() if v}
         if cors_obj:
             sec['cors'] = cors_obj
@@ -28223,27 +28363,24 @@ def _build_json_export(data: dict) -> str:
     if sec:
         out['security'] = sec
 
-    # ── [8] tokens ───────────────────────────────────────────
-    token_sources   = data.get('token_sources', [])
-    resolved_tokens = data.get('resolved_tokens', {})
+    # ── [7] tokens ───────────────────────────────────────────
+    token_sources = data.get('token_sources', [])
     if token_sources:
         out['tokens'] = []
         for t in token_sources:
             tname = t.get('name', '')
             res   = resolved_tokens.get(tname, {})
             entry_exp = {k: v for k, v in {
-                'name':        tname,
-                'source_type': t.get('source_type'),
-                'location':    t.get('location'),
-                'label':       t.get('label') or None,
-                # resolved fields — present only when we have a real value
-                'resolved_value':      res.get('value')      or None,
-                'resolve_confidence':  res.get('confidence') or None,
-                'resolve_method':      res.get('method')     or None,
-                'header_key':          res.get('header_key') or None,
+                'name':               tname,
+                'source_type':        t.get('source_type'),
+                'location':           t.get('location'),
+                'label':              t.get('label') or None,
+                'resolved_value':     res.get('value')      or None,
+                'resolve_confidence': res.get('confidence') or None,
+                'resolve_method':     res.get('method')     or None,
+                'header_key':         res.get('header_key') or None,
             }.items() if v}
             out['tokens'].append(entry_exp)
-        # flat ready-to-inject map — convenience for scripting
         ready_map = {
             n: i['value']
             for n, i in resolved_tokens.items()
@@ -28252,16 +28389,16 @@ def _build_json_export(data: dict) -> str:
         if ready_map:
             out['resolved_token_map'] = ready_map
 
-    # ── [9] client_storage ───────────────────────────────────
+    # ── [8] client_storage ───────────────────────────────────
     cs = data.get('client_storage', {})
     ls, ss = cs.get('localStorage', {}), cs.get('sessionStorage', {})
     if ls or ss:
         cs_out: dict = {}
-        if ls: cs_out['localStorage']  = ls
+        if ls: cs_out['localStorage']   = ls
         if ss: cs_out['sessionStorage'] = ss
         out['client_storage'] = cs_out
 
-    # ── [10] endpoints ───────────────────────────────────────
+    # ── [9] endpoints ────────────────────────────────────────
     ep_out: dict = {}
     gql = data.get('graphql_info')
     if gql:
@@ -28286,7 +28423,7 @@ def _build_json_export(data: dict) -> str:
     if ep_out:
         out['endpoints'] = ep_out
 
-    # ── [11] framework ───────────────────────────────────────
+    # ── [10] framework ───────────────────────────────────────
     fws = data.get('frameworks', [])
     if fws:
         out['framework'] = [
@@ -28294,7 +28431,7 @@ def _build_json_export(data: dict) -> str:
             for fw in fws
         ]
 
-    # ── [12] snippets ────────────────────────────────────────
+    # ── [11] snippets ────────────────────────────────────────
     snip = data.get('curl_snippet')
     if snip:
         snip_out = {k: v for k, v in {
@@ -28304,7 +28441,7 @@ def _build_json_export(data: dict) -> str:
         if snip_out:
             out['snippets'] = snip_out
 
-    # ── [13] live_findings ───────────────────────────────────
+    # ── [12] live_findings ───────────────────────────────────
     if live_finds:
         out['live_findings'] = [
             {k: v for k, v in {
@@ -28316,7 +28453,7 @@ def _build_json_export(data: dict) -> str:
             for lf in live_finds
         ]
 
-    # ── [14] response_patterns ───────────────────────────────
+    # ── [13] response_patterns ───────────────────────────────
     rp = data.get('response_patterns', {})
     if rp and rp.get('verdict', 'unknown') != 'unknown':
         rp_out: dict = {'verdict': rp.get('verdict', 'unknown')}
@@ -28486,33 +28623,17 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/payload <url> — Extract request payload + payment structure (JSON export)"""
     if not context.args:
+        # UI/UX refactor: compact MarkdownV2 capability card replaces long bullet list
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/payload https://example.com`\n\n"
-            "🧩 *Extracts:*\n"
-            "  • Form endpoints + HTTP methods\n"
-            "  • All fields (name, type, value, HTML5 validation)\n"
-            "  • 💳 Card fields (number, CVV, expiry)\n"
-            "  • 🔄 Dynamic fields (CSRF, Nonce, Session, OTP)\n"
-            "  • 📌 Static/hidden fields\n"
-            "  • 💳 Payment gateway detection (23+ gateways)\n"
-            "  • 🪤 Honeypot / anti-bot field detection\n"
-            "  • 💾 localStorage / sessionStorage token dump\n\n"
-            "🔬 *Analysis:*\n"
-            "  • 🔍 Header requirements\n"
-            "  • 🍪 Auth cookie security (HttpOnly/Secure/SameSite)\n"
-            "  • 🛡️ CSP header analysis\n"
-            "  • 🌐 CORS policy probe\n"
-            "  • 🔷 GraphQL endpoint detection\n"
-            "  • 📖 OpenAPI/Swagger schema discovery\n"
-            "  • ⚙️ JS Framework detection (React/Vue/Angular…)\n"
-            "  • 📊 Rate limit header detection\n"
-            "  • 🪜 Multi-step checkout detection\n"
-            "  • 📋 Auto-generated curl + Python snippet\n"
-            "  • 🔎 Success / Decline response pattern detection\n"
-            "     (ISO 8583 codes · Stripe decline_code · gateway messages)\n\n"
-            "📄 *Exports full JSON file*\n\n"
-            "⚠️ _For authorized security testing only._",
-            parse_mode='Markdown'
+            "🧩 *Payload Extractor*\n"
+            "`/payload <url>`\n\n"
+            "*Forms*  fields · endpoints · hidden · honeypots\n"
+            "*Security*  headers · cookies · CSP · CORS · 3DS\n"
+            "*Gateways*  23\\+ detectors · tokenization risk\n"
+            "*Tokens*  CSRF · nonce · localStorage dump\n"
+            "*Output*  inline report \\+ JSON export\n\n"
+            "⚠️ _Authorized testing only\\._",
+            parse_mode='MarkdownV2'
         )
         return
 
@@ -28559,32 +28680,43 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
 
+    # PATCHED: clean note truncation, internal prefix stripping, no ▓ running block
     def _build_progress_msg(domain: str, phase_idx: int, note: str = "") -> str:
-        """Build the animated progress message — compact clean format."""
-        filled  = min(phase_idx, TOTAL_PHASES)
-        empty   = TOTAL_PHASES - filled - (1 if phase_idx < TOTAL_PHASES else 0)
-        running = 1 if phase_idx < TOTAL_PHASES else 0
-        bar     = "█" * filled + ("▓" * running) + "░" * empty
-        pct     = int((filled / TOTAL_PHASES) * 100)
+        filled = min(phase_idx, TOTAL_PHASES)
+        pct    = int((filled / TOTAL_PHASES) * 100)
+        bar    = "█" * filled + "░" * (TOTAL_PHASES - filled)
 
         if phase_idx < TOTAL_PHASES:
-            _, cur_label, _ = _PAYLOAD_PHASES[phase_idx]
-            phase_line = f"⏳ *Phase {phase_idx + 1}/{TOTAL_PHASES}:* {escape_md(cur_label)}"
+            icon, cur_label, _ = _PAYLOAD_PHASES[phase_idx]
+            phase_line = (
+                f"{icon} {escape_md(cur_label)}  "
+                f"_{phase_idx + 1} / {TOTAL_PHASES}_"
+            )
         else:
-            phase_line = f"✅ *All {TOTAL_PHASES} phases done*"
+            phase_line = f"✅ _All {TOTAL_PHASES} phases done_"
 
-        lines = [
-            f"🧩 *Payload Extractor*",
-            f"`{escape_md(domain)}`\n",
-            f"`[{bar}]` {pct}%",
-            phase_line,
-        ]
+        # Clean note: take only the first clause, strip internal debug strings
+        short_note = ""
         if note:
-            lines.append(f"_{escape_md(note[:80])}_")
-        return "\n".join(lines)
+            # Drop anything after first "..." or newline, cap at 55 chars
+            short_note = note.split("...")[0].split("\n")[0].strip()[:55]
+            # Strip known internal prefixes that are not user-facing
+            for _pfx in ("Fetching", "Playwright", "intercepting",
+                         "Probing", "Scanning", "Extracting", "Locating"):
+                if short_note.startswith(_pfx):
+                    short_note = short_note[len(_pfx):].lstrip(" —:-")
+                    break
+
+        note_line = f"\n_→ {escape_md(short_note)}_" if short_note else ""
+
+        return (
+            f"🧩 *Payload Extractor*  ·  `{escape_md(domain)}`\n\n"
+            f"`[{bar}]`  {pct}%\n\n"
+            f"{phase_line}{note_line}"
+        )
 
     def _msg_to_phase(text: str) -> int | None:
-        """Map a progress_cb message to a phase index (0-based)."""
+        # PATCHED: guard against backward jump handled in progress_cb
         tl = text.lower()
         for i, (_, _, keywords) in enumerate(_PAYLOAD_PHASES):
             if any(kw.lower() in tl for kw in keywords):
@@ -28603,10 +28735,10 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phase_state    = [0]   # mutable so thread closure can update
 
     def progress_cb(text: str):
-        """Called from sync thread — puts (phase_idx, note) into async queue."""
+        # PATCHED: backward jump guard — phase index never decreases
         detected = _msg_to_phase(text)
-        if detected is not None and detected >= phase_state[0]:
-            phase_state[0] = detected
+        if detected is not None:
+            phase_state[0] = max(phase_state[0], detected)  # never go back
         loop.call_soon_threadsafe(
             progress_queue.put_nowait, (phase_state[0], text)
         )
@@ -28704,18 +28836,18 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fence_lang = ""   # language tag of the currently open fence, e.g. "python"
 
         def flush(reopen: bool = False):
+            # PATCHED: capture fence_lang before clearing state so reopen uses correct lang
             nonlocal current, cur_len, in_block
             if not current:
                 return
-            # Close any open fence before flushing
+            saved_lang = fence_lang          # snapshot before any mutation
             if in_block:
                 current.append("```\n")
             chunks.append("".join(current))
             current = []
             cur_len = 0
-            # Re-open the fence in the next chunk if we're still inside a block
             if reopen and in_block:
-                opener = f"```{fence_lang}\n"
+                opener = f"```{saved_lang}\n"  # use snapshot, not (now-cleared) fence_lang
                 current.append(opener)
                 cur_len = len(opener)
 
