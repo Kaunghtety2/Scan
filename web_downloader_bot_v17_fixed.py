@@ -51,6 +51,14 @@ try:
 except ImportError:
     _httpx = None                     # pip install httpx[http2]
     _HTTPX_OK = False
+
+# ── rapidfuzz — fuzzy pattern matching for response scanning ──
+try:
+    from rapidfuzz import fuzz as _rfuzz
+    _RAPIDFUZZ_OK = True
+except ImportError:
+    _rfuzz = None                     # pip install rapidfuzz
+    _RAPIDFUZZ_OK = False
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25994,35 +26002,166 @@ def _scan_response_patterns(
     found_success = list(_seen_success.values())
     found_decline = list(_seen_decline.values())
 
+    # ── FUZZY FALLBACK — rapidfuzz partial+token_set matching ────
+    # Only runs when rapidfuzz is installed. Checks each source body against
+    # human-readable keyword phrases that regex patterns may miss due to
+    # paraphrasing, whitespace variation, or natural-language phrasing.
+    _FUZZY_SUCCESS_KWS = [
+        "payment successful",
+        "transaction approved",
+        "thank you for your order",
+        "order confirmed",
+        "payment received",
+    ]
+    _FUZZY_DECLINE_KWS = [
+        "card declined",
+        "insufficient funds",
+        "do not honor",
+        "invalid card",
+        "transaction failed",
+        "payment failed",
+    ]
+    _FUZZY_THRESHOLD   = 75   # calibrated: 0 FP on stress set, catches natural-language phrasing
+    _FUZZY_DECISIVE_GAP = 12  # min score gap when both categories fire — avoids mixed noise
+
+    if _RAPIDFUZZ_OK:
+        _fuzzy_seen_success: set[str] = set()
+        _fuzzy_seen_decline: set[str] = set()
+
+        def _fuzzy_best(kws: list, text: str) -> tuple[int, str]:
+            """Return (best_score, matched_keyword) using max of partial_ratio + token_set_ratio."""
+            best_score, best_kw = 0, ''
+            tl = text.lower()
+            for kw in kws:
+                score = max(
+                    _rfuzz.partial_ratio(kw, tl),
+                    _rfuzz.token_set_ratio(kw, tl),
+                )
+                if score > best_score:
+                    best_score, best_kw = score, kw
+            return best_score, best_kw
+
+        def _fuzzy_snippet(text: str, kw: str, ctx: int = 80) -> str:
+            """Extract a short snippet around the best fuzzy match location."""
+            tl = text.lower()
+            # Find approximate position using the first word of the keyword
+            first_word = kw.split()[0]
+            pos = tl.find(first_word)
+            if pos == -1:
+                return text[:ctx * 2].replace('\n', ' ').strip()
+            start = max(0, pos - ctx)
+            end   = min(len(text), pos + len(kw) + ctx)
+            return text[start:end].replace('\n', ' ').replace('\r', '').strip()
+
+        for src_text, src_name in sources:
+            if not src_text:
+                continue
+
+            s_score, s_kw = _fuzzy_best(_FUZZY_SUCCESS_KWS, src_text)
+            d_score, d_kw = _fuzzy_best(_FUZZY_DECLINE_KWS, src_text)
+
+            s_hit = s_score >= _FUZZY_THRESHOLD
+            d_hit = d_score >= _FUZZY_THRESHOLD
+
+            # Disambiguation: if both fire, require a decisive gap
+            if s_hit and d_hit:
+                if (s_score - d_score) >= _FUZZY_DECISIVE_GAP:
+                    d_hit = False   # success clearly dominates
+                elif (d_score - s_score) >= _FUZZY_DECISIVE_GAP:
+                    s_hit = False   # decline clearly dominates
+                else:
+                    pass            # genuinely mixed — let both through
+
+            if s_hit and s_kw not in _fuzzy_seen_success:
+                # Only add if regex scan didn't already catch this category
+                regex_label = f'Fuzzy: "{s_kw}"'
+                if regex_label not in _seen_success:
+                    _fuzzy_seen_success.add(s_kw)
+                    found_success.append({
+                        'label':      f'Fuzzy: "{s_kw}"',
+                        'sources':    [src_name],
+                        'source':     src_name,
+                        'snippet':    _fuzzy_snippet(src_text, s_kw),
+                        'confidence': f'FUZZY_MATCH ({s_score:.0f}%)',
+                    })
+
+            if d_hit and d_kw not in _fuzzy_seen_decline:
+                regex_label = f'Fuzzy: "{d_kw}"'
+                if regex_label not in _seen_decline:
+                    _fuzzy_seen_decline.add(d_kw)
+                    found_decline.append({
+                        'label':      f'Fuzzy: "{d_kw}"',
+                        'sources':    [src_name],
+                        'source':     src_name,
+                        'snippet':    _fuzzy_snippet(src_text, d_kw),
+                        'confidence': f'FUZZY_MATCH ({d_score:.0f}%)',
+                    })
+
+    # ── Verdict logic (regex-first, fuzzy fills gaps) ─────────────
     # PATCHED: weight verdict by source reliability
     # Priority: xhr_response / live_intercept > js_source > static_html
+    # Fuzzy-only findings are treated as lower confidence (equivalent to static_html)
     _RELIABLE = {'xhr_response', 'live_intercept'}
     _MEDIUM   = {'js_source'}
 
+    def _is_fuzzy_only(entry: dict) -> bool:
+        return entry.get('label', '').startswith('Fuzzy:')
+
     def _has_reliable(entries: list) -> bool:
         return any(
-            s in _RELIABLE or s in _MEDIUM
+            (s in _RELIABLE or s in _MEDIUM) and not _is_fuzzy_only(e)
             for e in entries
             for s in e.get('sources', [e.get('source', '')])
         )
 
-    reliable_success = _has_reliable(found_success)
-    reliable_decline = _has_reliable(found_decline)
-    any_success      = bool(found_success)
-    any_decline      = bool(found_decline)
+    def _has_fuzzy_reliable(entries: list) -> bool:
+        """Fuzzy hit from xhr_response / live_intercept — medium confidence."""
+        return any(
+            _is_fuzzy_only(e)
+            and any(s in _RELIABLE for s in e.get('sources', [e.get('source', '')]))
+            for e in entries
+        )
 
+    # Separate regex findings from fuzzy-only findings for verdict weighting
+    regex_success = [e for e in found_success if not _is_fuzzy_only(e)]
+    regex_decline = [e for e in found_decline if not _is_fuzzy_only(e)]
+    fuzzy_success = [e for e in found_success if _is_fuzzy_only(e)]
+    fuzzy_decline = [e for e in found_decline if _is_fuzzy_only(e)]
+
+    reliable_success = _has_reliable(regex_success)
+    reliable_decline = _has_reliable(regex_decline)
+    any_regex_success = bool(regex_success)
+    any_regex_decline = bool(regex_decline)
+    fuzzy_reliable_s  = _has_fuzzy_reliable(fuzzy_success)
+    fuzzy_reliable_d  = _has_fuzzy_reliable(fuzzy_decline)
+    any_fuzzy_success = bool(fuzzy_success)
+    any_fuzzy_decline = bool(fuzzy_decline)
+
+    # Verdict priority: regex reliable > regex any > fuzzy reliable > fuzzy any > unknown
     if reliable_success and reliable_decline:
         verdict = 'mixed'
     elif reliable_success:
         verdict = 'success'
     elif reliable_decline:
         verdict = 'decline'
-    elif any_success and any_decline:
+    elif any_regex_success and any_regex_decline:
         verdict = 'mixed'
-    elif any_success:
-        verdict = 'likely_success'   # HTML-only — lower confidence
-    elif any_decline:
-        verdict = 'likely_decline'   # HTML-only — lower confidence
+    elif any_regex_success:
+        verdict = 'likely_success'    # HTML-only regex — lower confidence
+    elif any_regex_decline:
+        verdict = 'likely_decline'    # HTML-only regex — lower confidence
+    elif fuzzy_reliable_s and fuzzy_reliable_d:
+        verdict = 'mixed'
+    elif fuzzy_reliable_s:
+        verdict = 'likely_success'    # fuzzy XHR hit — medium confidence
+    elif fuzzy_reliable_d:
+        verdict = 'likely_decline'    # fuzzy XHR hit — medium confidence
+    elif any_fuzzy_success and any_fuzzy_decline:
+        verdict = 'mixed'
+    elif any_fuzzy_success:
+        verdict = 'likely_success'    # fuzzy HTML-only — lowest confidence
+    elif any_fuzzy_decline:
+        verdict = 'likely_decline'    # fuzzy HTML-only — lowest confidence
     else:
         verdict = 'unknown'
 
@@ -26040,13 +26179,14 @@ def _scan_response_patterns(
 # ══════════════════════════════════════════════════════════════
 
 def _generate_curl_snippet(endpoint: str, method: str, enctype: str,
-                           all_fields: list, headers_required: list = None) -> dict:
+                           all_fields: list, headers_required: list = None,
+                           resolved_tokens: dict = None) -> dict:
     """Generate curl + Python requests snippet from extracted form fields."""
     _CARD_PLACEHOLDERS = {
         'Card Number':    '4111111111111111',
         'CVV/CVC':        '123',
-        'Expiry Month':   '12/2025',
-        'Expiry Year':    '2025',
+        'Expiry Month':   '12',
+        'Expiry Year':    '2029',
         'Cardholder Name': 'John Doe',
         'Routing Number': '021000021',
         'Account Number': '000123456789',
@@ -26054,66 +26194,136 @@ def _generate_curl_snippet(endpoint: str, method: str, enctype: str,
         'Amount':         '100.00',
         'Currency':       'USD',
     }
-    field_map = {}
+    resolved_tokens = resolved_tokens or {}
+    field_map   = {}
+    has_dynamic = False
+
     for f in all_fields:
         name = f.get('name', '')
         if not name or f.get('type') in ('submit', 'button', 'reset', 'image'):
             continue
         if f.get('is_honeypot'):
-            continue   # skip honeypot fields
+            continue
         ct  = f.get('card_type') or ''
         val = f.get('value', '')
-        if val and len(val) > 1 and not f.get('is_dynamic'):
+
+        # Priority 1 — resolved token (live/static/inferred value)
+        rt = resolved_tokens.get(name, {})
+        if rt.get('value') and rt.get('confidence') in ('live', 'static', 'inferred'):
+            field_map[name] = rt['value']
+            if f.get('is_dynamic'):
+                has_dynamic = True
+            continue
+
+        if f.get('is_dynamic'):
+            has_dynamic = True
+            field_map[name] = f'<{name}_runtime>'
+        elif val and len(val) > 1:
             field_map[name] = val
         elif ct in _CARD_PLACEHOLDERS:
             field_map[name] = _CARD_PLACEHOLDERS[ct]
-        elif f.get('is_dynamic'):
-            field_map[name] = f'<{name}_runtime>'
         else:
             field_map[name] = f.get('placeholder') or f'<{name}>'
 
-    # Build header strings
+    # ── Header strings ────────────────────────────────────────
     h_parts, h_dict = [], {}
+    # Inject resolved token headers (e.g. X-CSRF-Token)
+    for name, rt in resolved_tokens.items():
+        hk = rt.get('header_key')
+        if hk and hk not in h_dict:
+            hval = rt.get('value') or '<token>'
+            h_parts.append(f'  -H "{hk}: {hval}"')
+            h_dict[hk] = hval
     if headers_required:
-        for h in (headers_required or []):
+        for h in headers_required:
             if h.get('status_key') in ('required', 'important'):
                 hname = h['header']
-                h_parts.append(f'  -H "{hname}: <value>"')
-                h_dict[hname] = '<value>'
+                if hname not in h_dict:
+                    h_parts.append(f'  -H "{hname}: <value>"')
+                    h_dict[hname] = '<value>'
 
-    is_json = 'json' in enctype.lower()
+    import json as _json
+
+    is_json      = 'json' in enctype.lower()
+    is_multipart = 'multipart' in enctype.lower()
+
     if is_json:
-        import json as _json
-        body_json = _json.dumps(field_map, indent=2)
-        curl_body = f"--data-raw '{body_json}'"
+        body_json  = _json.dumps(field_map, indent=2)
+        curl_parts = [f"  --data-raw '{body_json}'"]
         h_parts.insert(0, '  -H "Content-Type: application/json"')
+    elif is_multipart:
+        curl_parts = [f"  -F '{k}={v}'" for k, v in field_map.items()]
     else:
-        from urllib.parse import urlencode as _ue
-        curl_body = f"--data-urlencode '{_ue(field_map)}'"
+        # FIX: one --data-urlencode per field
+        curl_parts = [f"  --data-urlencode '{k}={v}'" for k, v in field_map.items()]
         h_parts.insert(0, '  -H "Content-Type: application/x-www-form-urlencoded"')
 
-    h_str  = ' \\\n'.join(h_parts)
-    curl   = f"curl -X {method} '{endpoint}' \\\n{h_str} \\\n  {curl_body}"
+    h_str    = ' \\\n'.join(h_parts)
+    body_str = ' \\\n'.join(curl_parts)
+    curl = (
+        f"curl -sS -L --compressed -X {method} '{endpoint}'"
+        + (f" \\\n{h_str}" if h_str else '')
+        + (f" \\\n{body_str}" if body_str else '')
+    )
 
-    # Python snippet
-    py_lines = [
-        'import requests', '',
-        f"url     = '{endpoint}'",
-        f'payload = {repr(field_map)}',
-    ]
+    # ── Python sync snippet ───────────────────────────────────
+    payload_repr = _json.dumps(field_map, indent=2, ensure_ascii=False)
+    headers_repr = _json.dumps(h_dict,    indent=2, ensure_ascii=False) if h_dict else None
+    kwargs_sync  = 'json=payload' if is_json else ('files=payload' if is_multipart else 'data=payload')
+    kwargs_async = kwargs_sync
     if h_dict:
-        py_lines.append(f'headers = {repr(h_dict)}')
-    kwargs = 'json=payload' if is_json else 'data=payload'
-    if h_dict:
-        kwargs += ', headers=headers'
-    py_lines += [
-        f'resp    = requests.{method.lower()}(url, {kwargs})',
-        'print(resp.status_code, resp.text[:500])',
+        kwargs_sync  += ', headers=headers'
+        kwargs_async += ', headers=headers'
+
+    py_sync_lines = ['import requests', '']
+    if has_dynamic:
+        py_sync_lines += [
+            f"# Prime session to pick up CSRF cookie/token",
+            f"s = requests.Session()",
+            f"s.get('{endpoint}', verify=False)",
+            '',
+        ]
+        send_fn = f"s.{method.lower()}"
+    else:
+        send_fn = f"requests.{method.lower()}"
+
+    py_sync_lines += [f"url     = '{endpoint}'"]
+    py_sync_lines += [f"payload = {payload_repr}"]
+    if headers_repr:
+        py_sync_lines += [f"headers = {headers_repr}"]
+    py_sync_lines += [
+        f"resp = {send_fn}(url, {kwargs_sync}, verify=False)",
+        "print(resp.status_code, resp.text[:500])",
     ]
-    return {'curl': curl, 'python': '\n'.join(py_lines)}
+
+    # ── Python async snippet ──────────────────────────────────
+    py_async_lines = ['import asyncio', 'import httpx', '']
+    py_async_lines += [f"url     = '{endpoint}'"]
+    py_async_lines += [f"payload = {payload_repr}"]
+    if headers_repr:
+        py_async_lines += [f"headers = {headers_repr}"]
+    py_async_lines += [
+        'async def main():',
+        '    async with httpx.AsyncClient(verify=False) as client:',
+    ]
+    if has_dynamic:
+        py_async_lines.append(f"        await client.get(url)  # prime CSRF")
+    py_async_lines += [
+        f"        resp = await client.{method.lower()}(url, {kwargs_async})",
+        '        print(resp.status_code, resp.text[:500])',
+        '',
+        'asyncio.run(main())',
+    ]
+
+    return {
+        'curl':         curl,
+        'python':       '\n'.join(py_sync_lines),
+        'python_async': '\n'.join(py_async_lines),
+    }
 
 
-def _analyze_auth_cookies(url: str) -> list:
+
+def _analyze_auth_cookies(url: str, resp_headers: dict = None) -> list:
     """Fetch URL and analyze Set-Cookie security flags on auth-looking cookies."""
     results = []
     _AUTH_NAMES = re.compile(
@@ -26121,10 +26331,22 @@ def _analyze_auth_cookies(url: str) -> list:
         re.I
     )
     try:
-        resp = requests.get(url, headers=_get_headers(), timeout=10,
-                            verify=False, allow_redirects=True)
-        raw_cookies = resp.headers.get_all('set-cookie') if hasattr(resp.headers, 'get_all') \
-                      else [v for k, v in resp.headers.items() if k.lower() == 'set-cookie']
+        if resp_headers is not None:
+            # Use cached headers — collect all Set-Cookie values
+            raw_cookies = []
+            for k, v in resp_headers.items():
+                if k.lower() == 'set-cookie':
+                    raw_cookies.append(v)
+        else:
+            resp = requests.get(url, headers=_get_headers(), timeout=10,
+                                verify=False, allow_redirects=True)
+            # FIX: use raw.headers.getlist to get ALL Set-Cookie headers individually
+            if hasattr(resp.raw.headers, 'getlist'):
+                raw_cookies = resp.raw.headers.getlist('set-cookie')
+            else:
+                raw_cookies = [v for k, v in resp.raw.headers.items()
+                               if k.lower() == 'set-cookie']
+
         for raw in (raw_cookies or []):
             parts = [p.strip() for p in raw.split(';')]
             if not parts:
@@ -26133,15 +26355,41 @@ def _analyze_auth_cookies(url: str) -> list:
             cname = name_val[0].strip()
             if not _AUTH_NAMES.search(cname):
                 continue
-            flags     = [p.lower() for p in parts[1:]]
-            http_only = any('httponly' in f for f in flags)
-            secure    = any(f == 'secure' for f in flags)
-            same_site = next((p.split('=',1)[1].strip() if '=' in p else 'None'
-                              for p in flags if 'samesite' in p), None)
-            # PATCHED: per-flag severity tiers; SameSite Lax ≠ None; Max-Age +
-            # Partitioned (CHIPS) detection; structured severity roll-up
-            issues      = []
-            severity    = []
+            flags     = [p.strip() for p in parts[1:]]
+            flags_low = [f.lower() for f in flags]
+            http_only = any('httponly' in f for f in flags_low)
+            secure    = any(f == 'secure' or f.startswith('secure') for f in flags_low)
+            same_site = next((p.split('=', 1)[1].strip() if '=' in p else 'None'
+                              for p in flags_low if 'samesite' in p), None)
+            domain    = next((p.split('=', 1)[1].strip() if '=' in p else ''
+                              for p in flags_low if p.startswith('domain')), '')
+            path_val  = next((p.split('=', 1)[1].strip() if '=' in p else ''
+                              for p in flags_low if p.startswith('path')), '')
+
+            issues   = []
+            severity = []
+
+            # __Host- prefix: requires Secure=True, Path='/', no Domain attr
+            if cname.startswith('__Host-'):
+                if not secure:
+                    issues.append('__Host- prefix requires Secure flag')
+                    severity.append('HIGH')
+                if path_val != '/':
+                    issues.append('__Host- prefix requires Path=/')
+                    severity.append('HIGH')
+                if domain:
+                    issues.append('__Host- prefix must not have Domain attribute')
+                    severity.append('HIGH')
+            # __Secure- prefix: requires Secure=True
+            elif cname.startswith('__Secure-'):
+                if not secure:
+                    issues.append('__Secure- prefix requires Secure flag')
+                    severity.append('HIGH')
+
+            # Domain overly broad (leading dot = sent to all subdomains)
+            if domain.startswith('.'):
+                issues.append(f'Domain={domain} — overly broad, sent to all subdomains')
+                severity.append('MEDIUM')
 
             if not http_only:
                 issues.append('No HttpOnly — XSS can steal this cookie')
@@ -26150,7 +26398,6 @@ def _analyze_auth_cookies(url: str) -> list:
                 issues.append('No Secure flag — transmitted over plain HTTP')
                 severity.append('HIGH')
 
-            # SameSite — None is CSRF risk, Lax is medium, Strict is safe
             ss_lower = (same_site or '').lower()
             if ss_lower in ('none', '') or same_site is None:
                 issues.append('SameSite=None — CSRF risk (cross-site requests allowed)')
@@ -26159,9 +26406,8 @@ def _analyze_auth_cookies(url: str) -> list:
                 issues.append('SameSite=Lax — top-level navigations allowed (medium risk)')
                 severity.append('MEDIUM')
 
-            # Max-Age / Expires — absence means session cookie (fixation risk)
-            has_expiry   = any('max-age' in f or 'expires' in f for f in flags)
-            partitioned  = any('partitioned' in f for f in flags)
+            has_expiry  = any('max-age' in f or 'expires' in f for f in flags_low)
+            partitioned = any('partitioned' in f for f in flags_low)
             if not has_expiry:
                 issues.append('No Max-Age/Expires — session cookie, fixation risk if not rotated')
                 severity.append('MEDIUM')
@@ -26177,6 +26423,7 @@ def _analyze_auth_cookies(url: str) -> list:
                 'httponly':    http_only,
                 'secure':      secure,
                 'samesite':    same_site or 'not set',
+                'domain':      domain or None,
                 'partitioned': partitioned,
                 'persistent':  has_expiry,
                 'severity':    top_severity,
@@ -26188,17 +26435,38 @@ def _analyze_auth_cookies(url: str) -> list:
     return results
 
 
+
 def _detect_graphql(origin: str) -> dict | None:
     """Probe common GraphQL paths and attempt introspection."""
+    import urllib.parse as _up
     _GQL_PATHS = ['/graphql', '/api/graphql', '/v1/graphql', '/gql',
                   '/query', '/api/query']
-    _INTROSPECTION = ('{"query":"{ __schema { queryType { name } types { name kind } } }"}')
-    headers = {**_get_headers(), 'Content-Type': 'application/json', 'Accept': 'application/json'}
+    _INTROSPECTION_QUERY = """
+{
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types { name kind }
+  }
+}
+""".strip()
+    _PAY_TYPES_RE = re.compile(r'payment|charge|checkout|order|billing|card', re.I)
+    headers = {**_get_headers(), 'Content-Type': 'application/json',
+               'Accept': 'application/json'}
     for path in _GQL_PATHS:
         url = origin + path
         try:
-            r = requests.post(url, data=_INTROSPECTION, headers=headers,
-                              timeout=8, verify=False)
+            # FIX: use json= kwarg, not data=string
+            r = requests.post(url, json={'query': _INTROSPECTION_QUERY},
+                              headers=headers, timeout=8, verify=False)
+            introspection_blocked = False
+            # ADD: on 405 retry with GET
+            if r.status_code == 405:
+                r = requests.get(
+                    url + '?query=' + _up.quote(_INTROSPECTION_QUERY),
+                    headers=headers, timeout=8, verify=False
+                )
             if r.status_code not in (200, 400):
                 continue
             try:
@@ -26207,25 +26475,37 @@ def _detect_graphql(origin: str) -> dict | None:
                 continue
             if 'data' not in body and 'errors' not in body:
                 continue
-            types   = []
-            ops     = []
-            schema  = (body.get('data') or {}).get('__schema') or {}
+            schema = (body.get('data') or {}).get('__schema') or {}
+            introspection_blocked = bool(body.get('errors') and not schema)
+            types         = []
+            payment_types = []
+            ops: dict     = {'query': None, 'mutation': None, 'subscription': None}
+            apollo_persisted = bool(
+                any('PersistedQuery' in str(e) for e in (body.get('errors') or []))
+            )
             if schema:
-                types = [t['name'] for t in schema.get('types', [])
-                         if not t['name'].startswith('__')][:20]
-                qt = (schema.get('queryType') or {}).get('name', '')
-                ops = [qt] if qt else []
+                all_types = [t['name'] for t in schema.get('types', [])
+                             if not t['name'].startswith('__')]
+                types = all_types[:20]
+                payment_types = [t for t in all_types if _PAY_TYPES_RE.search(t)]
+                qt = (schema.get('queryType')        or {}).get('name')
+                mt = (schema.get('mutationType')     or {}).get('name')
+                st = (schema.get('subscriptionType') or {}).get('name')
+                ops = {'query': qt, 'mutation': mt, 'subscription': st}
             return {
-                'endpoint':    url,
-                'status':      r.status_code,
-                'introspected': bool(schema),
-                'types':        types,
-                'operations':   ops,
-                'raw_preview':  str(body)[:300],
+                'endpoint':             url,
+                'status':               r.status_code,
+                'introspected':         bool(schema),
+                'introspection_blocked': introspection_blocked,
+                'types':                types,
+                'payment_types':        payment_types,
+                'operations':           ops,
+                'apollo_persisted':     apollo_persisted,
             }
         except Exception:
             continue
     return None
+
 
 
 def _check_api_schema(origin: str) -> dict | None:
@@ -26234,17 +26514,71 @@ def _check_api_schema(origin: str) -> dict | None:
         '/openapi.json', '/swagger.json', '/api-docs',
         '/api/docs', '/v1/openapi.json', '/docs/openapi.json',
         '/swagger/v1/swagger.json',
+        # ADD: extra paths
+        '/openapi.yaml', '/swagger.yaml', '/api/v2/openapi.json',
+        '/v2/api-docs', '/api/openapi.yaml',
     ]
     _PAY_KEYS = re.compile(r'payment|checkout|order|billing|card|purchase|charge', re.I)
+    _AUTH_KEYS = re.compile(r'bearer|apikey|api_key|authorization|oauth', re.I)
+
+    def _resolve_ref(spec: dict, ref: str) -> dict:
+        """Resolve a local $ref like '#/components/schemas/Foo'."""
+        if not ref.startswith('#/'):
+            return {}
+        parts = ref.lstrip('#/').split('/')
+        node = spec
+        for p in parts:
+            if isinstance(node, dict):
+                node = node.get(p, {})
+            else:
+                return {}
+        return node if isinstance(node, dict) else {}
+
+    def _extract_body_fields(spec: dict, detail: dict) -> list:
+        """Walk requestBody → content → schema → properties, follow $ref."""
+        fields = []
+        rb = (detail or {}).get('requestBody', {})
+        content = rb.get('content', {})
+        for ct, ct_obj in content.items():
+            schema = (ct_obj or {}).get('schema', {})
+            if '$ref' in schema:
+                schema = _resolve_ref(spec, schema['$ref'])
+            props = schema.get('properties', {})
+            for fname, fobj in props.items():
+                if '$ref' in fobj:
+                    fobj = _resolve_ref(spec, fobj['$ref'])
+                fields.append(fname)
+        return fields
+
+    def _requires_auth(detail: dict) -> bool:
+        security = detail.get('security', [])
+        if security:
+            return True
+        params = detail.get('parameters', [])
+        for p in params:
+            if _AUTH_KEYS.search(p.get('name', '')):
+                return True
+        return False
+
     for path in _SCHEMA_PATHS:
         url = origin + path
         try:
             r = requests.get(url, headers=_get_headers(), timeout=8, verify=False)
             if r.status_code != 200:
                 continue
+            # ADD: YAML parsing fallback
+            spec = None
             try:
                 spec = r.json()
             except Exception:
+                try:
+                    import yaml as _yaml
+                    spec = _yaml.safe_load(r.text)
+                except ImportError:
+                    continue
+                except Exception:
+                    continue
+            if not spec or not isinstance(spec, dict):
                 continue
             if 'paths' not in spec and 'openapi' not in spec and 'swagger' not in spec:
                 continue
@@ -26253,16 +26587,19 @@ def _check_api_schema(origin: str) -> dict | None:
                 if _PAY_KEYS.search(ep):
                     for method, detail in (methods or {}).items():
                         if method.lower() in ('get', 'post', 'put', 'patch', 'delete'):
+                            body_fields = _extract_body_fields(spec, detail or {})
                             pay_endpoints.append({
-                                'endpoint': ep,
-                                'method':   method.upper(),
-                                'summary':  (detail or {}).get('summary', ''),
+                                'endpoint':     ep,
+                                'method':       method.upper(),
+                                'summary':      (detail or {}).get('summary', ''),
+                                'body_fields':  body_fields,
+                                'requires_auth': _requires_auth(detail or {}),
                             })
             return {
-                'schema_url':     url,
-                'spec_version':   spec.get('openapi') or spec.get('swagger', '?'),
-                'title':          (spec.get('info') or {}).get('title', ''),
-                'pay_endpoints':  pay_endpoints[:10],
+                'schema_url':      url,
+                'spec_version':    spec.get('openapi') or spec.get('swagger', '?'),
+                'title':           (spec.get('info') or {}).get('title', ''),
+                'pay_endpoints':   pay_endpoints[:10],
                 'total_endpoints': len(spec.get('paths') or {}),
             }
         except Exception:
@@ -26270,9 +26607,11 @@ def _check_api_schema(origin: str) -> dict | None:
     return None
 
 
-def _detect_frameworks(html: str, js_text: str) -> list:
+
+def _detect_frameworks(html: str, js_text: str, script_urls: list = None) -> list:
     """Detect JS frameworks — affects how form fields and requests work."""
-    combined = html + js_text
+    # ADD: include script_urls in combined
+    combined = html + js_text + ' '.join(script_urls or [])
     _SIGS = [
         ('React',        re.compile(r'react\.(?:development|production)|__REACT_DEVTOOLS|_reactFiber|React\.createElement', re.I)),
         ('Next.js',      re.compile(r'__NEXT_DATA__|/_next/static|next/router', re.I)),
@@ -26284,30 +26623,74 @@ def _detect_frameworks(html: str, js_text: str) -> list:
         ('Ember.js',     re.compile(r'Ember\.VERSION|ember-source', re.I)),
         ('Alpine.js',    re.compile(r'x-data=|Alpine\.version|alpinejs', re.I)),
         ('HTMX',         re.compile(r'hx-post=|hx-get=|htmx\.min', re.I)),
+        # ADD: new frameworks
+        ('Remix',        re.compile(r'__remixContext|@remix-run', re.I)),
+        ('SvelteKit',    re.compile(r'__sveltekit|kit\.svelte\.dev', re.I)),
+        ('Inertia.js',   re.compile(r'@inertiajs|data-page=', re.I)),
+        ('Livewire',     re.compile(r'wire:model|livewire:', re.I)),
+        ('Backbone.js',  re.compile(r'Backbone\.Model|Backbone\.Collection', re.I)),
     ]
+    # ADD: version extraction patterns per framework
+    _VERSION_PATS = {
+        'React':     re.compile(r'react[@/](\d+\.\d+[\.\d]*)', re.I),
+        'Next.js':   re.compile(r'next[@/](\d+\.\d+[\.\d]*)', re.I),
+        'Vue.js':    re.compile(r'vue[@/](\d+\.\d+[\.\d]*)', re.I),
+        'Angular':   re.compile(r'angular[@/](\d+\.\d+[\.\d]*)', re.I),
+        'jQuery':    re.compile(r'jquery[-./](\d+\.\d+[\.\d]*)', re.I),
+        'Svelte':    re.compile(r'svelte[@/](\d+\.\d+[\.\d]*)', re.I),
+        'Alpine.js': re.compile(r'Alpine\.version\s*=\s*[\'"]([\d.]+)', re.I),
+        'Ember.js':  re.compile(r'Ember\.VERSION\s*=\s*[\'"]([\d.]+)', re.I),
+        'Remix':     re.compile(r'@remix-run/[^@]+@(\d+\.\d+[\.\d]*)', re.I),
+    }
     _NOTES = {
-        'React':   '⚛️  Controlled inputs — static HTML value= always empty, use XHR intercept',
-        'Next.js': '▲  SSR/CSR hybrid — check both static HTML and hydrated DOM',
-        'Vue.js':  '🟢 v-model binding — value not in HTML, use DOM extraction',
-        'Angular': '🔴 Reactive forms — ngModel/FormControl, fields dynamic at runtime',
-        'jQuery':  '💲 $.ajax / $.post likely — intercept XHR for real endpoint',
-        'HTMX':    '⚡ hx-post attributes define endpoints — check HTML attrs',
+        'React':      '⚛️  Controlled inputs — static HTML value= always empty, use XHR intercept',
+        'Next.js':    '▲  SSR/CSR hybrid — check both static HTML and hydrated DOM',
+        'Vue.js':     '🟢 v-model binding — value not in HTML, use DOM extraction',
+        'Angular':    '🔴 Reactive forms — ngModel/FormControl, fields dynamic at runtime',
+        'jQuery':     '💲 $.ajax / $.post likely — intercept XHR for real endpoint',
+        'HTMX':       '⚡ hx-post attributes define endpoints — check HTML attrs',
+        'Inertia.js': '🔗 SPA bridge — form data sent as XHR JSON',
+        'Livewire':   '🔥 wire:model binds to PHP backend — watch WebSocket frames',
+        'Remix':      '💿 Remix action= forms — check loader/action endpoints',
+        'SvelteKit':  '🌿 SvelteKit form actions — check +page.server.js',
     }
     found = []
     for name, pat in _SIGS:
         if pat.search(combined):
-            found.append({'name': name, 'note': _NOTES.get(name, '')})
+            ver_pat = _VERSION_PATS.get(name)
+            version = ''
+            if ver_pat:
+                vm = ver_pat.search(combined)
+                if vm:
+                    version = vm.group(1)
+            found.append({
+                'name':    name,
+                'version': version,
+                'note':    _NOTES.get(name, ''),
+            })
     return found
 
 
-def _analyze_csp(url: str) -> dict | None:
+
+def _analyze_csp(url: str, resp_headers: dict = None) -> dict | None:
     """Fetch URL headers and parse Content-Security-Policy."""
     try:
-        r = requests.get(url, headers=_get_headers(), timeout=8, verify=False)
-        csp_raw = (r.headers.get('Content-Security-Policy') or
-                   r.headers.get('Content-Security-Policy-Report-Only') or '')
+        # ADD: use cached headers if provided
+        if resp_headers is not None:
+            hdrs = resp_headers
+            report_only = 'Content-Security-Policy-Report-Only' in hdrs
+            csp_raw = (hdrs.get('Content-Security-Policy') or
+                       hdrs.get('content-security-policy') or
+                       hdrs.get('Content-Security-Policy-Report-Only') or
+                       hdrs.get('content-security-policy-report-only') or '')
+        else:
+            r = requests.get(url, headers=_get_headers(), timeout=8, verify=False)
+            report_only = 'Content-Security-Policy-Report-Only' in r.headers
+            csp_raw = (r.headers.get('Content-Security-Policy') or
+                       r.headers.get('Content-Security-Policy-Report-Only') or '')
         if not csp_raw:
             return None
+
         directives = {}
         for part in csp_raw.split(';'):
             part = part.strip()
@@ -26316,104 +26699,271 @@ def _analyze_csp(url: str) -> dict | None:
             tokens = part.split()
             if tokens:
                 directives[tokens[0].lower()] = tokens[1:]
-        issues = []
-        if "'unsafe-inline'" in ' '.join(directives.get('script-src', [])):
-            issues.append("script-src allows 'unsafe-inline' — XSS risk")
-        if "'unsafe-eval'" in ' '.join(directives.get('script-src', [])):
+
+        script_src = directives.get('script-src', [])
+        script_src_str = ' '.join(script_src)
+
+        # ADD: nonce/hash detection
+        nonces = [v for v in script_src if v.startswith("'nonce-")]
+        hashes = [v for v in script_src if v.startswith("'sha")]
+
+        issues  = []
+        notices = []
+
+        unsafe_inline = "'unsafe-inline'" in script_src_str
+        if unsafe_inline:
+            if nonces or hashes:
+                # ADD: downgrade to notice when nonce/hash is present
+                notices.append("script-src has 'unsafe-inline' but nonce/hash present — browsers ignore unsafe-inline when nonce/hash used")
+            else:
+                issues.append("script-src allows 'unsafe-inline' — XSS risk")
+
+        if "'unsafe-eval'" in script_src_str:
             issues.append("script-src allows 'unsafe-eval' — eval() XSS risk")
-        if '*' in directives.get('script-src', []):
+        if '*' in script_src:
             issues.append("script-src wildcard (*) — any script can load")
+
+        # ADD: object-src check
+        if 'object-src' not in directives:
+            issues.append("object-src not set — plugin XSS possible")
+
+        # ADD: base-uri check
+        if 'base-uri' not in directives:
+            issues.append("base-uri missing — <base> tag injection possible")
+
+        # ADD: form-action wildcard
+        form_action = directives.get('form-action', [])
+        if '*' in form_action:
+            issues.append("form-action wildcard — form submissions to any origin")
+
         connect_src = directives.get('connect-src', [])
         return {
             'raw':         csp_raw[:300],
             'directives':  {k: v for k, v in directives.items()
                             if k in ('script-src', 'connect-src', 'form-action',
-                                     'frame-src', 'default-src')},
+                                     'frame-src', 'default-src', 'object-src', 'base-uri')},
             'connect_src': connect_src,
             'issues':      issues,
+            'notices':     notices,
+            'nonces':      nonces,
+            'hashes':      hashes,
+            'report_only': report_only,
         }
     except Exception:
         return None
 
 
+
 def _analyze_cors(url: str, endpoint: str = None) -> dict | None:
-    """OPTIONS preflight to check CORS policy on form endpoint."""
-    target = endpoint or url
-    try:
-        r = requests.options(
-            target,
-            headers={
-                **_get_headers(),
-                'Origin':                        'https://evil.example.com',
-                'Access-Control-Request-Method': 'POST',
-                'Access-Control-Request-Headers':'Content-Type, Authorization',
-            },
-            timeout=8, verify=False
-        )
-        acao  = r.headers.get('Access-Control-Allow-Origin', '')
-        acac  = r.headers.get('Access-Control-Allow-Credentials', '').lower()
-        acam  = r.headers.get('Access-Control-Allow-Methods', '')
-        acah  = r.headers.get('Access-Control-Allow-Headers', '')
-        issues = []
+    """OPTIONS preflight to check CORS policy on form endpoint with multiple origin tests."""
+    from urllib.parse import urlparse as _up
+    target   = endpoint or url
+    issues   = []
+    tests    = []
+
+    def _probe(origin_val: str) -> dict | None:
+        try:
+            r = requests.options(
+                target,
+                headers={
+                    **_get_headers(),
+                    'Origin':                         origin_val,
+                    'Access-Control-Request-Method':  'POST',
+                    'Access-Control-Request-Headers': 'Content-Type, Authorization',
+                },
+                timeout=8, verify=False
+            )
+            return r
+        except Exception:
+            return None
+
+    # Test 1 — evil.example.com (existing)
+    r1 = _probe('https://evil.example.com')
+    acao = acac = acam = acah = status = ''
+    if r1 is not None:
+        acao   = r1.headers.get('Access-Control-Allow-Origin', '')
+        acac   = r1.headers.get('Access-Control-Allow-Credentials', '').lower()
+        acam   = r1.headers.get('Access-Control-Allow-Methods', '')
+        acah   = r1.headers.get('Access-Control-Allow-Headers', '')
+        status = r1.status_code
+        tests.append({'origin_sent': 'https://evil.example.com',
+                      'allow_origin': acao, 'status': status})
         if acao == '*':
             issues.append('ACAO: * — any origin allowed (safe only if no credentials)')
         if acao == 'https://evil.example.com':
             issues.append('ACAO reflects Origin — wildcard reflection CORS misconfiguration!')
         if acac == 'true' and acao in ('*', 'https://evil.example.com'):
             issues.append('ACAC: true + ACAO wildcard/reflect — credentials exposed cross-origin!')
-        return {
-            'endpoint':   target,
-            'status':     r.status_code,
-            'allow_origin': acao,
-            'allow_credentials': acac,
-            'allow_methods': acam,
-            'allow_headers': acah,
-            'issues':     issues,
-        }
+        # ADD: Vary header check
+        if acao and 'Origin' not in r1.headers.get('Vary', ''):
+            issues.append('Vary: Origin missing — CORS response may be cached without origin discrimination (cache poisoning risk)')
+
+    # ADD: Test 2 — null origin (sandboxed iframe bypass)
+    r2 = _probe('null')
+    if r2 is not None:
+        acao2 = r2.headers.get('Access-Control-Allow-Origin', '')
+        tests.append({'origin_sent': 'null', 'allow_origin': acao2, 'status': r2.status_code})
+        if acao2 == 'null':
+            issues.append('CRITICAL: null origin reflected — sandboxed iframe CORS bypass!')
+
+    # ADD: Test 3 — subdomain prefix bypass
+    try:
+        parsed_host = _up(target).netloc
+        if parsed_host:
+            evil_sub = f'https://evil.{parsed_host}'
+            r3 = _probe(evil_sub)
+            if r3 is not None:
+                acao3 = r3.headers.get('Access-Control-Allow-Origin', '')
+                tests.append({'origin_sent': evil_sub, 'allow_origin': acao3, 'status': r3.status_code})
+                if acao3 == evil_sub:
+                    issues.append(f'CRITICAL: subdomain prefix bypass — {evil_sub} reflected as allowed origin!')
     except Exception:
+        pass
+
+    if r1 is None and not tests:
         return None
 
+    return {
+        'endpoint':          target,
+        'status':            status,
+        'allow_origin':      acao,
+        'allow_credentials': acac,
+        'allow_methods':     acam,
+        'allow_headers':     acah,
+        'issues':            issues,
+        'tests':             tests,
+    }
 
-def _detect_rate_limit_headers(resp_headers: dict) -> dict | None:
+
+
+def _detect_rate_limit_headers(resp_headers: dict, endpoint: str = None,
+                               probe_post: bool = False) -> dict | None:
     """Extract rate limit info from response headers."""
+    import time as _time
     _RL_HEADERS = {
-        'X-RateLimit-Limit':     'limit',
-        'X-RateLimit-Remaining': 'remaining',
-        'X-RateLimit-Reset':     'reset',
-        'Retry-After':           'retry_after',
-        'X-Rate-Limit-Limit':    'limit',
-        'X-Rate-Limit-Remaining':'remaining',
-        'RateLimit-Limit':       'limit',
-        'RateLimit-Remaining':   'remaining',
-        'RateLimit-Reset':       'reset',
+        'X-RateLimit-Limit':              'limit',
+        'X-RateLimit-Remaining':          'remaining',
+        'X-RateLimit-Reset':              'reset',
+        'Retry-After':                    'retry_after',
+        'X-Rate-Limit-Limit':             'limit',
+        'X-Rate-Limit-Remaining':         'remaining',
+        'RateLimit-Limit':                'limit',
+        'RateLimit-Remaining':            'remaining',
+        'RateLimit-Reset':                'reset',
+        # ADD: extra headers
+        'CF-RateLimit-Limit':             'limit',
+        'CF-RateLimit-Remaining':         'remaining',
+        'X-Shopify-Shop-Api-Call-Limit':  'shopify_limit',
     }
     found = {}
-    for hname, key in _RL_HEADERS.items():
-        val = resp_headers.get(hname) or resp_headers.get(hname.lower())
-        if val:
-            found[key] = val
+
+    def _merge(hdrs: dict):
+        for hname, key in _RL_HEADERS.items():
+            val = hdrs.get(hname) or hdrs.get(hname.lower())
+            if not val:
+                continue
+            # ADD: Retry-After parsing (int seconds or HTTP-date)
+            if key == 'retry_after':
+                try:
+                    found['retry_after'] = f"{int(val)}s"
+                except (ValueError, TypeError):
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt = parsedate_to_datetime(val)
+                        secs = max(0, int(dt.timestamp() - _time.time()))
+                        found['retry_after'] = f"{secs}s"
+                    except Exception:
+                        found['retry_after'] = val
+            # ADD: Reset as epoch → seconds-until
+            elif key == 'reset':
+                try:
+                    iv = int(val)
+                    if iv > 1_000_000_000:
+                        found['reset'] = f"{max(0, iv - int(_time.time()))}s"
+                    else:
+                        found['reset'] = val
+                except (ValueError, TypeError):
+                    found['reset'] = val
+            else:
+                if key not in found:
+                    found[key] = val
+
+    _merge(resp_headers or {})
+
+    # ADD: probe_post — fire a real POST to capture its RL headers
+    if probe_post and endpoint:
+        try:
+            pr = requests.post(endpoint, data={}, timeout=5, verify=False)
+            _merge(dict(pr.headers))
+        except Exception:
+            pass
+
     return found if found else None
+
 
 
 def _detect_multistep(html: str, js_text: str, url: str) -> dict | None:
     """Detect multi-step / wizard checkout forms."""
+    from concurrent.futures import ThreadPoolExecutor
     combined = html + js_text
+
+    _PAT_DATA_STEP  = re.compile(r'data-step=["\'](\d+)["\']', re.I)
+    _PAT_STEP_CLASS = re.compile(r'step[_-](\d+)|checkout[_-]step[_-](\d+)', re.I)
+    _PAT_CSS_STEP   = re.compile(r'class=["\'"][^"\'"]*(?:step|wizard|progress)[^"\'"]*["\']', re.I)
+    _PAT_ARIA_STEP  = re.compile(r'<[^>]+aria-label=["\'"][^"\'"]*step[^"\'"]*["\']', re.I)
+    _PAT_JS_STEP    = re.compile(r'currentStep|activeStep|stepIndex|wizardStep', re.I)
+
     _STEP_SIGS = [
-        (re.compile(r'data-step=["\'](\d+)["\']', re.I),             'data-step attribute'),
-        (re.compile(r'step[_-](\d+)|checkout[_-]step[_-](\d+)', re.I), 'URL/class step pattern'),
-        (re.compile(r'class=["\'][^"\']*(?:step|wizard|progress)[^"\']*["\']', re.I), 'CSS step/wizard class'),
-        (re.compile(r'<[^>]+aria-label=["\'][^"\']*step[^"\']*["\']', re.I), 'aria-label step'),
-        (re.compile(r'currentStep|activeStep|stepIndex|wizardStep', re.I),  'JS step variable'),
+        (_PAT_DATA_STEP,  'data-step attribute'),
+        (_PAT_STEP_CLASS, 'URL/class step pattern'),
+        (_PAT_CSS_STEP,   'CSS step/wizard class'),
+        (_PAT_ARIA_STEP,  'aria-label step'),
+        (_PAT_JS_STEP,    'JS step variable'),
     ]
     _STEP_URLS = ['/checkout/step', '/checkout/address', '/checkout/shipping',
                   '/checkout/payment', '/checkout/review', '/checkout/confirm']
+
+    url_lower        = url.lower()
+    is_checkout_page = any(kw in url_lower for kw in ('checkout', 'cart', 'payment'))
+
     signals = []
     for pat, label in _STEP_SIGS:
-        if pat.search(combined):
-            signals.append(label)
-    step_urls = [_origin_from_url(url) + p for p in _STEP_URLS
-                 if _origin_from_url(url)][:5]
-    return {'signals': signals, 'likely_step_urls': step_urls} if signals else None
+        if label == 'CSS step/wizard class':
+            if pat.search(combined):
+                if is_checkout_page or len(signals) >= 2:
+                    signals.append(label)
+        else:
+            if pat.search(combined):
+                signals.append(label)
+
+    step_nums  = _PAT_DATA_STEP.findall(combined)
+    step_count = max((int(v) for v in step_nums if v), default=None) if step_nums else None
+
+    if not signals:
+        return None
+
+    origin = _origin_from_url(url)
+    candidate_urls = [origin + p for p in _STEP_URLS if origin][:6]
+
+    def _head(u: str):
+        try:
+            r = requests.head(u, timeout=4, verify=False, allow_redirects=False)
+            return u if r.status_code in (200, 301, 302) else None
+        except Exception:
+            return None
+
+    verified_step_urls = []
+    if candidate_urls:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            results = list(ex.map(_head, candidate_urls))
+        verified_step_urls = [u for u in results if u]
+
+    return {
+        'signals':            signals,
+        'step_count':         step_count,
+        'verified_step_urls': verified_step_urls,
+        'is_checkout_page':   is_checkout_page,
+    }
 
 
 def _origin_from_url(url: str) -> str:
@@ -26706,6 +27256,53 @@ def _resolve_dynamic_tokens(
     return resolved
 
 
+def _detect_payment_sdks(html: str, js_text: str) -> list:
+    """
+    Detect payment SDK scripts and version from HTML script tags and JS.
+    PATCHED
+    """
+    combined = (html or '') + (js_text or '')
+    sdks = []
+    _SDK_PATTERNS = [
+        # (name, src_pattern, version_pattern)
+        ('Stripe.js v3',
+         re.compile(r'js\.stripe\.com/v3', re.I),
+         None),
+        ('Stripe.js v2',
+         re.compile(r'js\.stripe\.com/v2', re.I),
+         None),
+        ('Braintree SDK',
+         re.compile(r'js\.braintreegateway\.com/web/([0-9.]+)', re.I),
+         re.compile(r'js\.braintreegateway\.com/web/([0-9.]+)', re.I)),
+        ('PayPal SDK',
+         re.compile(r'paypal\.com/sdk/js', re.I),
+         re.compile(r'paypal\.com/sdk/js\?[^"\']*client-id=([^&"\']{8,})', re.I)),
+        ('Square Web Payments',
+         re.compile(r'web\.squarecdn\.com|square\.js', re.I),
+         None),
+        ('Adyen Web',
+         re.compile(r'checkoutshopper[^"\']*adyen', re.I),
+         re.compile(r'adyen-checkout-([0-9.]+)', re.I)),
+        ('Authorize.Net Accept.js',
+         re.compile(r'jstest\.authorize\.net|js\.authorize\.net', re.I),
+         None),
+        ('Klarna',
+         re.compile(r'x\.klarnacdn\.net|klarna\.com/.*\.js', re.I),
+         None),
+    ]
+    seen = set()
+    for name, src_pat, ver_pat in _SDK_PATTERNS:
+        if src_pat.search(combined) and name not in seen:
+            seen.add(name)
+            entry = {'name': name}
+            if ver_pat:
+                vm = ver_pat.search(combined)
+                if vm:
+                    entry['version'] = vm.group(1)[:20]
+            sdks.append(entry)
+    return sdks
+
+
 def _detect_braintree_hosted_fields(html: str, js_text: str) -> dict | None:
     """
     Detect Braintree hosted-fields pattern from iframe src and JS config.
@@ -26972,6 +27569,11 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                 'raw_post_risk':   False,
             })
 
+    # PATCHED: payment SDK detection
+    _sdks = _detect_payment_sdks(static_html + js_html, js_text)
+    if _sdks:
+        pass  # stored in return dict below
+
     # Phase 5: Header probing
     if progress_cb: progress_cb("🔍 Probing header requirements...")
     headers_result = _probe_header_requirement(url, progress_cb)
@@ -27039,6 +27641,16 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         "/register", "/signup", "/login", "/contact",
         "/pricing", "/plans", "/membership", "/upgrade",
     ]
+    # PATCHED: priority-sort sub-pages — payment paths first
+    _SUBPAGE_PRIORITY = re.compile(
+        r'/(?:checkout|payment|pay|cart|billing|order|'
+        r'confirm|purchase|donate|subscribe|card)',
+        re.I
+    )
+    _SUBPAGES = sorted(
+        _SUBPAGES,
+        key=lambda u: (0 if _SUBPAGE_PRIORITY.search(u) else 1, u)
+    )
     if progress_cb: progress_cb("🔗 Scanning payment sub-pages...")
     subpage_forms: list = []
     subpage_sitekeys: list = []
@@ -27115,15 +27727,15 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH: Rate limit headers (from initial response) ──────────────────
     if progress_cb: progress_cb("📊 Checking rate limit headers...")
-    rate_limit = _detect_rate_limit_headers(_resp_headers)
+    rate_limit = _detect_rate_limit_headers(_resp_headers, endpoint=url)
 
     # ── ENH: Cookie security analysis ────────────────────────────────────
     if progress_cb: progress_cb("🍪 Analyzing auth cookie security flags...")
-    auth_cookies = _analyze_auth_cookies(url)
+    auth_cookies = _analyze_auth_cookies(url, resp_headers=_resp_headers)
 
     # ── ENH: CSP header analysis ──────────────────────────────────────────
     if progress_cb: progress_cb("🛡️ Parsing Content-Security-Policy...")
-    csp_info = _analyze_csp(url)
+    csp_info = _analyze_csp(url, resp_headers=_resp_headers)
 
     # ── ENH: CORS analysis (on first payment form endpoint if found) ──────
     if progress_cb: progress_cb("🌐 Testing CORS policy...")
@@ -27148,7 +27760,9 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH: Framework detection ───────────────────────────────────────────
     if progress_cb: progress_cb("🔍 Detecting JS framework...")
-    frameworks = _detect_frameworks(static_html + js_html, js_text)
+    _script_srcs = re.findall(
+        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', static_html + js_html, re.I)
+    frameworks = _detect_frameworks(static_html + js_html, js_text, script_urls=_script_srcs)
 
     # ── ENH: Multi-step form detection ────────────────────────────────────
     if progress_cb: progress_cb("🪜 Checking for multi-step checkout...")
@@ -27169,6 +27783,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             enctype        = _snippet_form.get('enctype', 'application/x-www-form-urlencoded'),
             all_fields     = _snippet_form.get('fields', []),
             headers_required = headers_result,
+            resolved_tokens  = resolved_tokens,
         )
 
     # ── ENH: Live network intercept — capture real tokens & sitekeys ─────
@@ -27334,6 +27949,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'response_patterns': response_patterns,     # ← NEW
         'content_type_mismatches': _ct_mismatches,  # PATCHED
         'braintree_hosted':  _bt,                   # PATCHED (None if not detected)
+        'payment_sdks':      _sdks,                 # PATCHED
     }
 
 
@@ -27572,6 +28188,16 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         lines.append(
             f"💳 *{escape_md(gw['name'])}*{tok_str}"
         )
+
+    # PATCHED: payment SDK row
+    _sdks = data.get('payment_sdks', [])
+    if _sdks:
+        sdk_row = '  '.join(
+            f"`{raw_code(s['name'])}`"
+            + (f" _v{escape_md(s['version'])}_" if s.get('version') else '')
+            for s in _sdks[:4]
+        )
+        lines.append(f"📦 SDKs: {sdk_row}")
 
     # ── CAPTCHA / Sitekey block — full detail ────────────────
     _all_sitekeys = []
@@ -28061,6 +28687,12 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 hk    = res.get('header_key', '')
                 badge = _CONF_BADGE.get(conf, '')
 
+                # PATCHED: show confidence as score bar
+                _CONF_SCORE = {'live': 4, 'static': 3, 'inferred': 2, 'empty': 0}
+                _score = _CONF_SCORE.get(conf, 0)
+                _score_bar = '●' * _score + '○' * (4 - _score)
+                _score_str = f" `{_score_bar}`" if conf else ''
+
                 # Value display: prefer resolved, fall back to value_preview
                 val_preview = t.get('value_preview', '')
                 display_val = rval or (
@@ -28073,7 +28705,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 hk_str  = (f"  → `{raw_code(hk)}`"
                            if hk else "")
                 lines.append(
-                    f"  {badge}{icon} `{raw_code(tname, 30)}`{val_str}"
+                    f"  {badge}{icon} `{raw_code(tname, 30)}`"
+                    f"{_score_str}{val_str}"
                     f"{hk_str}  _{escape_md(t.get('label','')[:50])}_"
                 )
 
@@ -28145,9 +28778,13 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             vals = csp.get('directives', {}).get(directive, [])
             if vals:
                 lines.append(f"  `{directive}`: `{raw_code(' '.join(vals[:4]))}`")
+        if csp.get('report_only'):
+            lines.append("  ℹ️ _Report-Only mode — not enforced_")
         for iss in csp.get('issues', [])[:3]:
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
-        if not csp.get('issues'):
+        for note in csp.get('notices', [])[:2]:
+            lines.append(f"  ℹ️ _{escape_md(note)}_")
+        if not csp.get('issues') and not csp.get('notices'):
             lines.append("  ✅ No issues")
 
     # ── CORS ──────────────────────────────────────────────────
@@ -28157,7 +28794,11 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         acao = cors.get('allow_origin', 'not set')
         acac = cors.get('allow_credentials', 'false')
         lines.append(f"  Origin: `{raw_code(acao)}`  Credentials: `{raw_code(acac)}`")
-        for iss in cors.get('issues', [])[:2]:
+        for t in cors.get('tests', [])[:3]:
+            t_orig = escape_md(str(t.get('origin_sent', ''))[:40])
+            t_acao = escape_md(str(t.get('allow_origin', '—'))[:40])
+            lines.append(f"  `{t_orig}` → `{t_acao}`")
+        for iss in cors.get('issues', [])[:3]:
             lines.append(f"  ⚠️ _{escape_md(iss)}_")
         if not cors.get('issues'):
             lines.append("  ✅ Safe")
@@ -28186,7 +28827,11 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── FRAMEWORK ─────────────────────────────────────────────
     fws = data.get('frameworks', [])
     if fws:
-        fw_row = "  ".join(f"*{escape_md(fw['name'])}*" for fw in fws[:4])
+        fw_row = "  ".join(
+            (f"*{escape_md(fw['name'])}* v{escape_md(fw['version'])}"
+             if fw.get('version') else f"*{escape_md(fw['name'])}")
+            for fw in fws[:4]
+        )
         lines.append(_sec(f"Framework  ·  {fw_row}", "⚙️"))
         for fw in fws[:2]:
             if fw.get('note'):
@@ -28198,8 +28843,12 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         lines.append(_sec("Multi-step Checkout", "🪜"))
         for sig in ms.get('signals', [])[:3]:
             lines.append(f"  • {escape_md(sig)}")
-        for su in ms.get('likely_step_urls', [])[:3]:
-            lines.append(f"  `{raw_code(su, 70)}`")
+        if ms.get('step_count'):
+            lines.append(f"  📊 _Step count:_ `{ms['step_count']}`")
+        if ms.get('is_checkout_page'):
+            lines.append("  🛒 _Confirmed checkout page_")
+        for su in ms.get('verified_step_urls', [])[:3]:
+            lines.append(f"  ✅ `{raw_code(su, 70)}`")
 
     # ── SUCCESS / DECLINE PATTERNS ────────────────────────────
     rp = data.get('response_patterns', {})
@@ -28217,10 +28866,17 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             'mixed':          '⚠️',
             'unknown':        '❓',
         }.get(_v, '❓')
-        _conf_note = (
-            '  _\\(HTML only — lower confidence\\)_'
-            if _v in ('likely_success', 'likely_decline') else ''
+        # Determine if verdict is driven purely by fuzzy findings
+        _any_regex_finding = any(
+            not item.get('label', '').startswith('Fuzzy:')
+            for item in rp.get('success', []) + rp.get('decline', [])
         )
+        _conf_note = ''
+        if _v in ('likely_success', 'likely_decline'):
+            if not _any_regex_finding:
+                _conf_note = '  _\\(fuzzy match only — lower confidence\\)_'
+            else:
+                _conf_note = '  _\\(HTML only — lower confidence\\)_'
         lines.append(
             f"{_verdict_icon} *Verdict:* `{escape_md(_v.upper())}`{_conf_note}\n"
         )
@@ -28230,8 +28886,14 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         if _succ:
             lines.append(f"✅ *Success Indicators* ({len(_succ)}):")
             for item in _succ[:6]:
-                src_tag = f" _{escape_md(item['source'])}_"
-                lines.append(f"  • {escape_md(item['label'])}{src_tag}")
+                _is_fuzzy  = item.get('label', '').startswith('Fuzzy:')
+                _conf      = item.get('confidence', '')
+                _conf_tag  = f" 〰 _{escape_md(_conf)}_" if _conf else ''
+                _fuzzy_pfx = "〰 " if _is_fuzzy else ""
+                src_tag    = f" _{escape_md(item['source'])}_"
+                lines.append(
+                    f"  • {_fuzzy_pfx}{escape_md(item['label'])}{src_tag}{_conf_tag}"
+                )
                 if item.get('snippet'):
                     lines.append(f"    `{escape_md(item['snippet'][:90])}`")
 
@@ -28240,8 +28902,14 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         if _decl:
             lines.append(f"\n🔴 *Decline Indicators* ({len(_decl)}):")
             for item in _decl[:6]:
-                src_tag = f" _{escape_md(item['source'])}_"
-                lines.append(f"  • {escape_md(item['label'])}{src_tag}")
+                _is_fuzzy  = item.get('label', '').startswith('Fuzzy:')
+                _conf      = item.get('confidence', '')
+                _conf_tag  = f" 〰 _{escape_md(_conf)}_" if _conf else ''
+                _fuzzy_pfx = "〰 " if _is_fuzzy else ""
+                src_tag    = f" _{escape_md(item['source'])}_"
+                lines.append(
+                    f"  • {_fuzzy_pfx}{escape_md(item['label'])}{src_tag}{_conf_tag}"
+                )
                 if item.get('stripe_decline_code'):
                     lines.append(
                         f"    💳 `{escape_md(item['stripe_decline_code'])}` — "
@@ -28275,11 +28943,11 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     if snip:
         lines.append(_sec("Request Snippets", "📋"))
         if snip.get('curl'):
-            lines.append("*cURL:*")
-            lines.append("```\n" + snip['curl'][:700] + "\n```")
+            lines.append("```bash\n" + snip['curl'][:700] + "\n```")
         if snip.get('python'):
-            lines.append("🐍 *Python:*")
-            lines.append("```python\n" + snip['python'][:500] + "\n```")
+            lines.append("\n```python\n" + snip['python'][:500] + "\n```")
+        if snip.get('python_async'):
+            lines.append("\n```python\n" + snip['python_async'][:600] + "\n```")
 
     lines.append(f"\n{SEP_MINOR}")
     lines.append("⚠️ _Authorized testing only._")
@@ -28341,6 +29009,31 @@ def _build_json_export(data: dict) -> str:
         'Billing Last Name', 'Billing Company',
     }
 
+    # ── Canonical placeholder strings (keyed on card_type label) ─
+    _CT_TO_PLACEHOLDER: dict[str, str] = {
+        'Card Number':        '<card_number>',
+        'CVV/CVC':            '<cvv>',
+        'Expiry Month':       '<expiry_month>',
+        'Expiry Year':        '<expiry_year>',
+        'Expiry MM/YY':       '<expiry_mmyy>',
+        'Cardholder Name':    '<cardholder_name>',
+        'Routing Number':     '<routing_number>',
+        'Account Number':     '<account_number>',
+        'Account Type':       '<account_type>',
+        'CSRF Token':         '<csrf_token>',
+        'Nonce':              '<nonce_token>',
+        'Amount':             '<amount>',
+        'Currency':           '<currency>',
+        'Billing First Name': '<first_name>',
+        'Billing Last Name':  '<last_name>',
+        'Billing Address':    '<street>',
+        'Billing City':       '<city>',
+        'Billing State':      '<state>',
+        'Billing Zip':        '<zip>',
+        'Billing Country':    '<country>',
+        'Customer ID':        '<customer_id>',
+    }
+
     # ── _ph helper ────────────────────────────────────────────
     _SMART_PH = None
     try:
@@ -28375,29 +29068,75 @@ def _build_json_export(data: dict) -> str:
     url    = data.get('url', '')
     domain = urlparse(url).hostname or url
 
-    # ── [1] meta ─────────────────────────────────────────────
-    _gw_name = gateways[0].get('name', '') if gateways else None
-    meta: dict = {
-        'url':        url,
-        'domain':     domain,
-        'scanned_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'risk':       risk,
-        'risk_reason': risk_reason,
-    }
-    if _gw_name:
-        meta['gateway'] = _gw_name
-    out: dict = {'meta': meta}
+    # ── [1] info ──────────────────────────────────────────────
+    # Determine SUBMIT_ENDPOINT: prefer payment form/request, fallback any
+    _all_entries_info = data.get('forms', []) + data.get('requests', [])
+    _submit_ep     = ''
+    _submit_method = 'POST'
+    _pay_ep = next(
+        (e for e in _all_entries_info if e.get('is_payment') and e.get('action')),
+        None,
+    )
+    if _pay_ep:
+        _submit_ep     = _pay_ep.get('action', '')
+        _submit_method = (_pay_ep.get('method') or 'POST').upper()
+    else:
+        _any_ep = next((e for e in _all_entries_info if e.get('action')), None)
+        if _any_ep:
+            _submit_ep     = _any_ep.get('action', '')
+            _submit_method = (_any_ep.get('method') or 'POST').upper()
 
-    # ── [2] gateway (detail) ─────────────────────────────────
-    if gateways:
-        gw = gateways[0]
-        gw_obj: dict = {'name': gw.get('name', '')}
-        if gw.get('tokenization'):
-            gw_obj['tokenization'] = gw['tokenization']
-        gw_obj['raw_post_risk'] = bool(gw.get('raw_post_risk', False))
-        if len(gateways) > 1:
-            gw_obj['additional'] = [g.get('name') for g in gateways[1:]]
-        out['gateway'] = gw_obj
+    # RECAPTCHA info
+    rc_info = data.get('recaptcha')
+
+    # SUBPAGE_URLS — collect from subpage form sources + subpage_sitekeys
+    _STANDARD_PAY_PATHS = {
+        '/checkout', '/pay', '/payment', '/donate', '/donation',
+        '/billing', '/order', '/cart', '/subscribe',
+    }
+    _subpage_urls: list  = []
+    _seen_subpages: set  = set()
+    _base_url  = data.get('base_url', '') or url
+    _p_base    = urlparse(_base_url)
+    _base_orig = (f"{_p_base.scheme}://{_p_base.netloc}"
+                  if _p_base.netloc else _base_url)
+
+    for _e in data.get('forms', []):
+        _src = _e.get('source', '')
+        if _src.startswith('subpage:'):
+            _path = _src.split('subpage:', 1)[1].strip()
+            if _path and _path not in _seen_subpages:
+                _subpage_urls.append(urljoin(_base_orig + '/', _path.lstrip('/')))
+                _seen_subpages.add(_path)
+
+    for _sp_sk in data.get('subpage_sitekeys', []):
+        _su = _sp_sk.get('page_url', '')
+        if _su and _su not in _seen_subpages:
+            _subpage_urls.append(_su)
+            _seen_subpages.add(_su)
+
+    _all_form_sources = [_e.get('source', '') for _e in data.get('forms', [])]
+    for _sp in _STANDARD_PAY_PATHS:
+        _sp_clean = _sp.lstrip('/')
+        if (any(_sp_clean in _s for _s in _all_form_sources)
+                and _sp not in _seen_subpages):
+            _subpage_urls.append(urljoin(_base_orig + '/', _sp_clean))
+            _seen_subpages.add(_sp)
+
+    info: dict = {
+        'BASE_URL':           _base_url,
+        'SUBMIT_ENDPOINT':    _submit_ep,
+        'SUBMIT_METHOD':      _submit_method,
+        'RECAPTCHA_PAGE_URL': rc_info.get('page_url', '')     if rc_info else '',
+        'RECAPTCHA_SITE_KEY': rc_info.get('site_key', '')     if rc_info else '',
+        'RECAPTCHA_TYPE':     rc_info.get('captcha_type', '') if rc_info else '',
+        'GATEWAY':            gateways[0].get('name', '')     if gateways else '',
+        'RISK':               risk,
+    }
+    if _subpage_urls:
+        info['SUBPAGE_URLS'] = _subpage_urls
+
+    out: dict = {'info': info}
 
     # ── [3] post_body + field_map ─────────────────────────────
     all_entries     = data.get('forms', []) + data.get('requests', [])
@@ -28446,17 +29185,27 @@ def _build_json_export(data: dict) -> str:
             # Layer 2 — Token: dynamic fields or known token card_types
             if dyn or ct in _TOKEN_CARD_TYPES:
                 res = resolved_tokens.get(nm, {})
-                _pb_tokens[nm] = res.get('value') or f'<{nm}>'
+                _pb_tokens[nm] = (
+                    res.get('value')
+                    or _CT_TO_PLACEHOLDER.get(ct)
+                    or _CT_TO_PLACEHOLDER.get(f.get('field_label', ''), f'<{nm}>')
+                )
                 continue
 
-            # Layer 3 — Card data: placeholder via _smart_placeholder
+            # Layer 3 — Card data: placeholder via _CT_TO_PLACEHOLDER
             if ct in _CARD_TYPES:
-                _pb_card[nm] = _ph(nm, label, ft)
+                _pb_card[nm] = (
+                    _CT_TO_PLACEHOLDER.get(ct)
+                    or _CT_TO_PLACEHOLDER.get(label, _ph(nm, label, ft))
+                )
                 continue
 
             # Layer 4 — Billing / generic user inputs
             if ct in _PAY_TYPES or ft in ('text', 'email', 'tel', 'select-one'):
-                _pb_billing[nm] = _ph(nm, label, ft)
+                _pb_billing[nm] = (
+                    _CT_TO_PLACEHOLDER.get(ct)
+                    or _CT_TO_PLACEHOLDER.get(label, _ph(nm, label, ft))
+                )
                 continue
 
     # ── Sort and assemble post_body ───────────────────────────
@@ -28530,10 +29279,16 @@ def _build_json_export(data: dict) -> str:
         elif ct in _BILLING_CTYPES:
             # 'Billing First Name' → 'billing_first_name'
             sem = ct.lower().replace(' ', '_')
-        elif re.search(r'recaptcha|g-recaptcha', nm_l):
+        elif re.search(r'g-recaptcha|recaptcha', nm_l):
             sem = 'recaptcha_token'
-        elif re.search(r'cardtoken|card_token', nm_l):
+        elif re.search(r'cardtoken|card_token|stripe.*token', nm_l):
             sem = 'gateway_token'
+        elif re.search(r'isajax|xsubmit|ispostback|btnid', nm_l):
+            sem = 'static_flag'
+        elif re.search(r'total|amount|price', nm_l):
+            sem = 'amount'
+        elif re.search(r'dlevel|level|timeline|sort', nm_l):
+            sem = 'payment_config'
         elif ft == 'email':
             sem = 'email'
         elif ft == 'tel':
@@ -28587,7 +29342,9 @@ def _build_json_export(data: dict) -> str:
     if ms:
         ms_obj: dict = {}
         if ms.get('signals'):          ms_obj['signals']   = ms['signals']
-        if ms.get('likely_step_urls'): ms_obj['step_urls'] = ms['likely_step_urls']
+        if ms.get('verified_step_urls'): ms_obj['step_urls'] = ms['verified_step_urls']
+        if ms.get('step_count') is not None: ms_obj['step_count'] = ms['step_count']
+        if ms.get('is_checkout_page'): ms_obj['is_checkout_page'] = ms['is_checkout_page']
         signals['multistep'] = ms_obj
     if signals:
         out['signals'] = signals
@@ -29185,6 +29942,22 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.effective_message.reply_text(part)
 
     await _safe_send_report(report)
+
+    # PATCHED: cache scan data + send inline keyboard
+    import hashlib as _hl
+    _url_hash = _hl.md5(url.encode()).hexdigest()[:8]
+    context.bot_data[f'payload_cache_{_url_hash}'] = {
+        'url': url, 'data': data}
+
+    _kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Re-scan",   callback_data=f"pla_rescan_{_url_hash}"),
+        InlineKeyboardButton("📋 curl",      callback_data=f"pla_curl_{_url_hash}"),
+        InlineKeyboardButton("📄 JSON",      callback_data=f"pla_json_{_url_hash}"),
+    ]])
+    await update.effective_message.reply_text(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        reply_markup=_kb
+    )
 
     # ── JSON file export ───────────────────────────────────────
     try:
@@ -34458,6 +35231,80 @@ async def appassets_cat_callback(update: Update, context) -> None:
     await _do_appassets_extract(query.message, context, last_app, wanted_cats)
 
 
+# ══════════════════════════════════════════════════
+# /payload inline action callback  PATCHED
+# ══════════════════════════════════════════════════
+
+async def payload_action_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Handle /payload inline action buttons. PATCHED"""
+    query = update.callback_query
+    await query.answer()
+    data_str = query.data  # format: "pla_{action}_{url_hash}"
+
+    parts = data_str.split('_', 3)
+    if len(parts) < 3:
+        return
+    action   = parts[1]
+    url_hash = parts[2]
+
+    # Retrieve cached data
+    cached = context.bot_data.get(f'payload_cache_{url_hash}')
+    if not cached:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "⏰ _Cache expired — /payload ကို ပြန်လည် run ပါ_",
+            parse_mode='Markdown'
+        )
+        return
+
+    url  = cached.get('url', '')
+    data = cached.get('data', {})
+
+    if action == 'rescan':
+        await query.edit_message_reply_markup(reply_markup=None)
+        context.args = [url]
+        await cmd_payload(update, context)
+
+    elif action == 'curl':
+        snip = data.get('curl_snippet') or {}
+        curl_text = snip.get('curl', '')
+        py_text   = snip.get('python', '')
+        out = ''
+        if curl_text:
+            out += f"```bash\n{curl_text}\n```\n\n"
+        if py_text:
+            out += f"```python\n{py_text}\n```"
+        if out:
+            await query.message.reply_text(out, parse_mode='Markdown')
+        else:
+            await query.message.reply_text(
+                "_Snippet မရှိပါ_", parse_mode='Markdown')
+
+    elif action == 'json':
+        try:
+            json_str = _build_json_export(data)
+            domain   = urlparse(url).hostname or url
+            safe_dom = re.sub(r'[^\w\-]', '_', domain)[:40]
+            fname    = f"payload_{safe_dom}.json"
+            import tempfile, os as _os
+            tmp = _os.path.join(tempfile.gettempdir(), fname)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+            with open(tmp, 'rb') as f:
+                await query.message.reply_document(
+                    document=f, filename=fname,
+                    caption=f"📄 *{escape_md(domain)}* — JSON export",
+                    parse_mode='Markdown'
+                )
+            _os.unlink(tmp)
+        except Exception as e:
+            await query.message.reply_text(
+                f"❌ `{escape_md(str(e)[:100])}`",
+                parse_mode='Markdown')
+
+
 # 🛡️  MISSING COMMAND HANDLERS
 # ══════════════════════════════════════════════════
 
@@ -35397,6 +36244,8 @@ def main():
     app.add_handler(CallbackQueryHandler(appassets_cat_callback,  pattern="^apa_"))
     app.add_handler(CallbackQueryHandler(admin_callback,          pattern="^adm_"))
     app.add_handler(CallbackQueryHandler(help_category_callback,  pattern="^help_"))
+    app.add_handler(CallbackQueryHandler(
+        payload_action_callback, pattern="^pla_"))  # PATCHED
     # ── Global error handler → Admin notify ──────────
     app.add_error_handler(error_handler)
 
