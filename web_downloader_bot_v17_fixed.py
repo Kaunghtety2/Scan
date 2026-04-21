@@ -26706,6 +26706,129 @@ def _resolve_dynamic_tokens(
     return resolved
 
 
+def _detect_braintree_hosted_fields(html: str, js_text: str) -> dict | None:
+    """
+    Detect Braintree hosted-fields pattern from iframe src and JS config.
+    Returns detection dict or None.
+    """
+    # PATCHED
+    _BT_IFRAME = re.compile(
+        r'https://assets\.braintreegateway\.com/web/[^"\']+/html/'
+        r'(?:credit-card-frame|hosted-fields[^"\']*)',
+        re.I
+    )
+    _BT_SDK = re.compile(
+        r'braintree(?:\.min)?\.js|braintree-web|'
+        r'client\.create|hostedFields\.create',
+        re.I
+    )
+    _BT_CONFIG = re.compile(
+        r'authorization\s*:\s*["\']([a-zA-Z0-9_\-=+/]{20,})["\']',
+        re.I
+    )
+
+    combined = (html or '') + (js_text or '')
+    iframe_match  = _BT_IFRAME.search(combined)
+    sdk_match     = _BT_SDK.search(combined)
+    config_match  = _BT_CONFIG.search(combined)
+
+    if not (iframe_match or sdk_match):
+        return None
+
+    result = {
+        'gateway':         'Braintree',
+        'type':            'hosted_fields',
+        'cross_origin':    True,
+        'dom_accessible':  False,
+        'note':            (
+            'Braintree Hosted Fields detected — card inputs are in '
+            'cross-origin iframes and cannot be DOM-scraped. '
+            'Card data goes directly to Braintree servers.'
+        ),
+    }
+    if config_match:
+        result['client_token_prefix'] = config_match.group(1)[:20] + '...'
+    if iframe_match:
+        result['iframe_src'] = iframe_match.group(0)[:120]
+
+    return result
+
+
+def _detect_content_type_mismatch(forms: list, requests_: list) -> list:
+    """
+    Cross-check form enctype vs actual XHR Content-Type header.
+    Returns list of mismatch dicts.
+    PATCHED
+    """
+    mismatches = []
+    for form in forms:
+        form_enc = (form.get('enctype') or
+                    form.get('method', '')).lower()
+        form_url = form.get('action', '') or form.get('endpoint', '')
+        if not form_url:
+            continue
+        for req in requests_:
+            req_url = req.get('url', '') or req.get('endpoint', '')
+            # Match if endpoints overlap (path comparison)
+            if not (form_url in req_url or req_url in form_url):
+                continue
+            req_ct = (req.get('content_type') or
+                      req.get('headers', {}).get(
+                          'content-type', '')).lower()
+            if not req_ct:
+                continue
+            # Detect mismatch
+            form_is_json = 'json' in form_enc
+            req_is_json  = 'json' in req_ct
+            if form_is_json != req_is_json:
+                mismatches.append({
+                    'endpoint':   form_url[:80],
+                    'form_enc':   form_enc or 'not set',
+                    'actual_ct':  req_ct,
+                    'impact':     (
+                        'Form declares URL-encoded but JS sends JSON — '
+                        'use Content-Type: application/json in requests'
+                        if req_is_json else
+                        'Form declares JSON but JS sends form-encoded'
+                    ),
+                })
+    return mismatches
+
+
+def _extract_3ds_redirect_fields(fields: list) -> list:
+    """
+    Find URL-type fields in the POST body that indicate 3DS redirect flow.
+    PATCHED
+    """
+    _3DS_URL_NAMES = re.compile(
+        r'return.?url|callback.?url|redirect.?url|term.?url|'
+        r'notification.?url|acs.?url|pa.?req|pa.?res|'
+        r'three.?ds|3ds|challenge.?url|md$',
+        re.I
+    )
+    found = []
+    for f in fields:
+        name = f.get('name', '')
+        if _3DS_URL_NAMES.search(name):
+            found.append({
+                'field':   name,
+                'type':    f.get('type', 'hidden'),
+                'value':   f.get('value', '')[:120],
+                'role':    (
+                    'ACS URL (3DS challenge endpoint)'
+                    if re.search(r'acs', name, re.I) else
+                    'PaReq (3DS auth request data)'
+                    if re.search(r'pa.?req', name, re.I) else
+                    'PaRes (3DS auth response data)'
+                    if re.search(r'pa.?res', name, re.I) else
+                    'Merchant data / session token'
+                    if re.search(r'\bmd\b', name, re.I) else
+                    '3DS redirect / callback URL'
+                ),
+            })
+    return found
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
@@ -26821,6 +26944,33 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     gateways = _detect_payment_gateway(static_html + js_html, js_text)
     if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
+
+    # PATCHED: Braintree hosted fields detection
+    _bt = _detect_braintree_hosted_fields(static_html + js_html, js_text)
+    if _bt:
+        _bt_forms_target = static_forms  # mutate in-place before further processing
+        _bt_fields = [
+            {'name': 'number',          'type': 'tel',  'card_type': 'Card Number',
+             'from_iframe': True, 'source': 'braintree_hosted', 'required': True},
+            {'name': 'expirationDate',  'type': 'tel',  'card_type': 'Expiry MM/YY',
+             'from_iframe': True, 'source': 'braintree_hosted', 'required': True},
+            {'name': 'cvv',             'type': 'tel',  'card_type': 'CVV/CVC',
+             'from_iframe': True, 'source': 'braintree_hosted', 'required': True},
+        ]
+        if _bt_forms_target:
+            _bt_forms_target[0].setdefault('fields', []).extend(_bt_fields)
+        else:
+            static_forms.append({
+                'source':     'braintree_hosted',
+                'is_payment': True,
+                'fields':     _bt_fields,
+            })
+        if not any(g.get('name') == 'Braintree' for g in gateways):
+            gateways.append({
+                'name':            'Braintree',
+                'tokenization':    'hosted_fields',
+                'raw_post_risk':   False,
+            })
 
     # Phase 5: Header probing
     if progress_cb: progress_cb("🔍 Probing header requirements...")
@@ -27141,6 +27291,21 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             f"🔎 Patterns: {_s} success / {_d} decline / {_c} response codes"
         )
 
+    # PATCHED: Content-Type mismatch check
+    _all_forms_out = static_forms + js_forms + subpage_forms
+    _ct_mismatches = _detect_content_type_mismatch(_all_forms_out, real_requests)
+
+    # PATCHED: 3DS redirect field extraction
+    for form in _all_forms_out:
+        _3ds_fields = _extract_3ds_redirect_fields(form.get('fields', []))
+        if _3ds_fields:
+            form['threeds_redirect_fields'] = _3ds_fields
+            # Merge into top-level threeds_signals (deduplicated)
+            for f in _3ds_fields:
+                _sig = f"3DS field: {f['field']} ({f['role']})"
+                if _sig not in threeds_signals:
+                    threeds_signals.append(_sig)
+
     return {
         'url':               url,
         'base_url':          base_url,
@@ -27167,6 +27332,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'live_result':       live_result,
         'live_findings':     live_result.get('live_findings', []),
         'response_patterns': response_patterns,     # ← NEW
+        'content_type_mismatches': _ct_mismatches,  # PATCHED
+        'braintree_hosted':  _bt,                   # PATCHED (None if not detected)
     }
 
 
@@ -27203,6 +27370,82 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         prefix = f"{icon} " if icon else ""
         return f"\n{prefix}*{escape_md(title)}*"
 
+    def _is_obfuscated_name(name: str) -> bool:
+        """Heuristic: short alphanum+underscore, high consonant ratio,
+        no real word substring → likely obfuscated."""
+        if len(name) > 20 or len(name) < 3:
+            return False
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+            return False
+        # Real field names usually contain a vowel sequence or known word
+        _KNOWN_WORDS = re.compile(
+            r'name|card|num|cvv|cvc|exp|month|year|zip|city|'
+            r'email|phone|address|token|csrf|amount|total|bill|'
+            r'first|last|birth|country|state|street|pay|submit',
+            re.I
+        )
+        if _KNOWN_WORDS.search(name):
+            return False
+        vowels = sum(1 for c in name.lower() if c in 'aeiou')
+        ratio  = vowels / max(len(name), 1)
+        # Low vowel ratio + short + no known word = likely obfuscated
+        return ratio < 0.2 and len(name) <= 12
+
+    def _infer_obfuscated_type(f: dict, all_fields: list) -> str:
+        """
+        Use neighbor context + HTML5 attrs to guess obfuscated field type.
+        Returns card_type string or empty string.
+        """
+        idx       = all_fields.index(f) if f in all_fields else -1
+        ftype     = f.get('type', 'text')
+        maxlen    = str(f.get('maxlength', ''))
+        ac        = f.get('autocomplete', '').lower()
+        ph        = (f.get('placeholder') or '').lower()
+        label     = (f.get('field_label') or f.get('label', '')).lower()
+
+        # autocomplete hint is the most reliable signal
+        _AC_MAP = {
+            'cc-number':       'Card Number',
+            'cc-csc':          'CVV/CVC',
+            'cc-exp-month':    'Expiry Month',
+            'cc-exp-year':     'Expiry Year',
+            'cc-name':         'Cardholder Name',
+            'cc-exp':          'Expiry MM/YY',
+        }
+        if ac in _AC_MAP:
+            return _AC_MAP[ac]
+
+        # maxlength heuristics
+        if maxlen == '16' and ftype in ('text', 'tel', 'number'):
+            return 'Card Number'
+        if maxlen in ('3', '4') and ftype in ('text', 'tel', 'number', 'password'):
+            return 'CVV/CVC'
+        if maxlen == '2' and ftype in ('text', 'number', 'select-one'):
+            return 'Expiry Month'
+        if maxlen == '4' and ftype in ('text', 'number', 'select-one'):
+            return 'Expiry Year'
+
+        # placeholder / label keywords
+        _PH_MAP = [
+            (re.compile(r'card\s*num|cc\s*num|\*{4}', re.I), 'Card Number'),
+            (re.compile(r'cvv|cvc|security\s*code', re.I),   'CVV/CVC'),
+            (re.compile(r'mm|month',                  re.I), 'Expiry Month'),
+            (re.compile(r'yy|year',                   re.I), 'Expiry Year'),
+            (re.compile(r'name\s*on\s*card|holder',   re.I), 'Cardholder Name'),
+        ]
+        for pat, ctype in _PH_MAP:
+            if pat.search(ph) or pat.search(label):
+                return ctype
+
+        # Neighbor context: if previous field is Card Number → this is likely Expiry
+        if idx > 0:
+            prev = all_fields[idx - 1]
+            if prev.get('card_type') == 'Card Number':
+                if ftype in ('text', 'number', 'select-one'):
+                    return 'Expiry Month'
+
+        return ''
+
     def _classify(fields: list):
         card, pay, user, dyn, hidden, iframe = [], [], [], [], [], []
         for f in fields:
@@ -27219,6 +27462,17 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             elif ft == 'hidden':
                 hidden.append(f)
             elif ft not in ('submit', 'button', 'reset', 'iframe'):
+                # PATCHED: try to recover obfuscated field types
+                if _is_obfuscated_name(f.get('name', '')):
+                    inferred = _infer_obfuscated_type(f, fields)
+                    if inferred in _CARD_STRICT_TYPES:
+                        f = dict(f, card_type=inferred, _obfuscated=True)
+                        card.append(f)
+                        continue
+                    elif inferred in _PAY_INFO_TYPES:
+                        f = dict(f, card_type=inferred, _obfuscated=True)
+                        pay.append(f)
+                        continue
                 user.append(f)
         return card, pay, user, dyn, hidden, iframe
 
@@ -27350,6 +27604,21 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     lines.append(f"🤖 CAPTCHA   `{raw_code(captcha_label, 28)}`")
     lines.append(f"🔐 3DS       `{raw_code(_3ds_label)}`")
     lines.append(f"📱 Wallets   `{raw_code(wallet_label, 28)}`")
+
+    # PATCHED: 3DS redirect fields — surfaced per form below the overview row
+    _any_3ds_redirect = any(f.get('threeds_redirect_fields') for f in ordered)
+    if _any_3ds_redirect:
+        lines.append("🔗 *3DS Redirect Fields:*")
+        for form in ordered:
+            _3f = form.get('threeds_redirect_fields', [])
+            if _3f:
+                for tf in _3f[:4]:
+                    lines.append(
+                        f"  🔗 `{raw_code(tf['field'], 28)}` "
+                        f"_{escape_md(tf['role'])}_"
+                        + (f"\n    `{raw_code(tf['value'], 60)}`"
+                           if tf['value'] else '')
+                    )
     lines.append(f"📋 Forms     `{total_forms}`" +
                  (f"  _({pay_cnt} payment)_" if pay_cnt else ""))
     lines.append(f"📡 XHR       `{total_xhr}` intercepted")
@@ -27450,7 +27719,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         pay_tag   = " 💳" if is_pay else ""
         meth_icon = "🟠" if method in ("POST","PUT","PATCH") else "🔵"
 
-        lines.append(f"\n{SEP}")
+        lines.append(f"\n{SEP_MINOR}")
         lines.append(f"▌ *FORM {idx}{pay_tag}*{src_note}")
         lines.append(f"  {meth_icon} `{raw_code(method)}` `{raw_code(ep[:65])}`")
         if ct_short:
@@ -27588,6 +27857,21 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 lines.append(f"\n{SEP_MINOR}")
                 lines.append("📤 *POST Body Template*  _(ready\\-to\\-fill)_")
                 lines.append(f"```json\n{tpl_str}\n```")
+
+            # PATCHED: Content-Type mismatch display
+            _ep = entry.get('endpoint', '') or entry.get('action', '')
+            _ct_mm = [
+                mm for mm in data.get('content_type_mismatches', [])
+                if not _ep or mm.get('endpoint', '') in _ep or _ep in mm.get('endpoint', '')
+            ]
+            if _ct_mm:
+                for mm in _ct_mm:
+                    lines.append(
+                        f"⚠️ *Content\\-Type mismatch* — "
+                        f"`{raw_code(mm['form_enc'], 30)}` declared "
+                        f"but `{raw_code(mm['actual_ct'], 30)}` sent\n"
+                        f"  _{escape_md(mm['impact'])}_"
+                    )
 
             # Accumulate for merged summary (defined outside per-form loop)
             _merged_card_seen: set  # forward-ref — populated in outer scope
@@ -27997,7 +28281,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             lines.append("🐍 *Python:*")
             lines.append("```python\n" + snip['python'][:500] + "\n```")
 
-    lines.append(f"\n{SEP}")
+    lines.append(f"\n{SEP_MINOR}")
     lines.append("⚠️ _Authorized testing only._")
     return '\n'.join(lines)
 
