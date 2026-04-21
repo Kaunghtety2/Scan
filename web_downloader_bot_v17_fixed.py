@@ -36,6 +36,21 @@ from urllib.parse import urljoin, urlparse, parse_qs
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ── Optional TLS-fingerprint backends (graceful fallback) ────────
+try:
+    import curl_cffi.requests as _curl_cffi_requests
+    _CURL_CFFI_OK = True
+except ImportError:
+    _curl_cffi_requests = None        # pip install curl-cffi
+    _CURL_CFFI_OK = False
+
+try:
+    import httpx as _httpx
+    _HTTPX_OK = True
+except ImportError:
+    _httpx = None                     # pip install httpx[http2]
+    _HTTPX_OK = False
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1894,6 +1909,309 @@ def _get_headers() -> dict:
         'Cache-Control': 'max-age=0',
         **({"Sec-CH-UA-Mobile": "?1"} if is_mobile else {"Sec-CH-UA-Mobile": "?0"}),
     }
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# 🌐  REQUEST ENGINE — TLS Fingerprinting + Session + CSRF Auto-Carry
+#     Backend priority: curl_cffi → httpx → requests (fallback)
+#
+#     pip install curl-cffi        # best TLS fingerprint (JA3/JA4)
+#     pip install httpx[http2]     # HTTP/2 + custom TLS
+# ══════════════════════════════════════════════════════════════════
+
+# TLS impersonation profiles available in curl_cffi
+_TLS_PROFILES = {
+    "chrome":    "chrome136",
+    "chrome120": "chrome120",
+    "chrome110": "chrome110",
+    "chrome107": "chrome107",
+    "safari":    "safari18_0",
+    "safari17":  "safari17_0",
+    "firefox":   "firefox133",
+    "firefox117": "firefox117",
+    "edge":      "edge133",
+}
+
+# Sec-CH-UA hint strings aligned with each profile
+_SEC_CH_UA = {
+    "chrome136":  '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
+    "chrome120":  '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="8"',
+    "chrome110":  '"Chromium";v="110", "Google Chrome";v="110", "Not-A.Brand";v="99"',
+    "chrome107":  '"Chromium";v="107", "Google Chrome";v="107", "Not-A.Brand";v="24"',
+    "safari18_0": "",
+    "safari17_0": "",
+    "firefox133": "",
+    "firefox117": "",
+    "edge133":    '"Chromium";v="133", "Not-A.Brand";v="8", "Microsoft Edge";v="133"',
+}
+
+# ── CSRF / nonce regex patterns ───────────────────────────────────
+_RE_CSRF = [
+    re.compile(
+        r"""name=["'](?:_token|csrf[_-]?token|authenticity_token|"""
+        r"""_csrf|csrfmiddlewaretoken|__RequestVerificationToken)["']"""
+        r"""(?:\s[^>]*)?\s+value=["']([^"']{8,})["']""",
+        re.I),
+    re.compile(
+        r"""content=["']([^"']{20,})["'].*?name=["']csrf[_-]?token["']""",
+        re.I),
+    re.compile(
+        r'''"(?:csrf[_-]?token|_token|xsrf[_-]?token)"\s*:\s*"([^"]{8,})"''',
+        re.I),
+    re.compile(
+        r"""window\.__csrf\s*=\s*["']([^"']{8,})["']""",
+        re.I),
+    re.compile(
+        r"""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']{8,})["']""",
+        re.I),
+]
+_RE_NONCE = [
+    re.compile(
+        r"""name=["'](?:nonce|__nonce|_nonce)["'](?:\s[^>]*)?\s+value=["']([^"']{8,})["']""",
+        re.I),
+    re.compile(
+        r'''"(?:nonce|requestNonce|antiForgery)"\s*:\s*"([^"]{8,})"''',
+        re.I),
+]
+
+
+class _RequestEngine:
+    """
+    Unified request engine for /payload scans.
+
+    Features
+    --------
+    * TLS Fingerprinting  -- curl_cffi impersonates real Chrome/Safari JA3/JA4.
+                             httpx fallback keeps HTTP/2 + ALPN negotiation.
+                             requests used only if both are absent.
+    * Session Persistence -- cookies, connection pool and CSRF tokens survive
+                             across every request in a single scan run.
+    * CSRF Auto-Carry     -- after each response the engine scans the body for
+                             CSRF / nonce tokens and injects them into the next
+                             request automatically.
+    * Proxy Support       -- honours proxy_manager.get_proxy() transparently.
+
+    Usage
+    -----
+        engine = _make_engine("chrome")   # or "safari", "firefox", "edge"
+        resp   = engine.get("https://example.com/checkout")
+        resp2  = engine.post(endpoint, data={"card": "..."})
+        engine.close()
+
+        # or as context manager:
+        with _make_engine("safari") as eng:
+            html = eng.get(url).text
+    """
+
+    def __init__(self, profile="chrome", timeout=TIMEOUT, proxy=None):
+        """
+        profile : TLS impersonation key — see _TLS_PROFILES.
+                  Ignored gracefully when curl_cffi is absent.
+        timeout : seconds for connect + read.
+        proxy   : requests-style proxy dict e.g. {"https": "http://1.2.3.4:8080"}.
+                  Pass None to auto-use proxy_manager each call.
+        """
+        self.profile     = _TLS_PROFILES.get(profile, "chrome136")
+        self.timeout     = timeout
+        self._proxy      = proxy
+        self._csrf_token = ""
+        self._nonce      = ""
+
+        if _CURL_CFFI_OK:
+            self._session = _curl_cffi_requests.Session()
+            self._backend = "curl_cffi"
+        elif _HTTPX_OK:
+            self._session = _httpx.Client(
+                http2=True, verify=False,
+                follow_redirects=True, timeout=timeout,
+            )
+            self._backend = "httpx"
+        else:
+            self._session        = requests.Session()
+            self._session.verify = False
+            self._backend        = "requests"
+
+        logger.debug(
+            "_RequestEngine  backend=%-10s  profile=%s",
+            self._backend, self.profile,
+        )
+
+    # ── Internal helpers ──────────────────────────────────────────
+
+    def _proxy_dict(self):
+        if self._proxy is not None:
+            return self._proxy
+        try:
+            return proxy_manager.get_proxy()
+        except Exception:
+            return None
+
+    def _build_headers(self, extra=None):
+        """Merge rotated browser headers + Sec-CH-UA hint + CSRF token."""
+        h     = _get_headers()
+        ch_ua = _SEC_CH_UA.get(self.profile, "")
+        if ch_ua:
+            h["Sec-CH-UA"]          = ch_ua
+            h["Sec-CH-UA-Platform"] = '"Windows"'
+        if self._csrf_token:
+            h["X-CSRF-Token"]     = self._csrf_token
+            h["X-Requested-With"] = "XMLHttpRequest"
+        if extra:
+            h.update(extra)
+        return h
+
+    def _extract_tokens(self, text):
+        """Scan response body for CSRF / nonce tokens and cache them."""
+        for pat in _RE_CSRF:
+            m = pat.search(text)
+            if m:
+                c = m.group(1)
+                if len(c) >= 8 and "{{" not in c:
+                    self._csrf_token = c
+                    break
+        for pat in _RE_NONCE:
+            m = pat.search(text)
+            if m:
+                c = m.group(1)
+                if len(c) >= 8 and "{{" not in c:
+                    self._nonce = c
+                    break
+
+    def _do_request(self, method, url, **kwargs):
+        """
+        Dispatch to the active backend.
+        curl_cffi  → impersonate= kwarg enables JA3/JA4 TLS fingerprint.
+        httpx      → HTTP/2 + proper ALPN (no TLS fingerprint spoofing).
+        requests   → plain urllib3 fallback.
+        """
+        proxies = self._proxy_dict()
+        if self._backend == "curl_cffi":
+            return self._session.request(
+                method, url,
+                impersonate=self.profile,
+                timeout=self.timeout,
+                proxies=proxies or {},
+                verify=False,
+                **kwargs,
+            )
+        if self._backend == "httpx":
+            kw = dict(kwargs)
+            if proxies:
+                p = proxies.get("https") or proxies.get("http")
+                if p:
+                    kw["proxies"] = {"https://": p, "http://": p}
+            return self._session.request(method, url, **kw)
+        # requests fallback
+        return self._session.request(
+            method, url,
+            timeout=self.timeout, verify=False,
+            proxies=proxies, allow_redirects=True,
+            **kwargs,
+        )
+
+    # ── Public API ────────────────────────────────────────────────
+
+    def get(self, url, headers=None, **kwargs):
+        """
+        HTTP GET — carries session cookies and CSRF token automatically.
+        Scans the response body for new CSRF / nonce tokens after each call.
+        """
+        resp = self._do_request(
+            "GET", url, headers=self._build_headers(headers), **kwargs
+        )
+        try:
+            self._extract_tokens(resp.text)
+        except Exception:
+            pass
+        return resp
+
+    def post(self, url, data=None, json_body=None, headers=None, **kwargs):
+        """
+        HTTP POST — carries session cookies + CSRF token.
+        Accepts form data dict or json_body dict.
+        CSRF token is injected into data under common field names.
+        """
+        h  = self._build_headers(headers)
+        kw = dict(kwargs)
+        if json_body is not None:
+            h.setdefault("Content-Type", "application/json")
+            kw["json"] = json_body
+        elif data is not None:
+            if self._csrf_token:
+                for fname in (
+                    "_token", "csrf_token", "authenticity_token",
+                    "_csrf", "csrfmiddlewaretoken",
+                    "__RequestVerificationToken",
+                ):
+                    if fname not in data:
+                        data = {**data, fname: self._csrf_token}
+                        break
+            if self._nonce:
+                data = {**data, "nonce": self._nonce}
+            kw["data"] = data
+        resp = self._do_request("POST", url, headers=h, **kw)
+        try:
+            self._extract_tokens(resp.text)
+        except Exception:
+            pass
+        return resp
+
+    def close(self):
+        """Release underlying connection pool / session."""
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    # ── Read-only properties ──────────────────────────────────────
+
+    @property
+    def backend(self):
+        """Active backend: 'curl_cffi' | 'httpx' | 'requests'."""
+        return self._backend
+
+    @property
+    def csrf_token(self):
+        """Last extracted CSRF token (empty string if none found yet)."""
+        return self._csrf_token
+
+    @property
+    def cookies(self):
+        """Current session cookies as a plain dict."""
+        try:
+            return dict(self._session.cookies)
+        except Exception:
+            return {}
+
+
+def _make_engine(profile="chrome"):
+    """
+    Convenience factory — returns a ready _RequestEngine.
+
+    Profile options
+    ---------------
+    "chrome" / "chrome120" / "chrome110"  -- Chrome TLS fingerprint
+    "safari" / "safari17"                 -- Safari TLS fingerprint
+    "firefox" / "firefox117"              -- Firefox TLS fingerprint
+    "edge"                                -- Edge TLS fingerprint
+    """
+    engine = _RequestEngine(profile=profile)
+    logger.info(
+        "RequestEngine  backend=%-10s  profile=%-14s  curl_cffi=%s  httpx=%s",
+        engine.backend, engine.profile,
+        "OK" if _CURL_CFFI_OK else "missing",
+        "OK" if _HTTPX_OK    else "missing",
+    )
+    return engine
+
+# ══════════════════════════════════════════════════════════════════
 
 
 def _get_page_fingerprint(url: str, timeout: int = 6) -> tuple:
@@ -25660,6 +25978,291 @@ def _origin_from_url(url: str) -> str:
     return f"{p.scheme}://{p.netloc}" if p.netloc else ''
 
 
+# ══════════════════════════════════════════════════════════════
+# ── Dynamic Token Resolver  (Phase 6b) ───────────────────────
+# ══════════════════════════════════════════════════════════════
+#
+# After _find_token_sources() identifies *where* tokens live,
+# _resolve_dynamic_tokens() actually fetches their LIVE values
+# from the page source so the POST body template is ready-to-use.
+#
+# Resolution priority per source_type:
+#   hidden_input  → parse live HTML  (fresh GET to guarantee latest nonce)
+#   meta_tag      → parse live HTML
+#   js_variable   → scan HTML + inline JS blobs
+#   cookie        → read from engine session / response cookies
+#
+# Returns:
+#   dict[str, dict]  {field_name → {value, confidence, method, header_key}}
+#
+#   confidence:  "live"     – freshly fetched value (recommended for POST)
+#                "static"   – value from already-cached HTML (may be stale)
+#                "inferred" – read from session cookie jar
+#                "empty"    – found token slot but value was blank
+#
+#   header_key:  suggested request-header name if token should also be
+#                sent as a header (X-CSRF-Token, X-Requested-With …)
+
+_HEADER_MAP: dict = {
+    # name pattern → recommended header
+    'csrf':                   'X-CSRF-Token',
+    'xsrf':                   'X-XSRF-Token',
+    '_token':                 'X-CSRF-Token',
+    'authenticity_token':     'X-CSRF-Token',
+    'csrfmiddlewaretoken':    'X-CSRFToken',
+    '__requestverificationtoken': 'RequestVerificationToken',
+    'x-csrf-token':           'X-CSRF-Token',
+    'nonce':                  'X-Nonce',
+    'access_token':           'Authorization',
+    'auth_token':             'Authorization',
+    'bearer':                 'Authorization',
+    'api_key':                'X-API-Key',
+    'apikey':                 'X-API-Key',
+}
+
+_DYN_HIDDEN_RE = re.compile(
+    r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']'
+    r'|'
+    r'<input[^>]*name=["\']([^"\']+)["\'][^>]*type=["\']hidden["\'][^>]*value=["\']([^"\']*)["\']',
+    re.I | re.S,
+)
+_DYN_META_RE = re.compile(
+    r'<meta[^>]+name=["\']([^"\']*(?:csrf|token|nonce|xsrf)[^"\']*)["\'][^>]+content=["\']([^"\']*)["\']'
+    r'|'
+    r'<meta[^>]+content=["\']([^"\']*)["\'][^>]*name=["\']([^"\']*(?:csrf|token|nonce|xsrf)[^"\']*)["\']',
+    re.I | re.S,
+)
+_DYN_JS_VAR_RES = [
+    # window.__token = "…"  /  var csrfToken = "…"  /  "csrfToken":"…"
+    re.compile(
+        r'(?:window\.|var\s+|const\s+|let\s+)?'
+        r'(["\']?)(\w*(?:token|nonce|csrf|xsrf|secret|key|auth)\w*)\1'
+        r'\s*[:=]\s*["\']([A-Za-z0-9+/=_\-\.]{8,300})["\']',
+        re.I,
+    ),
+    # PHP/template inline: {"csrfToken":"abc..."}
+    re.compile(
+        r'["\'](\w*(?:token|nonce|csrf|xsrf)\w*)["\']'
+        r'\s*:\s*["\']([A-Za-z0-9+/=_\-\.]{8,300})["\']',
+        re.I,
+    ),
+]
+_DYN_COOKIE_RE = re.compile(
+    r'(?:token|nonce|csrf|xsrf|auth|session|sess)',
+    re.I,
+)
+
+
+def _resolve_dynamic_tokens(
+    url:           str,
+    token_sources: list,
+    engine=None,
+    html:          str = '',
+    js_text:       str = '',
+    progress_cb=None,
+) -> dict:
+    """
+    Extract live values for each dynamic token found in token_sources.
+
+    Args:
+        url           – page URL (used for a fresh GET if needed)
+        token_sources – output of _find_token_sources()
+        engine        – _SmartRequestEngine instance (reuses session + cookies)
+        html          – already-fetched HTML (used first; fresh GET only if needed)
+        js_text       – already-fetched inline JS text
+        progress_cb   – optional callable for status updates
+
+    Returns:
+        dict[field_name → {value, confidence, method, header_key}]
+    """
+    resolved: dict = {}
+
+    if not token_sources:
+        return resolved
+
+    # ── Helpers ───────────────────────────────────────────────
+
+    def _header_key(name: str) -> str:
+        nl = name.lower().replace('-', '_')
+        for kw, hdr in _HEADER_MAP.items():
+            if kw in nl:
+                return hdr
+        return ''
+
+    def _record(name: str, value: str, confidence: str, method: str) -> None:
+        if name in resolved and resolved[name]['confidence'] == 'live':
+            return   # already have best-quality value
+        hk = _header_key(name)
+        resolved[name] = {
+            'value':      value,
+            'confidence': confidence,
+            'method':     method,
+            'header_key': hk,
+        }
+
+    # ── Step 0: Use values already captured in token_sources ──
+    # (value_preview that is NOT "(empty — runtime)" or "(runtime value)")
+    _RUNTIME_PLACEHOLDERS = {
+        '(runtime value)', '(empty)', '(empty — runtime)',
+        '', '(empty — runtime)'
+    }
+    for t in token_sources:
+        name = t.get('name', '')
+        val  = t.get('value_preview', '')
+        if not name or val in _RUNTIME_PLACEHOLDERS or val.endswith('…'):
+            continue
+        _record(name, val, 'static', f"cached_{t.get('source_type','')}")
+
+    # ── Step 1: Fresh GET — get latest nonces/CSRF from server ─
+    live_html = ''
+    live_cookies: dict = {}
+
+    # Only fetch if we have unresolved hidden_input / meta_tag tokens
+    _needs_live = any(
+        t.get('source_type') in ('hidden_input', 'meta_tag')
+        and t.get('name', '') not in resolved
+        for t in token_sources
+    )
+
+    if _needs_live:
+        if progress_cb:
+            progress_cb('🔑 Fetching live page for fresh token values…')
+        try:
+            if engine is not None:
+                resp     = engine.get(url)
+                live_html    = resp.text
+                live_cookies = dict(getattr(resp, 'cookies', {}) or {})
+                # also pull from engine session jar
+                if hasattr(engine, '_session'):
+                    live_cookies.update({
+                        k: v for k, v in engine._session.cookies.items()
+                    })
+            else:
+                resp         = requests.get(
+                    url, headers=_get_headers(),
+                    timeout=TIMEOUT, verify=False, allow_redirects=True,
+                )
+                live_html    = resp.text
+                live_cookies = dict(resp.cookies)
+        except Exception as _e:
+            if progress_cb:
+                progress_cb(f'⚠️ Live fetch failed: {str(_e)[:60]}')
+            live_html = html   # fall back to cached
+
+    combined_html = live_html or html
+    combined_js   = combined_html + '\n' + js_text
+
+    # ── Step 2: hidden_input extraction ───────────────────────
+    hidden_map: dict = {}
+    for m in _DYN_HIDDEN_RE.finditer(combined_html):
+        g = m.groups()
+        # pattern has two alternations — pick whichever group matched
+        name  = (g[0] or g[2] or '').strip()
+        value = (g[1] if g[0] else g[3] or '').strip()
+        if name:
+            hidden_map[name.lower()] = (name, value)
+
+    for t in token_sources:
+        if t.get('source_type') != 'hidden_input':
+            continue
+        name = t.get('name', '')
+        if not name:
+            continue
+        key = name.lower()
+        if key in hidden_map:
+            orig_name, val = hidden_map[key]
+            conf = 'live' if live_html else 'static'
+            _record(name, val, conf, 'hidden_input_regex')
+        elif name not in resolved:
+            _record(name, '', 'empty', 'hidden_input_not_found')
+
+    # ── Step 3: meta tag extraction ───────────────────────────
+    for m in _DYN_META_RE.finditer(combined_html):
+        g = m.groups()
+        # two alternations: (name, content) or (content, name)
+        if g[0]:
+            meta_name, meta_val = g[0].strip(), g[1].strip()
+        else:
+            meta_name, meta_val = g[3].strip(), g[2].strip()
+        for t in token_sources:
+            if t.get('source_type') != 'meta_tag':
+                continue
+            tname = t.get('name', '')
+            if tname.lower() == meta_name.lower():
+                conf = 'live' if live_html else 'static'
+                _record(tname, meta_val, conf, 'meta_tag_regex')
+
+    # ── Step 4: JS variable extraction ────────────────────────
+    for t in token_sources:
+        if t.get('source_type') != 'js_variable':
+            continue
+        tname = t.get('name', '')
+        if not tname or tname in resolved:
+            continue
+        for pat in _DYN_JS_VAR_RES:
+            for m in pat.finditer(combined_js):
+                g = m.groups()
+                # group indices differ between the two patterns
+                js_name  = g[1] if len(g) >= 3 else g[0]
+                js_value = g[2] if len(g) >= 3 else g[1]
+                if js_name and js_name.lower() == tname.lower():
+                    _record(tname, js_value, 'static', 'js_variable_regex')
+                    break
+            if tname in resolved:
+                break
+
+    # ── Step 5: Cookie-based tokens ────────────────────────────
+    # Try session cookies from engine + live response cookies
+    all_cookies: dict = dict(live_cookies)
+    if engine is not None and hasattr(engine, '_session'):
+        all_cookies.update({
+            k: v for k, v in engine._session.cookies.items()
+        })
+
+    for t in token_sources:
+        if t.get('source_type') != 'cookie':
+            continue
+        tname = t.get('name', '')
+        if not tname:
+            continue
+        # Look for matching cookie (case-insensitive)
+        for ck_name, ck_val in all_cookies.items():
+            if ck_name.lower() == tname.lower() or tname.lower() in ck_name.lower():
+                _record(tname, ck_val, 'live', 'session_cookie')
+                break
+        # If not in jar, check Set-Cookie header patterns in HTML
+        if tname not in resolved:
+            sc_pat = re.compile(
+                rf'(?:set-cookie|cookie):[^\n]*\b{re.escape(tname)}\b[^=]*=([^\s;,]{{4,200}})',
+                re.I,
+            )
+            m = sc_pat.search(combined_html)
+            if m:
+                _record(tname, m.group(1), 'static', 'cookie_header_scan')
+            else:
+                _record(tname, '', 'empty', 'cookie_not_in_jar')
+
+    # ── Step 6: Known-name scan — pick up tokens not in sources ─
+    # Scan for well-known CSRF field names that may have been missed
+    for name, _ in hidden_map.values():
+        nl = name.lower()
+        if nl in _KNOWN_CSRF_NAMES and name not in resolved:
+            _, val = hidden_map[nl]
+            if val:
+                _record(name, val, 'live' if live_html else 'static',
+                        'known_csrf_name_scan')
+
+    if progress_cb:
+        live_cnt   = sum(1 for v in resolved.values() if v['confidence'] == 'live')
+        static_cnt = sum(1 for v in resolved.values() if v['confidence'] == 'static')
+        empty_cnt  = sum(1 for v in resolved.values() if v['confidence'] == 'empty')
+        progress_cb(
+            f'🔑 Tokens resolved: {live_cnt} live · {static_cnt} static · {empty_cnt} empty'
+        )
+
+    return resolved
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
@@ -25667,13 +26270,32 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     static_html   = ''
     _resp_headers = {}
     _initial_resp = None
+
+    # ── Request Engine: TLS fingerprint + session + CSRF auto-carry ──
+    # Picks up curl_cffi (JA3/JA4) if installed, else httpx (HTTP/2),
+    # else falls back to plain requests — all transparent to the rest.
+    _engine = _make_engine("chrome")
+    if progress_cb:
+        progress_cb(
+            f"🌐 Request engine: {_engine.backend}"
+            + (" (TLS impersonation)" if _engine.backend == "curl_cffi" else "")
+        )
+
     try:
-        _initial_resp = requests.get(url, headers=_get_headers(),
-                            timeout=TIMEOUT, verify=False, allow_redirects=True)
+        _initial_resp = _engine.get(url)
         static_html   = _initial_resp.text
         _resp_headers = dict(_initial_resp.headers)
+        if _engine.csrf_token and progress_cb:
+            progress_cb(f"🔑 CSRF token found: {_engine.csrf_token[:24]}…")
     except Exception:
-        pass
+        # Fallback: raw requests if engine fails for any reason
+        try:
+            _initial_resp = requests.get(url, headers=_get_headers(),
+                                timeout=TIMEOUT, verify=False, allow_redirects=True)
+            static_html   = _initial_resp.text
+            _resp_headers = dict(_initial_resp.headers)
+        except Exception:
+            pass
 
     static_forms = _extract_forms_static(static_html, url) if static_html else []
     for _sf in static_forms:
@@ -25761,9 +26383,20 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🔍 Probing header requirements...")
     headers_result = _probe_header_requirement(url, progress_cb)
 
-    # Phase 6: Token sources
+    # Phase 6: Token sources — locate
     if progress_cb: progress_cb("🔎 Locating token sources...")
     token_sources = _find_token_sources(static_html + js_html, js_text)
+
+    # Phase 6b: Resolve live token values
+    if progress_cb: progress_cb("🔑 Resolving dynamic token values...")
+    resolved_tokens = _resolve_dynamic_tokens(
+        url           = url,
+        token_sources = token_sources,
+        engine        = _engine,
+        html          = static_html + js_html,
+        js_text       = js_text,
+        progress_cb   = progress_cb,
+    )
 
     # Phase 7: CAPTCHA sitekeys — full Playwright scan (action/invisible/score/theme)
     if progress_cb: progress_cb("🤖 Running full Playwright CAPTCHA sitekey scan...")
@@ -26053,6 +26686,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'gateways':         gateways,
         'headers':          headers_result,
         'token_sources':    token_sources,
+        'resolved_tokens':  resolved_tokens,
         'recaptcha':        recaptcha_info,
         'subpage_sitekeys': subpage_sitekeys,
         'threeds_signals':  threeds_signals,
@@ -26097,7 +26731,13 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     }
 
     # ── Helpers ───────────────────────────────────────────────
-    SEP = "─" * 30
+    SEP       = "━" * 32   # major section divider
+    SEP_MINOR = "┈" * 28   # minor / sub-section divider
+
+    def _sec(title: str, icon: str = "") -> str:
+        """Pro-style section header."""
+        prefix = f"{icon} " if icon else ""
+        return f"\n{SEP}\n▌ *{prefix}{escape_md(title)}*"
 
     def _classify(fields: list):
         card, pay, user, dyn, hidden, iframe = [], [], [], [], [], []
@@ -26172,14 +26812,36 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     wallets     = data.get('wallets', [])
     pay_cnt     = sum(1 for e in all_entries if e.get('is_payment'))
 
-    lines = [f"🧩 *{escape_md(domain)}*  `{raw_code(url[:70])}`"]
+    # ── Risk assessment ───────────────────────────────────────
+    _raw_risk_gw = any(g.get('raw_post_risk') for g in gateways)
+    _live_finds  = data.get('live_findings', [])
+    if _raw_risk_gw or _live_finds:
+        risk_badge = "🔴 *HIGH*"
+        risk_note  = "Raw card POST detected" if _raw_risk_gw else "Live secrets intercepted"
+    elif gateways and threeds:
+        risk_badge = "🟡 *MEDIUM*"
+        risk_note  = "Payment form with 3DS signals"
+    elif gateways:
+        risk_badge = "🟡 *MEDIUM*"
+        risk_note  = "Payment form present"
+    else:
+        risk_badge = "🟢 *LOW*"
+        risk_note  = "No payment surface detected"
 
-    # Gateway row
+    # ── Title ─────────────────────────────────────────────────
+    lines = [
+        f"🧩 *PhantomScope · Payload Extractor*",
+        f"`{raw_code(url[:80])}`",
+    ]
+
+    # ── Gateway row ───────────────────────────────────────────
     if gateways:
         gw = gateways[0]
-        raw_risk = " 🚨 *Raw POST*" if gw.get('raw_post_risk') else ""
+        raw_risk = "  🚨 *Raw POST*" if gw.get('raw_post_risk') else ""
+        tok = gw.get('tokenization', '')
+        tok_str = f" · _{escape_md(tok)}_" if tok else ""
         lines.append(
-            f"💳 *{escape_md(gw['name'])}* · {escape_md(gw.get('tokenization',''))}{raw_risk}"
+            f"💳 *{escape_md(gw['name'])}*{tok_str}{raw_risk}"
         )
 
     # ── CAPTCHA / Sitekey block — full detail ────────────────
@@ -26196,9 +26858,31 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 _all_sitekeys.append({**_sk_entry, '_subpage': True})
                 _seen_sk.add(_sk_entry.get('site_key',''))
 
+    # ── OVERVIEW TABLE (always shown) ────────────────────────
+    captcha_label = (
+        _all_sitekeys[0].get('type') or _all_sitekeys[0].get('captcha_type', 'CAPTCHA')
+        if _all_sitekeys else "—"
+    )
+    wallet_label  = " · ".join(wallets[:3]) if wallets else "—"
+    _3ds_label    = f"{len(threeds)} signal(s)" if threeds else "—"
+    gw_label      = gateways[0]['name'] if gateways else "—"
+    total_forms   = len(ordered)
+    total_xhr     = len(requests_)
+
+    lines.append(f"\n{SEP}")
+    lines.append("▌ *OVERVIEW*")
+    lines.append(
+        f"`{'Forms':<10}` `{total_forms}` {'  💳 ' + str(pay_cnt) + ' payment' if pay_cnt else ''}"
+    )
+    lines.append(f"`{'XHR/fetch':<10}` `{total_xhr}`")
+    lines.append(f"`{'Gateway':<10}` `{raw_code(gw_label, 30)}`")
+    lines.append(f"`{'CAPTCHA':<10}` `{raw_code(captcha_label, 30)}`")
+    lines.append(f"`{'3DS':<10}` `{raw_code(_3ds_label)}`")
+    lines.append(f"`{'Wallets':<10}` `{raw_code(wallet_label, 40)}`")
+    lines.append(f"`{'Risk':<10}` {risk_badge} — _{escape_md(risk_note)}_")
+
     if _all_sitekeys:
-        lines.append(f"\n{SEP}")
-        lines.append(f"🤖 *CAPTCHA / Anti-bot* ({len(_all_sitekeys)} key(s) found)")
+        lines.append(_sec(f"CAPTCHA / Anti-bot  ·  {len(_all_sitekeys)} key(s) found", "🤖"))
         for _sk in _all_sitekeys:
             _sk_type  = _sk.get('type') or _sk.get('captcha_type', 'CAPTCHA')
             _sk_key   = _sk.get('site_key', '')
@@ -26232,8 +26916,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── LIVE INTERCEPT FINDINGS ───────────────────────────────
     live_findings = data.get('live_findings', [])
     if live_findings:
-        lines.append(f"\n{SEP}")
-        lines.append(f"🔴 *Live Network Secrets* ({len(live_findings)} found)")
+        lines.append(_sec(f"Live Network Secrets  ·  {len(live_findings)} found", "🔴"))
         jlines = ["{"]
         for lf in live_findings:
             ltype  = raw_code(lf.get('type', 'secret'), 40)
@@ -26244,25 +26927,17 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         jlines.append("}")
         lines.append("```json\n" + "\n".join(jlines) + "\n```")
 
-    # 3DS / Wallets inline
-    badges = []
-    if threeds:
-        badges.append(f"🔐 3DS ({len(threeds)})")
-    if wallets:
-        badges.append("📱 " + " · ".join(f"`{raw_code(w)}`" for w in wallets))
-    if badges:
-        lines.append("  ".join(badges))
-
-    # Summary
+    # Summary (compact)
     s_parts = [f"*{len(ordered)}* unique form(s)"]
     if len(all_entries) > len(unique_entries):
         s_parts.append(f"_{len(all_entries) - len(unique_entries)} dupes hidden_")
     if pay_cnt:
         s_parts.append(f"💳 *{pay_cnt}* payment")
+
     lines.append("📊 " + " · ".join(s_parts))
 
     if not ordered:
-        lines.append("\nℹ️ No forms or intercepted requests found.")
+        lines.append("\nℹ️ _No forms or intercepted requests found._")
         return '\n'.join(lines)
 
     # ── Merged-summary accumulators (populated inside per-form loop) ─
@@ -26288,20 +26963,22 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                       .replace('x-www-form-urlencoded', 'urlencoded')
                       .replace('; charset=utf-8', '').strip()[:30])
 
-        pay_badge = " 💳" if is_pay else ""
         src_note  = ""
         if len(sources) > 1:
-            src_note = f" _×{len(sources)} sources_"
+            src_note = f" _{escape_md('×' + str(len(sources)) + ' sources')}_"
         elif src_lbl.startswith('subpage:'):
             src_note = f" _sub\\-page `{escape_md(src_lbl[8:])}`_"
         elif src_lbl == 'playwright_dom':
             src_note = " _DOM_"
         elif src_lbl == 'live_intercept':
-            src_note = " 🔴 _live intercept_"
+            src_note = " 🔴 _live_"
+
+        pay_tag   = " 💳" if is_pay else ""
+        meth_icon = "🟠" if method in ("POST","PUT","PATCH") else "🔵"
 
         lines.append(f"\n{SEP}")
-        lines.append(f"📋{pay_badge} *Form {idx}*{src_note}")
-        lines.append(f"  `{raw_code(method)}` `{raw_code(ep[:65])}`")
+        lines.append(f"▌ *FORM {idx}{pay_tag}*{src_note}")
+        lines.append(f"  {meth_icon} `{raw_code(method)}` `{raw_code(ep[:65])}`")
         if ct_short:
             lines.append(f"  _{escape_md(ct_short)}_")
 
@@ -26376,26 +27053,20 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
 
                 return obj
 
-            json_obj: dict = {}
-            if card:
-                json_obj["card_fields"] = [_field_to_obj(f) for f in card]
-            if pay:
-                json_obj["payment_fields"] = [_field_to_obj(f) for f in pay]
-            if user:
-                json_obj["user_fields"] = [_field_to_obj(f) for f in user]
-
-            # pretty-print — 2-space indent fits Telegram code block nicely
-            json_str = json.dumps(json_obj, ensure_ascii=False, indent=2)
-            # section header (counts)
-            hdr_parts = []
-            if card:
-                hdr_parts.append(f"💳 {len(card)} card")
-            if pay:
-                hdr_parts.append(f"💰 {len(pay)} payment")
-            if user:
-                hdr_parts.append(f"✏️ {len(user)} user")
-            lines.append("  ".join(hdr_parts))
-            lines.append(f"```json\n{json_str}\n```")
+            # ── Per-group sections (card / payment / user) ──────────
+            _GROUP_CFG = [
+                ("card",    "💳", "CARD FIELDS",    card),
+                ("payment", "💰", "PAYMENT FIELDS", pay),
+                ("user",    "✏️", "USER FIELDS",    user),
+            ]
+            for _gkey, _gicon, _glabel, _gfields in _GROUP_CFG:
+                if not _gfields:
+                    continue
+                _gobjs = [_field_to_obj(f) for f in _gfields]
+                _gjson = json.dumps(_gobjs, ensure_ascii=False, indent=2)
+                lines.append(f"\n{SEP_MINOR}")
+                lines.append(f"{_gicon} *{_glabel}*  `({len(_gfields)})`")
+                lines.append(f"```json\n{_gjson}\n```")
 
             # ── ENH: POST body template — flat {name: placeholder} ───
             # Only for payment forms (card fields present) — practical POST payload
@@ -26431,12 +27102,17 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                     )
                     tpl[fname] = ph
                 # add any dynamic tokens (CSRF/nonce) the server will check
+                # ENH: inject resolved live values when available
+                _resolved = entry.get('_resolved_tokens', {}) or data.get('resolved_tokens', {}) if 'data' in dir() else {}
                 for f in dyn:
                     fname = f.get("name", "")
                     if fname and fname not in tpl:
-                        tpl[fname] = f.get("value", "") or "<token>"
+                        res_info = _resolved.get(fname, {})
+                        res_val  = res_info.get('value', '') if res_info else ''
+                        tpl[fname] = res_val or f.get("value", "") or "<token>"
                 tpl_str = json.dumps(tpl, ensure_ascii=False, indent=2)
-                lines.append("📤 *POST body template:*")
+                lines.append(f"\n{SEP_MINOR}")
+                lines.append("📤 *POST Body Template*  _(ready\\-to\\-fill)_")
                 lines.append(f"```json\n{tpl_str}\n```")
 
             # Accumulate for merged summary (defined outside per-form loop)
@@ -26500,11 +27176,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
 
     # ── MERGED FIELDS SUMMARY (cross-form, deduped) ──────────
     if _summary_card or _summary_pay or _summary_user:
-        lines.append(f"\n{SEP}")
         total_fields = len(_summary_card) + len(_summary_pay) + len(_summary_user)
-        lines.append(
-            f"📦 *Merged Field Summary* — {total_fields} unique field(s) across all forms"
-        )
+        lines.append(_sec(f"MERGED FIELD SUMMARY  ·  {total_fields} unique field(s)", "📦"))
 
         def _field_to_obj_summary(f: dict) -> dict:
             name  = f.get("name", "")
@@ -26529,19 +27202,22 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             val = f.get("value", "")
             if val and val not in ("", "0", "0.00"):
                 obj["value"] = val[:80]
-            # options hidden from output to keep display clean
             return obj
 
-        merged_obj: dict = {}
-        if _summary_card:
-            merged_obj["card_fields"]    = [_field_to_obj_summary(f) for f in _summary_card]
-        if _summary_pay:
-            merged_obj["payment_fields"] = [_field_to_obj_summary(f) for f in _summary_pay]
-        if _summary_user:
-            merged_obj["user_fields"]    = [_field_to_obj_summary(f) for f in _summary_user]
-
-        merged_json = json.dumps(merged_obj, ensure_ascii=False, indent=2)
-        lines.append(f"```json\n{merged_json}\n```")
+        # ── Each group separate ───────────────────────────────
+        _SUMMARY_GROUPS = [
+            ("💳", "CARD FIELDS",    _summary_card),
+            ("💰", "PAYMENT FIELDS", _summary_pay),
+            ("✏️", "USER FIELDS",    _summary_user),
+        ]
+        for _sicon, _slabel, _sfields in _SUMMARY_GROUPS:
+            if not _sfields:
+                continue
+            _sobjs = [_field_to_obj_summary(f) for f in _sfields]
+            _sjson = json.dumps(_sobjs, ensure_ascii=False, indent=2)
+            lines.append(f"\n{SEP_MINOR}")
+            lines.append(f"{_sicon} *{_slabel}*  `({len(_sfields)})`")
+            lines.append(f"```json\n{_sjson}\n```")
 
         # ── Flat POST template from merged fields ─────────────
         _FIELD_ORDER_M = [
@@ -26573,7 +27249,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 )
         if flat_tpl:
             flat_str = json.dumps(flat_tpl, ensure_ascii=False, indent=2)
-            lines.append("📤 *Merged POST template:*")
+            lines.append(f"\n{SEP_MINOR}")
+            lines.append("📤 *Merged POST Body Template*  _(all forms combined)_")
             lines.append(f"```json\n{flat_str}\n```")
 
     # ── HEADERS ───────────────────────────────────────────────
@@ -26583,8 +27260,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         imp_h = [h for h in headers_result if h.get('status_key') == 'important']
         opt_h = [h for h in headers_result if h.get('status_key') == 'optional']
 
-        lines.append(f"\n{SEP}")
-        lines.append("🔍 *Headers*")
+        lines.append(_sec("Headers", "🔍"))
         for h in req_h:
             lines.append(f"  🔴 `{raw_code(h['header'])}` — _{escape_md(h.get('notes',''))}_")
         for h in imp_h:
@@ -26595,40 +27271,84 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             opt_row = "  ".join(f"`{raw_code(h['header'])}`" for h in opt_h)
             lines.append(f"  🟢 Optional: {opt_row}")
 
-    # ── TOKEN SOURCES ─────────────────────────────────────────
-    token_sources = data.get('token_sources', [])
+    # ── TOKEN SOURCES + RESOLVED VALUES ─────────────────────
+    token_sources    = data.get('token_sources', [])
+    resolved_tokens  = data.get('resolved_tokens', {})
     if token_sources:
         src_icon = {
             'hidden_input': '🔒', 'meta_tag': '🏷️',
             'js_variable':  '📜', 'cookie':   '🍪',
             'server_response': '📟',
         }
+        _CONF_BADGE = {
+            'live':     '✅',
+            'static':   '🟡',
+            'inferred': '🔵',
+            'empty':    '⬜',
+        }
         groups: dict = {}
         for t in token_sources:
             groups.setdefault(t['source_type'], []).append(t)
 
-        lines.append(f"\n{SEP}")
-        lines.append("🔎 *Token Sources*")
+        lines.append(_sec("Token Sources", "🔎"))
         for st in ('hidden_input', 'meta_tag', 'js_variable', 'cookie', 'server_response'):
             if st not in groups:
                 continue
             icon = src_icon.get(st, '🔄')
             for t in groups[st]:
-                val = t.get('value_preview', '')
-                val_str = (f" = `{raw_code(val, 50)}`"
-                           if val and val != '(runtime value)' else "")
-                lines.append(
-                    f"  {icon} `{raw_code(t['name'], 30)}`{val_str}"
-                    f"  _{escape_md(t.get('label','')[:60])}_"
+                tname = t.get('name', '')
+                res   = resolved_tokens.get(tname, {})
+                rval  = res.get('value', '')
+                conf  = res.get('confidence', '')
+                hk    = res.get('header_key', '')
+                badge = _CONF_BADGE.get(conf, '')
+
+                # Value display: prefer resolved, fall back to value_preview
+                val_preview = t.get('value_preview', '')
+                display_val = rval or (
+                    val_preview if val_preview not in (
+                        '(runtime value)', '(empty)', '(empty — runtime)', ''
+                    ) else ''
                 )
+                val_str = (f" = `{raw_code(display_val, 50)}`"
+                           if display_val else "")
+                hk_str  = (f"  → `{raw_code(hk)}`"
+                           if hk else "")
+                lines.append(
+                    f"  {badge}{icon} `{raw_code(tname, 30)}`{val_str}"
+                    f"{hk_str}  _{escape_md(t.get('label','')[:50])}_"
+                )
+
+        # ── Resolved tokens JSON block ─────────────────────────
+        # Show live/static resolved tokens as a ready-to-use JSON object
+        ready = {
+            name: info['value']
+            for name, info in resolved_tokens.items()
+            if info.get('value') and info.get('confidence') in ('live', 'static')
+        }
+        if ready:
+            lines.append("\n📋 *Resolved token values* _(inject into POST body/headers)_:")
+            lines.append("```json\n" + json.dumps(ready, ensure_ascii=False, indent=2) + "\n```")
+
+        # ── Headers to send ───────────────────────────────────
+        hdr_tokens = {
+            info['header_key']: info['value']
+            for info in resolved_tokens.values()
+            if info.get('header_key') and info.get('value')
+               and info.get('confidence') in ('live', 'static')
+        }
+        if hdr_tokens:
+            lines.append("🔑 *Token request headers:*")
+            lines.append("```\n" + "\n".join(
+                f"{k}: {v}" for k, v in hdr_tokens.items()
+            ) + "\n```")
 
     # ── CLIENT STORAGE ────────────────────────────────────────
     cs   = data.get('client_storage', {})
     _ls  = cs.get('localStorage', {})
     _ss  = cs.get('sessionStorage', {})
     if _ls or _ss:
-        lines.append(f"\n{SEP}")
-        lines.append("💾 *Client Storage*")
+        lines.append(_sec("Client Storage", "💾"))
         for store_name, store in (('localStorage', _ls), ('sessionStorage', _ss)):
             if store:
                 lines.append(f"  🗄️ _{store_name}_")
@@ -26638,16 +27358,14 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── RATE LIMIT ────────────────────────────────────────────
     rl = data.get('rate_limit')
     if rl:
-        lines.append(f"\n{SEP}")
-        lines.append("📊 *Rate Limit Headers*")
+        lines.append(_sec("Rate Limit Headers", "📊"))
         for k, v in list(rl.items())[:6]:
             lines.append(f"  `{raw_code(k)}` = `{raw_code(str(v))}`")
 
     # ── AUTH COOKIES ─────────────────────────────────────────
     auth_cookies = data.get('auth_cookies', [])
     if auth_cookies:
-        lines.append(f"\n{SEP}")
-        lines.append("🍪 *Auth Cookies*")
+        lines.append(_sec("Auth Cookies", "🍪"))
         for ck in auth_cookies[:5]:
             hi  = "✅" if ck['httponly'] else "❌"
             se  = "✅" if ck['secure']   else "❌"
@@ -26664,8 +27382,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── CSP ───────────────────────────────────────────────────
     csp = data.get('csp_info')
     if csp:
-        lines.append(f"\n{SEP}")
-        lines.append("🛡️ *CSP*")
+        lines.append(_sec("Content Security Policy", "🛡️"))
         for directive in ('connect-src', 'form-action'):
             vals = csp.get('directives', {}).get(directive, [])
             if vals:
@@ -26678,8 +27395,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── CORS ──────────────────────────────────────────────────
     cors = data.get('cors_info')
     if cors:
-        lines.append(f"\n{SEP}")
-        lines.append("🌐 *CORS*")
+        lines.append(_sec("CORS Policy", "🌐"))
         acao = cors.get('allow_origin', 'not set')
         acac = cors.get('allow_credentials', 'false')
         lines.append(f"  Origin: `{raw_code(acao)}`  Credentials: `{raw_code(acac)}`")
@@ -26691,8 +27407,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── GRAPHQL ───────────────────────────────────────────────
     gql = data.get('graphql_info')
     if gql:
-        lines.append(f"\n{SEP}")
-        lines.append(f"🔷 *GraphQL* `{raw_code(gql['endpoint'])}`")
+        lines.append(_sec(f"GraphQL  ·  `{raw_code(gql['endpoint'])}`", "🔷"))
         if gql.get('introspected'):
             types_str = '  '.join(f"`{raw_code(t)}`" for t in gql['types'][:6])
             lines.append(f"  Types: {types_str}")
@@ -26702,11 +27417,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── API SCHEMA ────────────────────────────────────────────
     schema = data.get('api_schema')
     if schema:
-        lines.append(f"\n{SEP}")
-        lines.append(
-            f"📖 *API Schema* v{escape_md(schema['spec_version'])}"
-            f"  `{raw_code(schema['schema_url'], 60)}`"
-        )
+        lines.append(_sec(f"API Schema  v{escape_md(schema['spec_version'])}", "📖"))
+        lines.append(f"  `{raw_code(schema['schema_url'], 60)}`")
         for ep in schema.get('pay_endpoints', [])[:4]:
             lines.append(
                 f"  💳 `{raw_code(ep['method'])}` `{raw_code(ep['endpoint'], 50)}`"
@@ -26716,9 +27428,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── FRAMEWORK ─────────────────────────────────────────────
     fws = data.get('frameworks', [])
     if fws:
-        lines.append(f"\n{SEP}")
         fw_row = "  ".join(f"*{escape_md(fw['name'])}*" for fw in fws[:4])
-        lines.append(f"⚙️ *Framework*: {fw_row}")
+        lines.append(_sec(f"Framework  ·  {fw_row}", "⚙️"))
         for fw in fws[:2]:
             if fw.get('note'):
                 lines.append(f"  _{escape_md(fw['note'][:80])}_")
@@ -26726,8 +27437,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── MULTI-STEP ────────────────────────────────────────────
     ms = data.get('multistep')
     if ms:
-        lines.append(f"\n{SEP}")
-        lines.append("🪜 *Multi-step Checkout*")
+        lines.append(_sec("Multi-step Checkout", "🪜"))
         for sig in ms.get('signals', [])[:3]:
             lines.append(f"  • {escape_md(sig)}")
         for su in ms.get('likely_step_urls', [])[:3]:
@@ -26736,16 +27446,16 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── CURL / PYTHON SNIPPET ─────────────────────────────────
     snip = data.get('curl_snippet')
     if snip:
-        lines.append(f"\n{SEP}")
-        lines.append("📋 *Request Snippets*")
+        lines.append(_sec("Request Snippets", "📋"))
         if snip.get('curl'):
             lines.append("*cURL:*")
             lines.append("```\n" + snip['curl'][:700] + "\n```")
         if snip.get('python'):
             lines.append("🐍 *Python:*")
-            lines.append("```\n" + snip['python'][:500] + "\n```")
+            lines.append("```python\n" + snip['python'][:500] + "\n```")
 
-    lines.append(f"\n⚠️ _Authorized testing only._")
+    lines.append(f"\n{SEP}")
+    lines.append("⚠️ _Authorized testing only._")
     return '\n'.join(lines)
 
 
@@ -26777,8 +27487,16 @@ def _sanitize_for_json(obj, _seen=None):
 
 
 def _build_json_export(data: dict) -> str:
-    """Full JSON export — fields categorized: card / payment / user / dynamic / hidden + submit buttons."""
+    """Full JSON export — clean structured format.
 
+    Top-level sections:
+      meta · gateway · captcha · signals · forms · xhr_requests
+      security · tokens · client_storage · endpoints · framework
+      snippets · live_findings
+    """
+    from datetime import timezone
+
+    # ── Field-type sets (same as report) ─────────────────────
     _CARD_TYPES = {'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
                    'Expiry MM/YY', 'Cardholder Name',
                    'Routing Number', 'Account Number', 'Account Type'}
@@ -26789,37 +27507,85 @@ def _build_json_export(data: dict) -> str:
     _DYN_TYPES  = {'CSRF Token', 'Nonce', 'Session Token', 'OTP/Verification',
                    'Timestamp', 'Anti-Bot Token', 'Request ID'}
 
-    def _categorize(fields: list) -> dict:
-        card_f    = {}
-        pay_f     = {}
-        user_f    = {}
-        dyn_f     = {}
-        hidden_f  = {}
+    _SRC_LABELS = {
+        'static':         'html',
+        'static_orphan':  'html_orphan',
+        'playwright':     'xhr_intercept',
+        'playwright_dom': 'dom',
+        'live_intercept': 'live',
+    }
+
+    _SMART_PH = None
+    try:
+        _SMART_PH = _smart_placeholder  # may be defined in outer scope
+    except NameError:
+        pass
+
+    def _ph(name, label, ftype):
+        if _SMART_PH:
+            try:
+                return _SMART_PH(name, label, ftype)
+            except Exception:
+                pass
+        return ''
+
+    # ── Convert one raw field → clean dict (array element) ───
+    def _field_obj(f: dict, src_override: str = '') -> dict:
+        name  = f.get('name', '')
+        label = f.get('field_label') or f.get('label', '') or name
+        ftype = f.get('type', 'text')
+        obj: dict = {'name': name, 'label': label, 'type': ftype}
+
+        # placeholder
+        ph = f.get('placeholder') or _ph(name, label, ftype)
+        if ph:
+            obj['placeholder'] = ph
+
+        # required
+        obj['required'] = bool(f.get('required', False))
+
+        # prefilled value (skip trivial)
+        val = f.get('value', '')
+        if val and val not in ('', '0', '0.00'):
+            obj['value'] = val[:120]
+
+        # autocomplete hint
+        ac = f.get('autocomplete', '')
+        if ac and ac.lower() not in ('', 'on', 'off'):
+            obj['autocomplete'] = ac
+
+        # HTML5 validation — only non-empty attrs
+        vd = {k: f[k] for k in ('pattern', 'minlength', 'maxlength', 'min', 'max') if f.get(k)}
+        if vd:
+            obj['validation'] = vd
+
+        # field origin
+        src = f.get('source', '') or src_override
+        if src:
+            obj['source'] = _SRC_LABELS.get(src, src)
+
+        return obj
+
+    # ── Categorize fields into 5 groups (arrays, not dicts) ──
+    def _categorize(fields: list, entry_src: str = '') -> dict:
+        card_f, pay_f, user_f, dyn_f, hidden_f = [], [], [], [], []
         for f in fields:
             ct  = f.get('card_type') or ''
             ft  = f.get('type', 'text')
             dyn = f.get('is_dynamic', False)
-            name = f['name']
-            entry = {
-                'label':    f.get('field_label') or name,
-                'type':     ft,
-                'value':    f.get('value', ''),
-                'required': f.get('required', False),
-            }
-            if f.get('placeholder'):
-                entry['placeholder'] = f['placeholder']
-
+            if f.get('is_honeypot'):
+                continue   # honeypots handled separately
+            obj = _field_obj(f, entry_src)
             if ct in _CARD_TYPES:
-                card_f[name] = entry
+                card_f.append(obj)
             elif ct in _PAY_TYPES:
-                pay_f[name] = entry
+                pay_f.append(obj)
             elif dyn or ct in _DYN_TYPES:
-                dyn_f[name] = entry
-            elif ft in ('hidden',):
-                hidden_f[name] = entry
+                dyn_f.append(obj)
+            elif ft == 'hidden':
+                hidden_f.append(obj)
             elif ft not in ('submit', 'button', 'reset', 'image'):
-                user_f[name] = entry
-
+                user_f.append(obj)
         return {
             'card_fields':    card_f,
             'payment_fields': pay_f,
@@ -26828,119 +27594,346 @@ def _build_json_export(data: dict) -> str:
             'hidden_fields':  hidden_f,
         }
 
-    clean = {
-        'url':               data.get('url'),
-        'base_url':          data.get('base_url', ''),
-        'recaptcha':         data.get('recaptcha'),
-        'subpage_sitekeys':  data.get('subpage_sitekeys', []),
-        'threeds_signals':   data.get('threeds_signals', []),
-        'wallets':           data.get('wallets', []),
-        'gateways':          data.get('gateways', []),
-        'forms':             [],
-        'requests':          [],
+    # ── POST body template builder ────────────────────────────
+    _FIELD_ORDER = [
+        'Email', 'Phone', 'Cardholder Name',
+        'Billing First Name', 'Billing Last Name', 'Billing Company',
+        'Billing Address', 'Billing City', 'Billing State',
+        'Billing Zip', 'Billing Country', 'Billing Province',
+        'Card Number', 'Expiry Month', 'Expiry Year', 'CVV/CVC',
+        'Routing Number', 'Account Number', 'Account Type',
+        'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
+    ]
+
+    def _post_template(fields: list, dyn_fields: list) -> dict:
+        def _order_key(f_raw):
+            ct = f_raw.get('card_type') or f_raw.get('field_label', '')
+            try:    return _FIELD_ORDER.index(ct)
+            except: return 99
+        tpl = {}
+        for f_raw in sorted(fields, key=_order_key):
+            nm = f_raw.get('name', '')
+            ft = f_raw.get('type', 'text')
+            if not nm or ft in ('submit', 'button', 'reset', 'image'):
+                continue
+            tpl[nm] = _ph(nm, f_raw.get('field_label') or f_raw.get('label', ''), ft) or ''
+        # dynamic tokens (CSRF/nonce) — include live values if available
+        for f_raw in dyn_fields:
+            nm = f_raw.get('name', '')
+            if nm and nm not in tpl:
+                tpl[nm] = f_raw.get('value', '') or '<token>'
+        return tpl
+
+    # ── Risk assessment (mirrors report) ──────────────────────
+    gateways    = data.get('gateways', [])
+    threeds     = data.get('threeds_signals', [])
+    wallets     = data.get('wallets', [])
+    live_finds  = data.get('live_findings', [])
+    _raw_risk   = any(g.get('raw_post_risk') for g in gateways)
+
+    if _raw_risk or live_finds:
+        risk, risk_reason = 'HIGH',   ('raw_card_post' if _raw_risk else 'live_secrets_intercepted')
+    elif gateways and threeds:
+        risk, risk_reason = 'MEDIUM', 'payment_form_with_3ds'
+    elif gateways:
+        risk, risk_reason = 'MEDIUM', 'payment_form_present'
+    else:
+        risk, risk_reason = 'LOW',    'no_payment_surface'
+
+    url    = data.get('url', '')
+    domain = urlparse(url).hostname or url
+
+    # ── [1] meta ─────────────────────────────────────────────
+    out: dict = {
+        'meta': {
+            'url':        url,
+            'domain':     domain,
+            'scanned_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'risk':       risk,
+            'risk_reason': risk_reason,
+        }
     }
 
-    for entry in data.get('forms', []):
-        cats = _categorize(entry.get('fields', []))
-        # Submit buttons
-        submit_btns = entry.get('submit_buttons', [])
-        if not submit_btns:
-            # Fallback: check hidden fields named 'submit' or similar
-            pass
-        form_obj = {
-            'source':          entry.get('source'),
-            'form_idx':        entry.get('form_idx'),
-            'endpoint':        entry.get('endpoint'),
-            'method':          entry.get('method'),
-            'enctype':         entry.get('enctype'),
-            'is_payment':      entry.get('is_payment', False),
-            'submit_buttons':  submit_btns,
-            'card_fields':     cats['card_fields'],
-            'payment_fields':  cats['payment_fields'],
-            'user_fields':     cats['user_fields'],
-            'dynamic_fields':  cats['dynamic_fields'],
-            'hidden_fields':   cats['hidden_fields'],
-        }
-        if entry.get('note'):
-            form_obj['note'] = entry['note']
-        clean['forms'].append(form_obj)
+    # ── [2] gateway ───────────────────────────────────────────
+    if gateways:
+        gw = gateways[0]
+        gw_obj: dict = {'name': gw.get('name', '')}
+        if gw.get('tokenization'):
+            gw_obj['tokenization'] = gw['tokenization']
+        gw_obj['raw_post_risk'] = bool(gw.get('raw_post_risk', False))
+        if len(gateways) > 1:
+            gw_obj['additional'] = [g.get('name') for g in gateways[1:]]
+        out['gateway'] = gw_obj
 
-    for entry in data.get('requests', []):
-        cats = _categorize(entry.get('fields', []))
-        clean['requests'].append({
-            'endpoint':        entry.get('endpoint'),
-            'method':          entry.get('method'),
-            'enctype':         entry.get('enctype'),
-            'is_payment':      entry.get('is_payment', False),
-            'raw_body':        entry.get('raw_body', ''),
-            'submit_buttons':  entry.get('submit_buttons', []),
-            'card_fields':     cats['card_fields'],
-            'payment_fields':  cats['payment_fields'],
-            'user_fields':     cats['user_fields'],
-            'dynamic_fields':  cats['dynamic_fields'],
-            'hidden_fields':   cats['hidden_fields'],
-        })
+    # ── [3] captcha ───────────────────────────────────────────
+    rc = data.get('recaptcha')
+    all_keys = []
+    if rc and rc.get('all_keys'):
+        all_keys = rc['all_keys']
+    elif rc and rc.get('site_key'):
+        all_keys = [rc]
+    seen_sk = {f.get('site_key', '') for f in all_keys}
+    for sp_sk in data.get('subpage_sitekeys', []):
+        for _e in (sp_sk.get('all_keys') or [sp_sk]):
+            if _e.get('site_key', '') not in seen_sk:
+                all_keys.append({**_e, '_subpage': True})
+                seen_sk.add(_e.get('site_key', ''))
+    if all_keys:
+        captcha_list = []
+        for sk in all_keys:
+            ck: dict = {
+                'type':     sk.get('type') or sk.get('captcha_type', 'CAPTCHA'),
+                'site_key': sk.get('site_key', ''),
+            }
+            if sk.get('action'):        ck['action']         = sk['action']
+            if sk.get('invisible'):     ck['invisible']       = True
+            if sk.get('min_score'):     ck['min_score']       = sk['min_score']
+            if sk.get('enterprise'):    ck['enterprise']      = True
+            if sk.get('callback'):      ck['callback']        = sk['callback']
+            if sk.get('confirmed_live'):ck['confirmed_live']  = True
+            if sk.get('source'):        ck['source']          = sk['source'][:80]
+            if sk.get('_subpage'):      ck['subpage']         = True
+            captcha_list.append(ck)
+        out['captcha'] = captcha_list
 
-    # Headers
-    clean['headers'] = [
-        {
-            'header':       h['header'],
-            'description':  h['description'],
-            'status':       h['status_key'],
-            'status_label': h['status_label'],
-            'reason':       h['reason'],
-            'base_status':  h['base_status'],
-            'probe_status': h['probe_status'],
-            'notes':        h['notes'],
-        }
-        for h in data.get('headers', [])
-    ]
-    # Token Sources
-    clean['token_sources'] = [
-        {
-            'name':          t['name'],
-            'value_preview': t.get('value_preview', ''),
-            'source_type':   t['source_type'],
-            'location':      t['location'],
-            'label':         t['label'],
-        }
-        for t in data.get('token_sources', [])
-    ]
-    # ── New enhancement fields ────────────────────────────────
-    clean['client_storage']  = data.get('client_storage', {})
-    clean['rate_limit']      = data.get('rate_limit')
-    clean['auth_cookies']    = data.get('auth_cookies', [])
-    clean['csp_info']        = data.get('csp_info')
-    clean['cors_info']       = data.get('cors_info')
-    clean['graphql_info']    = data.get('graphql_info')
-    clean['api_schema']      = data.get('api_schema')
-    clean['frameworks']      = data.get('frameworks', [])
-    clean['multistep']       = data.get('multistep')
-    clean['curl_snippet']    = data.get('curl_snippet')
-    # ── Per-field enhancements: include honeypot + HTML5 attrs ─
-    for form_obj in clean['forms']:
-        src_entry = next(
-            (e for e in data.get('forms', [])
-             if e.get('endpoint') == form_obj.get('endpoint')),
-            None
+    # ── [4] signals ───────────────────────────────────────────
+    signals: dict = {}
+    if threeds:
+        signals['3ds'] = threeds
+    if wallets:
+        signals['wallets'] = wallets
+    ms = data.get('multistep')
+    if ms:
+        ms_obj: dict = {}
+        if ms.get('signals'):       ms_obj['signals']   = ms['signals']
+        if ms.get('likely_step_urls'): ms_obj['step_urls'] = ms['likely_step_urls']
+        signals['multistep'] = ms_obj
+    if signals:
+        out['signals'] = signals
+
+    # ── [5] forms ─────────────────────────────────────────────
+    def _build_form_obj(entry: dict, idx: int) -> dict:
+        fields   = entry.get('fields', [])
+        src_lbl  = entry.get('source', '')
+        cats     = _categorize(fields, src_lbl)
+        dyn_raw  = [f for f in fields if f.get('is_dynamic')]
+
+        fo: dict = {'id': idx}
+        if entry.get('endpoint'):  fo['endpoint']     = entry['endpoint']
+        if entry.get('method'):    fo['method']        = entry['method']
+        if entry.get('enctype'):   fo['content_type']  = (
+            entry['enctype']
+            .replace('application/', '')
+            .replace('x-www-form-urlencoded', 'urlencoded')
+            .replace('; charset=utf-8', '').strip()
         )
-        if not src_entry:
-            continue
-        honeypots = [
-            {'name': f['name'], 'type': f.get('type'), 'reason': 'css_hidden'}
-            for f in src_entry.get('fields', []) if f.get('is_honeypot')
+        fo['is_payment'] = bool(entry.get('is_payment', False))
+        if src_lbl:
+            fo['source'] = _SRC_LABELS.get(src_lbl, src_lbl)
+
+        # field groups — omit empty arrays
+        for key in ('card_fields', 'payment_fields', 'user_fields',
+                    'dynamic_fields', 'hidden_fields'):
+            if cats[key]:
+                fo[key] = cats[key]
+
+        # honeypots
+        hp = [{'name': f['name'], 'type': f.get('type', 'text')}
+              for f in fields if f.get('is_honeypot')]
+        if hp:
+            fo['honeypot_fields'] = hp
+
+        # submit button text (concise)
+        btns = entry.get('submit_buttons', [])
+        if btns:
+            fo['submit'] = btns[0].get('text') or btns[0].get('value') or 'Submit'
+
+        # POST body template (only for payment / card forms)
+        all_pay_card = cats['card_fields'] or cats['payment_fields']
+        if all_pay_card:
+            tpl = _post_template(fields, dyn_raw)
+            if tpl:
+                fo['post_template'] = tpl
+
+        if entry.get('note'):
+            fo['note'] = entry['note']
+
+        return fo
+
+    forms_out = []
+    for i, entry in enumerate(data.get('forms', []), 1):
+        forms_out.append(_build_form_obj(entry, i))
+    if forms_out:
+        out['forms'] = forms_out
+
+    # ── [6] xhr_requests ─────────────────────────────────────
+    xhr_out = []
+    for i, entry in enumerate(data.get('requests', []), 1):
+        fields  = entry.get('fields', [])
+        src_lbl = entry.get('source', '')
+        cats    = _categorize(fields, src_lbl)
+        xo: dict = {'id': i}
+        if entry.get('endpoint'):  xo['endpoint']    = entry['endpoint']
+        if entry.get('method'):    xo['method']       = entry['method']
+        xo['is_payment'] = bool(entry.get('is_payment', False))
+        if entry.get('raw_body'):  xo['raw_body']     = entry['raw_body'][:300]
+        for key in ('card_fields', 'payment_fields', 'user_fields',
+                    'dynamic_fields', 'hidden_fields'):
+            if cats[key]:
+                xo[key] = cats[key]
+        xhr_out.append(xo)
+    if xhr_out:
+        out['xhr_requests'] = xhr_out
+
+    # ── [7] security ─────────────────────────────────────────
+    sec: dict = {}
+
+    headers_raw = data.get('headers', [])
+    if headers_raw:
+        sec['headers'] = [
+            {k: v for k, v in {
+                'name':         h.get('header'),
+                'status':       h.get('status_key'),
+                'notes':        h.get('notes') or h.get('reason'),
+                'base_status':  h.get('base_status'),
+                'probe_status': h.get('probe_status'),
+            }.items() if v}
+            for h in headers_raw
         ]
-        if honeypots:
-            form_obj['honeypot_fields'] = honeypots
-        # Attach HTML5 validation attrs to each field category
-        _attr_map = {
-            f['name']: {k: f[k] for k in ('autocomplete','pattern','minlength','maxlength','min','max')
-                        if f.get(k)}
-            for f in src_entry.get('fields', [])
+
+    auth_cookies = data.get('auth_cookies', [])
+    if auth_cookies:
+        sec['auth_cookies'] = [
+            {k: v for k, v in {
+                'name':      ck.get('name'),
+                'httponly':  ck.get('httponly'),
+                'secure':    ck.get('secure'),
+                'samesite':  ck.get('samesite'),
+                'issues':    ck.get('issues') or None,
+            }.items() if v is not None and v != []}
+            for ck in auth_cookies[:10]
+        ]
+
+    csp = data.get('csp_info')
+    if csp:
+        csp_obj: dict = {}
+        directives = {k: v for k, v in (csp.get('directives') or {}).items() if v}
+        if directives:  csp_obj['directives'] = directives
+        if csp.get('issues'): csp_obj['issues'] = csp['issues']
+        if csp_obj:
+            sec['csp'] = csp_obj
+
+    cors = data.get('cors_info')
+    if cors:
+        cors_obj = {k: v for k, v in {
+            'allow_origin':       cors.get('allow_origin'),
+            'allow_credentials':  cors.get('allow_credentials'),
+            'issues':             cors.get('issues') or None,
+        }.items() if v}
+        if cors_obj:
+            sec['cors'] = cors_obj
+
+    rl = data.get('rate_limit')
+    if rl:
+        sec['rate_limit'] = rl
+
+    if sec:
+        out['security'] = sec
+
+    # ── [8] tokens ───────────────────────────────────────────
+    token_sources   = data.get('token_sources', [])
+    resolved_tokens = data.get('resolved_tokens', {})
+    if token_sources:
+        out['tokens'] = []
+        for t in token_sources:
+            tname = t.get('name', '')
+            res   = resolved_tokens.get(tname, {})
+            entry_exp = {k: v for k, v in {
+                'name':        tname,
+                'source_type': t.get('source_type'),
+                'location':    t.get('location'),
+                'label':       t.get('label') or None,
+                # resolved fields — present only when we have a real value
+                'resolved_value':      res.get('value')      or None,
+                'resolve_confidence':  res.get('confidence') or None,
+                'resolve_method':      res.get('method')     or None,
+                'header_key':          res.get('header_key') or None,
+            }.items() if v}
+            out['tokens'].append(entry_exp)
+        # flat ready-to-inject map — convenience for scripting
+        ready_map = {
+            n: i['value']
+            for n, i in resolved_tokens.items()
+            if i.get('value') and i.get('confidence') in ('live', 'static', 'inferred')
         }
-        if _attr_map:
-            form_obj['field_validation_attrs'] = _attr_map
-    safe = _sanitize_for_json(clean)
+        if ready_map:
+            out['resolved_token_map'] = ready_map
+
+    # ── [9] client_storage ───────────────────────────────────
+    cs = data.get('client_storage', {})
+    ls, ss = cs.get('localStorage', {}), cs.get('sessionStorage', {})
+    if ls or ss:
+        cs_out: dict = {}
+        if ls: cs_out['localStorage']  = ls
+        if ss: cs_out['sessionStorage'] = ss
+        out['client_storage'] = cs_out
+
+    # ── [10] endpoints ───────────────────────────────────────
+    ep_out: dict = {}
+    gql = data.get('graphql_info')
+    if gql:
+        gql_obj = {k: v for k, v in {
+            'endpoint':     gql.get('endpoint'),
+            'introspected': gql.get('introspected'),
+            'types':        gql.get('types') or None,
+        }.items() if v}
+        if gql_obj:
+            ep_out['graphql'] = gql_obj
+
+    schema = data.get('api_schema')
+    if schema:
+        sc_obj = {k: v for k, v in {
+            'spec_version':  schema.get('spec_version'),
+            'schema_url':    schema.get('schema_url'),
+            'pay_endpoints': schema.get('pay_endpoints') or None,
+        }.items() if v}
+        if sc_obj:
+            ep_out['api_schema'] = sc_obj
+
+    if ep_out:
+        out['endpoints'] = ep_out
+
+    # ── [11] framework ───────────────────────────────────────
+    fws = data.get('frameworks', [])
+    if fws:
+        out['framework'] = [
+            {k: v for k, v in {'name': fw.get('name'), 'note': fw.get('note')}.items() if v}
+            for fw in fws
+        ]
+
+    # ── [12] snippets ────────────────────────────────────────
+    snip = data.get('curl_snippet')
+    if snip:
+        snip_out = {k: v for k, v in {
+            'curl':   snip.get('curl'),
+            'python': snip.get('python'),
+        }.items() if v}
+        if snip_out:
+            out['snippets'] = snip_out
+
+    # ── [13] live_findings ───────────────────────────────────
+    if live_finds:
+        out['live_findings'] = [
+            {k: v for k, v in {
+                'type':       lf.get('type'),
+                'value':      lf.get('value'),
+                'source':     lf.get('source'),
+                'confidence': lf.get('confidence'),
+            }.items() if v}
+            for lf in live_finds
+        ]
+
+    safe = _sanitize_for_json(out)
     return json.dumps(safe, indent=2, ensure_ascii=False)
 
 
