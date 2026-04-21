@@ -27001,119 +27001,19 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             for f in iframe[:3]:
                 lines.append(f"  `{raw_code(f.get('label', f['name']), 80)}`")
 
-        # ── Card / Payment / User → JSON block ──────────────────
+        # ── Card / Payment / User → compact pill summary (full JSON only in Merged Summary) ──
         if card or pay or user:
-            def _field_to_obj(f: dict) -> dict:
-                """Convert a field dict → clean, rich JSON-serializable object.
-                ENH: Includes autocomplete hint, HTML5 validation rules, source tag.
-                """
-                name  = f.get("name", "")
-                label = f.get("field_label") or f.get("label", "")
-                ftype = f.get("type", "text")
-                obj: dict = {
-                    "name":        name,
-                    "label":       label,
-                    "type":        ftype,
-                    "placeholder": _smart_placeholder(name, label, ftype),
-                    "required":    bool(f.get("required", False)),
-                }
-                # ── autocomplete hint (browser/CC manager uses this) ──
-                ac = f.get("autocomplete", "")
-                if ac and ac.lower() not in ("", "on", "off"):
-                    obj["autocomplete"] = ac
-
-                # ── HTML5 validation constraints ──────────────────────
-                validation: dict = {}
-                if f.get("pattern"):    validation["pattern"]   = f["pattern"]
-                if f.get("minlength"):  validation["minlength"] = f["minlength"]
-                if f.get("maxlength"):  validation["maxlength"] = f["maxlength"]
-                if f.get("min"):        validation["min"]       = f["min"]
-                if f.get("max"):        validation["max"]       = f["max"]
-                if validation:
-                    obj["validation"] = validation
-
-                # ── select options — hidden from output (use _opts_hint for compact display) ──
-
-                # ── prefilled/live value (amount, currency, etc.) ─────
-                val = f.get("value", "")
-                if val and val not in ("", "0", "0.00"):
-                    obj["value"] = val[:80]
-
-                # ── field origin (static HTML / DOM / iframe / live) ──
-                src = f.get("source", "") or entry.get("source", "")
-                if src:
-                    _SRC_LABELS = {
-                        "static":           "html",
-                        "static_orphan":    "html_orphan",
-                        "playwright":       "xhr_intercept",
-                        "playwright_dom":   "dom",
-                        "live_intercept":   "live",
-                    }
-                    obj["source"] = _SRC_LABELS.get(src, src)
-
-                return obj
-
-            # ── Per-group sections (card / payment / user) ──────────
-            _GROUP_CFG = [
-                ("card",    "💳", "CARD FIELDS",    card),
-                ("payment", "💰", "PAYMENT FIELDS", pay),
-                ("user",    "✏️", "USER FIELDS",    user),
+            _GROUP_PILLS = [
+                ("💳", card),
+                ("💰", pay),
+                ("✏️", user),
             ]
-            for _gkey, _gicon, _glabel, _gfields in _GROUP_CFG:
+            for _gicon, _gfields in _GROUP_PILLS:
                 if not _gfields:
                     continue
-                _gobjs = [_field_to_obj(f) for f in _gfields]
-                _gjson = json.dumps(_gobjs, ensure_ascii=False, indent=2)
-                lines.append(f"\n{SEP_MINOR}")
-                lines.append(f"{_gicon} *{_glabel}*  `({len(_gfields)})`")
-                lines.append(f"```json\n{_gjson}\n```")
-
-            # ── ENH: POST body template — flat {name: placeholder} ───
-            # Only for payment forms (card fields present) — practical POST payload
-            if card or pay:
-                _FIELD_ORDER = [
-                    # user identity first
-                    "Email", "Phone", "Cardholder Name",
-                    "Billing First Name", "Billing Last Name", "Billing Company",
-                    # address block
-                    "Billing Address", "Billing City", "Billing State",
-                    "Billing Zip", "Billing Country", "Billing Province",
-                    # card block
-                    "Card Number", "Expiry Month", "Expiry Year",
-                    "CVV/CVC", "Routing Number", "Account Number", "Account Type",
-                    # transaction
-                    "Amount", "Currency", "Order/Txn ID", "Customer ID",
-                ]
-                def _order_key(f):
-                    ct = f.get("card_type") or f.get("field_label", "")
-                    try:    return _FIELD_ORDER.index(ct)
-                    except: return 99
-
-                all_fields = sorted(card + pay + user, key=_order_key)
-                tpl: dict = {}
-                for f in all_fields:
-                    fname = f.get("name", "")
-                    if not fname:
-                        continue
-                    ph = _smart_placeholder(
-                        fname,
-                        f.get("field_label") or f.get("label", ""),
-                        f.get("type", "text")
-                    )
-                    tpl[fname] = ph
-                # add any dynamic tokens (CSRF/nonce) the server will check
-                # ENH: inject resolved live values when available
-                _resolved = entry.get('_resolved_tokens', {}) or data.get('resolved_tokens', {}) if 'data' in dir() else {}
-                for f in dyn:
-                    fname = f.get("name", "")
-                    if fname and fname not in tpl:
-                        res_info = _resolved.get(fname, {})
-                        res_val  = res_info.get('value', '') if res_info else ''
-                        tpl[fname] = res_val or f.get("value", "") or "<token>"
-                tpl_str = json.dumps(tpl, ensure_ascii=False, indent=2)
-                lines.append(f"\n{SEP_MINOR}")
-                lines.append("📤 *POST Body Template*  _(ready\\-to\\-fill)_")
-                lines.append(f"```json\n{tpl_str}\n```")
+                pills = "  ".join(_field_pill(f) for f in _gfields[:8])
+                extra = f"  _+{len(_gfields)-8} more_" if len(_gfields) > 8 else ""
+                lines.append(f"  {_gicon} {pills}{extra}")
 
             # Accumulate for merged summary (defined outside per-form loop)
             _merged_card_seen: set  # forward-ref — populated in outer scope
