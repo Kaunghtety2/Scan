@@ -1,6 +1,25 @@
-python-telegram-bot>=20.0
+# ── Core Telegram Bot (v20+ — async/Application style) ──────────
+python-telegram-bot[http2]>=20.7
+
+# ── HTTP / Networking ─────────────────────────────────────────────
 requests>=2.31.0
 urllib3>=2.0.0
+httpx[http2]>=0.26.0          # optional — used if installed
+
+# ── HTML Parsing ──────────────────────────────────────────────────
 beautifulsoup4>=4.12.0
-python-dotenv>=1.0.0
-playwright>=1.40.0
+lxml>=5.0.0                   # faster BS4 parser (optional but recommended)
+
+# ── Browser Automation ───────────────────────────────────────────
+playwright>=1.42.0
+# After install, also run:
+#   playwright install chromium
+#   playwright install-deps chromium
+
+# ── Environment / Config ─────────────────────────────────────────
+
+# ── Standard Library (no install needed) ─────────────────────────
+# os, re, json, time, shutil, zipfile, hashlib, hmac, string
+# struct, tempfile, logging, asyncio, subprocess, socket
+# random, difflib, functools, concurrent.futures, threading
+# base64, math, ipaddress, urllib.parse, datetime
