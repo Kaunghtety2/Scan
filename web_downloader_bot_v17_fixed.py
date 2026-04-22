@@ -9572,6 +9572,115 @@ _LIVE_HIDDEN_PATTERNS = _LIVE_BODY_PATTERNS + [
     ("Live WebSocket auth",          re.compile(r'(?i)(?:Sec-WebSocket-Protocol|Authorization):\s*([A-Za-z0-9_\-\.+/=]{16,300})')),
 ]
 
+
+# ── Anti-Fraud detection patterns (live network) ─────────────────────────────
+_LIVE_ANTIFRAUD_PATTERNS: list = [
+    # (label, url_regex, body_regex | None)
+
+    # Sift Science
+    ("Sift",
+     re.compile(r'api3?\.sift(?:science)?\.com|sift\.com/v\d/event', re.I),
+     re.compile(r'\$session_id|\$user_id|\$payment_method', re.I)),
+
+    # Kount
+    ("Kount",
+     re.compile(r'\.kount\.net|kount\.com/collect', re.I),
+     re.compile(r'sess=|mack=|anid=', re.I)),
+
+    # Signifyd
+    ("Signifyd",
+     re.compile(r'cdn-scripts\.signifyd\.com|signifyd\.com/v\d', re.I),
+     None),
+
+    # HUMAN (PerimeterX)
+    ("HUMAN/PerimeterX",
+     re.compile(r'collector\.pxi\.pub|px-cdn\.net|\.perimeterx\.net', re.I),
+     re.compile(r'"appId"|"vid"|"uuid"', re.I)),
+
+    # Cloudflare Bot Management / Turnstile challenge
+    ("Cloudflare Bot Mgmt",
+     re.compile(r'challenges\.cloudflare\.com/cdn-cgi/challenge-platform', re.I),
+     None),
+
+    # DataDome
+    ("DataDome",
+     re.compile(r'api\.datadome\.co|mf\.datadome\.co', re.I),
+     re.compile(r'"datadome"|"dd_cookie"', re.I)),
+
+    # Forter
+    ("Forter",
+     re.compile(r'cdn\.forter\.com|api\.forter\.com', re.I),
+     None),
+
+    # Riskified
+    ("Riskified",
+     re.compile(r'beacon\.riskified\.com', re.I),
+     re.compile(r'"session_id"|"shop_domain"', re.I)),
+
+    # Radware Bot Manager
+    ("Radware",
+     re.compile(r'\.radwarecloud\.com|bot-manager\.radware', re.I),
+     None),
+
+    # ThreatMetrix (LexisNexis)
+    ("ThreatMetrix",
+     re.compile(r'h\.online-metrix\.net|\.threatmetrix\.com', re.I),
+     re.compile(r'org_id=|session_id=', re.I)),
+]
+
+# ── Device Fingerprint detection patterns (live network) ─────────────────────
+_LIVE_FINGERPRINT_PATTERNS: list = [
+    # FingerprintJS Pro
+    ("FingerprintJS Pro",
+     re.compile(r'api\.fpjs\.io|fpjs\.io/v\d|fingerprintjs\.com', re.I),
+     re.compile(r'"visitorId"|"requestId"|"confidence"', re.I)),
+
+    # FingerprintJS Open Source (self-hosted)
+    ("FingerprintJS OSS",
+     re.compile(r'/fingerprint(?:js)?/?(?:v\d|result|identify)', re.I),
+     re.compile(r'"visitorId"|"components"', re.I)),
+
+    # Device Atlas / 51Degrees
+    ("DeviceAtlas",
+     re.compile(r'device\.atlas\.com|51degrees\.com/device', re.I),
+     None),
+
+    # MaxMind minFraud device tracking
+    ("MaxMind",
+     re.compile(r'device\.maxmind\.com', re.I),
+     re.compile(r'"device_id"|"session_id"', re.I)),
+
+    # Iovation / TransUnion
+    ("Iovation",
+     re.compile(r'mpsnare\.iesnare\.com|iovation\.com', re.I),
+     re.compile(r'bb_bb_field|ioBlackBox', re.I)),
+
+    # BioCatch
+    ("BioCatch",
+     re.compile(r'\.biocatch\.com|biocatch\.io', re.I),
+     None),
+
+    # Sardine
+    ("Sardine",
+     re.compile(r'api\.sardine\.ai|loader\.sardine\.ai', re.I),
+     re.compile(r'"session_key"|"flow"', re.I)),
+
+    # Castle
+    ("Castle",
+     re.compile(r'\.castle\.io|api\.castle\.io', re.I),
+     re.compile(r'"request_token"|"user_id"', re.I)),
+
+    # Socure
+    ("Socure",
+     re.compile(r'device\.socure\.com|sdksocure', re.I),
+     None),
+
+    # Generic fingerprint endpoint heuristic
+    ("Generic Fingerprint",
+     re.compile(r'/(?:fingerprint|fp|device.?id|visitor.?id)/?(?:collect|token|identify|get)', re.I),
+     re.compile(r'"(?:visitor|device|fp)(?:Id|_id|Token)"', re.I)),
+]
+
 # ── /apikeys + /keydump specialized live patterns ─────────────────────────────
 _LIVE_API_PATTERNS = _LIVE_BODY_PATTERNS + [
     # Stripe sk/pk (explicit)
@@ -28263,6 +28372,69 @@ def _extract_3ds_redirect_fields(fields: list) -> list:
     return found
 
 
+
+def _live_match_af_fp(
+    live_requests: list,
+    patterns: list,
+    category: str,          # 'anti_fraud' | 'fingerprint'
+) -> list:
+    """
+    Scan intercepted live network requests against pattern list.
+    Returns list of finding dicts:
+    {
+      'category':   category,
+      'vendor':     label,
+      'endpoint':   request_url,
+      'method':     'POST'|'GET'|...,
+      'body_match': True|False,
+      'token_hint': str | None,
+      'source':     'live_network',
+    }
+    """
+    _TOKEN_EXTRACT = [
+        re.compile(r'"(?:visitor|device|fp|request)(?:Id|_id|Token)"\s*:\s*"([^"]{8,120})"', re.I),
+        re.compile(r'"(?:\$?session_id|mack|anid|bb_bb_field|session_key)"\s*:\s*"([^"]{4,120})"', re.I),
+        re.compile(r'(?:visitorId|deviceId|fpToken|ioBlackBox)=([A-Za-z0-9_\-\.]{8,120})', re.I),
+    ]
+    findings = []
+    seen: set = set()
+
+    for req in live_requests:
+        req_url   = req.get('url', '')
+        req_body  = req.get('body', '') or req.get('post_data', '') or ''
+        resp_body = req.get('response_body', '') or req.get('body_response', '') or ''
+        method    = req.get('method', 'GET')
+        combined  = req_url + ' ' + req_body + ' ' + resp_body
+
+        for label, url_pat, body_pat in patterns:
+            if not url_pat.search(req_url):
+                continue
+            body_match = bool(body_pat and body_pat.search(combined))
+            key = (label, req_url[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Extract token hint from response / request body
+            token_hint = None
+            for tp in _TOKEN_EXTRACT:
+                m = tp.search(combined)
+                if m:
+                    token_hint = m.group(1)[:80]
+                    break
+
+            findings.append({
+                'category':   category,
+                'vendor':     label,
+                'endpoint':   req_url[:200],
+                'method':     method,
+                'body_match': body_match,
+                'token_hint': token_hint,
+                'source':     'live_network',
+            })
+
+    return findings
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
@@ -28940,13 +29112,19 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     # ── ENH: Live network intercept — capture real tokens & sitekeys ─────
     # Combined pattern: payment + sitekey + hidden tokens (deduplicated by label)
     _pay_labels = {p[0] for p in _LIVE_PAY_PATTERNS}
-    _PAYLOAD_LIVE_PATTERNS = list(_LIVE_PAY_PATTERNS) + [
-        p for p in _LIVE_SITEKEY_PATTERNS if p[0] not in _pay_labels
-    ] + [
-        p for p in _LIVE_HIDDEN_PATTERNS  if p[0] not in _pay_labels
-    ]
-    live_result = {"live_requests": [], "live_findings": [], "sse_frames": [],
-                   "ws_frames": [], "response_bodies": {}, "error": None}
+    _af_labels  = {p[0] for p in _LIVE_ANTIFRAUD_PATTERNS}
+    _fp_labels  = {p[0] for p in _LIVE_FINGERPRINT_PATTERNS}
+    _PAYLOAD_LIVE_PATTERNS = (
+        list(_LIVE_PAY_PATTERNS)
+        + [p for p in _LIVE_SITEKEY_PATTERNS    if p[0] not in _pay_labels]
+        + [p for p in _LIVE_HIDDEN_PATTERNS      if p[0] not in _pay_labels]
+        + [p for p in _LIVE_ANTIFRAUD_PATTERNS   if p[0] not in _pay_labels]
+        + [p for p in _LIVE_FINGERPRINT_PATTERNS if p[0] not in _pay_labels]
+    )
+    live_result          = {"live_requests": [], "live_findings": [], "sse_frames": [],
+                            "ws_frames": [], "response_bodies": {}, "error": None}
+    live_antifraud_hits   = []   # populated after _stream_intercept_sync
+    live_fingerprint_hits = []   # populated after _stream_intercept_sync
     if PLAYWRIGHT_OK:
         if progress_cb: progress_cb("🔴 Live intercept: capturing real network tokens...")
         try:
@@ -29037,6 +29215,32 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     else:
         if progress_cb: progress_cb("⚠️ Live intercept skipped (Playwright not installed)")
 
+    # ── Section C2: Anti-Fraud + Fingerprint live signal matching ────────────
+    _live_reqs = live_result.get('live_requests', [])
+    live_antifraud_hits    = _live_match_af_fp(_live_reqs, _LIVE_ANTIFRAUD_PATTERNS,   'anti_fraud')
+    live_fingerprint_hits  = _live_match_af_fp(_live_reqs, _LIVE_FINGERPRINT_PATTERNS, 'fingerprint')
+
+    if live_antifraud_hits and progress_cb:
+        _af_vendors = ', '.join(h['vendor'] for h in live_antifraud_hits)
+        progress_cb(f"🛡️ Live anti-fraud detected: {_af_vendors}")
+
+    if live_fingerprint_hits and progress_cb:
+        _fp_vendors = ', '.join(h['vendor'] for h in live_fingerprint_hits)
+        progress_cb(f"🖐️ Live fingerprint SDK detected: {_fp_vendors}")
+
+    # Merge fingerprint token hints into resolved_tokens
+    for _fph in live_fingerprint_hits:
+        _hint        = _fph.get('token_hint')
+        _vendor      = _fph.get('vendor', 'fingerprint')
+        _field_hint  = re.sub(r'[^a-z0-9]', '_', _vendor.lower()) + '_token'
+        if _hint and _field_hint not in resolved_tokens:
+            resolved_tokens[_field_hint] = {
+                'value':      _hint,
+                'confidence': 'live',
+                'method':     'live_fingerprint_intercept',
+                'header_key': None,
+            }
+
     # ── ENH: Success / Decline pattern scan ───────────────────────────────
     if progress_cb: progress_cb("🔎 Scanning success / decline response patterns...")
     _live_bodies = [
@@ -29103,6 +29307,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'payment_sdks':      _sdks,                 # PATCHED
         'device_fingerprints': _device_fps,          # fingerprint SDKs
         'anti_fraud_layers':   _anti_fraud,           # anti-fraud middleware
+        'live_antifraud':      live_antifraud_hits,   # NEW — live AF signals
+        'live_fingerprints':   live_fingerprint_hits, # NEW — live FP signals
     }
 
 
@@ -29351,6 +29557,20 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             for s in _sdks[:4]
         )
         lines.append(f"📦 SDKs: {sdk_row}")
+
+    # ── Braintree Hosted Fields notice ────────────────────────
+    _bt = data.get('braintree_hosted')
+    if _bt:
+        _bt_token = (f"  token prefix: `{raw_code(_bt['client_token_prefix'])}`"
+                     if _bt.get('client_token_prefix') else "")
+        lines.append(
+            f"🌿 *Braintree Hosted Fields* — cross-origin iframes{_bt_token}"
+        )
+        lines.append(
+            f"  _Card data goes directly to Braintree — DOM scraping blocked_"
+        )
+        if _bt.get('iframe_src'):
+            lines.append(f"  `{raw_code(_bt['iframe_src'], 80)}`")
 
     # ── CAPTCHA / Sitekey block — full detail ────────────────
     _all_sitekeys = []
@@ -30035,6 +30255,27 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             elif ev.get('field_found'):
                 lines.append(f"    Form field: `{raw_code(ev['field_found'], 40)}`")
 
+    # ── LIVE ANTI-FRAUD SIGNALS ──────────────────────────────
+    af_live = data.get('live_antifraud', [])
+    fp_live = data.get('live_fingerprints', [])
+
+    if af_live:
+        lines.append(_sec(f"Live Anti-Fraud Signals  ·  {len(af_live)} detected", "🔴"))
+        for h in af_live:
+            _bm = "✅ body match" if h['body_match'] else "URL only"
+            _tk = f" → token: `{raw_code(h['token_hint'], 40)}`" if h.get('token_hint') else ""
+            lines.append(
+                f"  • `{raw_code(h['vendor'])}` [{raw_code(h['method'])}] {escape_md(_bm)}{_tk}"
+            )
+            lines.append(f"    `{raw_code(h['endpoint'], 80)}`")
+
+    if fp_live:
+        lines.append(_sec(f"Live Fingerprint SDKs  ·  {len(fp_live)} detected", "🔴"))
+        for h in fp_live:
+            _tk = f" → `{raw_code(h['token_hint'], 40)}`" if h.get('token_hint') else " _(no token captured)_"
+            lines.append(f"  • `{raw_code(h['vendor'])}`{_tk}")
+            lines.append(f"    `{raw_code(h['endpoint'], 80)}`")
+
     # ── MULTI-STEP ────────────────────────────────────────────
     ms = data.get('multistep')
     if ms:
@@ -30544,6 +30785,14 @@ def _build_json_export(data: dict) -> str:
         if ms.get('step_count') is not None: ms_obj['step_count'] = ms['step_count']
         if ms.get('is_checkout_page'): ms_obj['is_checkout_page'] = ms['is_checkout_page']
         signals['multistep'] = ms_obj
+    # ── Live AF / FP signals → signals section ───────────────
+    af_live = data.get('live_antifraud', [])
+    fp_live = data.get('live_fingerprints', [])
+    if af_live:
+        signals['live_anti_fraud'] = af_live
+    if fp_live:
+        signals['live_fingerprints'] = fp_live
+
     if signals:
         out['signals'] = signals
 
@@ -30690,6 +30939,84 @@ def _build_json_export(data: dict) -> str:
                 'confidence': lf.get('confidence'),
             }.items() if v}
             for lf in live_finds
+        ]
+
+    # ── [12b] braintree_hosted ───────────────────────────────
+    _bt_exp = data.get('braintree_hosted')
+    if _bt_exp:
+        out['braintree_hosted'] = {k: v for k, v in {
+            'gateway':             _bt_exp.get('gateway'),
+            'type':                _bt_exp.get('type'),
+            'cross_origin':        _bt_exp.get('cross_origin'),
+            'dom_accessible':      _bt_exp.get('dom_accessible'),
+            'client_token_prefix': _bt_exp.get('client_token_prefix') or None,
+            'iframe_src':          _bt_exp.get('iframe_src') or None,
+            'note':                _bt_exp.get('note') or None,
+        }.items() if v is not None}
+
+    # ── [12c] payment_sdks ────────────────────────────────────
+    _sdks_exp = data.get('payment_sdks', [])
+    if _sdks_exp:
+        out['payment_sdks'] = [
+            {k: v for k, v in {
+                'name':    s.get('name'),
+                'version': s.get('version') or None,
+                'source':  s.get('source') or None,
+            }.items() if v}
+            for s in _sdks_exp
+        ]
+
+    # ── [12d] device_fingerprints ─────────────────────────────
+    _dfps_exp = data.get('device_fingerprints', [])
+    if _dfps_exp:
+        out['device_fingerprints'] = [
+            {k: v for k, v in {
+                'vendor':      fp.get('vendor') or fp.get('name'),
+                'confidence':  fp.get('confidence') or None,
+                'field_name':  fp.get('field_name') or None,
+                'header_name': fp.get('header_name') or None,
+                'js_url':      fp.get('js_url') or None,
+                'note':        fp.get('note') or None,
+            }.items() if v}
+            for fp in _dfps_exp
+        ]
+
+    # ── [12e] anti_fraud_layers ───────────────────────────────
+    _afl_exp = data.get('anti_fraud_layers', [])
+    if _afl_exp:
+        out['anti_fraud_layers'] = [
+            {k: v for k, v in {
+                'vendor':      af.get('vendor') or af.get('name'),
+                'layer':       af.get('layer') or None,
+                'confidence':  af.get('confidence') or None,
+                'risk_impact': af.get('risk_impact') or None,
+                'fields': [
+                    {k2: v2 for k2, v2 in {
+                        'name':     f.get('name'),
+                        'role':     f.get('role') or None,
+                        'required': f.get('required'),
+                        'example':  f.get('example') or None,
+                    }.items() if v2 is not None}
+                    for f in af.get('fields', []) if f.get('required')
+                ] or None,
+                'headers': [
+                    h.get('name') for h in af.get('headers', []) if h.get('required')
+                ] or None,
+            }.items() if v}
+            for af in _afl_exp
+        ]
+
+    # ── [12f] content_type_mismatches ────────────────────────
+    _ctm_exp = data.get('content_type_mismatches', [])
+    if _ctm_exp:
+        out['content_type_mismatches'] = [
+            {k: v for k, v in {
+                'endpoint':        mm.get('endpoint') or mm.get('url') or None,
+                'form_enctype':    mm.get('form_enctype') or None,
+                'actual_ct':       mm.get('actual_ct') or None,
+                'mismatch_detail': mm.get('mismatch_detail') or None,
+            }.items() if v}
+            for mm in _ctm_exp
         ]
 
     # ── [13] response_patterns ───────────────────────────────
