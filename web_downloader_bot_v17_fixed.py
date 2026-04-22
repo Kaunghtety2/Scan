@@ -9996,40 +9996,186 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 except Exception:
                     pass
 
-            # Click interactive elements to trigger auth'd API calls
-            _trigger_selectors = [
-                "button:not([disabled])", "[role='button']",
-                "a[href='#']", "[data-toggle]", "[data-action]",
-                "input[type='submit']", "form button",
+            # ── ENHANCED LIVE MODE: Smart payment-focused interaction engine ──
+            # Phase A: Token field focus probing
+            # Focus on each sensitive field → triggers tokenization SDK init calls
+            _FOCUS_SELECTORS = [
+                "input[name*='card'], input[name*='cc'], input[autocomplete*='cc-']",
+                "input[name*='cvv'], input[name*='cvc'], input[name*='csc']",
+                "input[name*='exp'], input[name*='expiry']",
+                "input[name*='csrf'], input[name*='token'], input[name*='nonce']",
             ]
-            _clicks = 0
-            for sel in _trigger_selectors:
-                if _clicks >= 5:
-                    break
+            for _fsel in _FOCUS_SELECTORS:
                 try:
-                    els = page.query_selector_all(sel)
-                    for el in els[:2]:
-                        if el.is_visible():
-                            el.click(timeout=1000)
-                            page.wait_for_timeout(400)
-                            _clicks += 1
+                    _fel = page.query_selector(_fsel)
+                    if _fel and _fel.is_visible():
+                        _fel.focus()
+                        page.wait_for_timeout(300)
+                        _fel.blur()
+                        page.wait_for_timeout(200)
                 except Exception:
                     pass
 
-            # Wait for async API calls to settle — networkidle then short fixed flush
+            # Phase B: Smart checkout/payment button targeting
+            # Priority: payment-specific buttons FIRST, generic last
+            _PAY_BTN_SELECTORS = [
+                # Payment/checkout specific — highest priority
+                "button[id*='pay'], button[id*='checkout'], button[id*='purchase']",
+                "button[class*='pay'], button[class*='checkout'], button[class*='purchase']",
+                "button[data-action*='pay'], button[data-action*='checkout']",
+                "input[value*='Pay'], input[value*='Checkout'], input[value*='Purchase']",
+                # Continue / Next step buttons — for multi-step checkout flows
+                "button[id*='continue'], button[id*='next'], button[class*='continue']",
+                "a[href*='checkout'], a[href*='payment']",
+                # Form submit buttons (safe — Playwright won't navigate if form has no action)
+                "form button[type='submit']", "form input[type='submit']",
+                # Generic triggers — lowest priority
+                "[role='button'][aria-label*='pay' i]",
+                "[role='button'][aria-label*='checkout' i]",
+            ]
+
+            _interact_clicks = 0
+            _max_clicks = 6
+
+            for _bsel in _PAY_BTN_SELECTORS:
+                if _interact_clicks >= _max_clicks:
+                    break
+                try:
+                    _btns = page.query_selector_all(_bsel)
+                    for _btn in _btns[:2]:
+                        if _interact_clicks >= _max_clicks:
+                            break
+                        try:
+                            if not _btn.is_visible():
+                                continue
+                            # Safety: don't click navigation/back/cancel buttons
+                            _btn_text = (_btn.inner_text() or "").strip().lower()[:40]
+                            _SKIP_WORDS = ("cancel", "back", "close", "remove",
+                                           "delete", "clear", "dismiss", "skip")
+                            if any(w in _btn_text for w in _SKIP_WORDS):
+                                continue
+                            _btn.click(timeout=1500)
+                            page.wait_for_timeout(600)
+                            _interact_clicks += 1
+                            if progress_cb:
+                                progress_cb(
+                                    f"🖱️ Clicked: \"{_btn_text[:30]}\" "
+                                    f"({_interact_clicks}/{_max_clicks})"
+                                )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Phase C: Form field fill-probe (tokenization SDK trigger)
+            # Fill card fields with test placeholders — triggers Stripe/Braintree
+            # SDK tokenize() calls WITHOUT submitting the form
+            _FILL_MAP = {
+                # card number
+                r"card[_-]?num|cc[_-]?num|cardnumber|pan$": "4111111111111111",
+                r"cvv|cvc|csc|card[_-]?code":               "123",
+                r"exp[_-]?month|expirationdatemonth|cc[_-]?month": "12",
+                r"exp[_-]?year|expirationdateyear|cc[_-]?year":    "2028",
+                r"card[_-]?holder|name[_-]?on[_-]?card":    "Test User",
+                r"zip|postal":                               "10001",
+            }
+            try:
+                _inputs = page.query_selector_all("input:visible, input[type='tel']")
+                for _inp in _inputs[:30]:
+                    try:
+                        _iname = (_inp.get_attribute("name") or
+                                  _inp.get_attribute("id") or "").lower()
+                        if not _iname:
+                            continue
+                        for _pat_str, _fill_val in _FILL_MAP.items():
+                            if re.search(_pat_str, _iname, re.I):
+                                _inp.fill(_fill_val)
+                                page.wait_for_timeout(150)
+                                # Trigger change/input events so SDK picks it up
+                                _inp.dispatch_event("input")
+                                _inp.dispatch_event("change")
+                                _inp.blur()
+                                page.wait_for_timeout(200)
+                                break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Phase D: Token refresh probing
+            # Dispatch visibility events → triggers background token refresh calls
+            _REFRESH_EVENTS = [
+                "() => document.dispatchEvent(new Event('visibilitychange'))",
+                "() => document.dispatchEvent(new Event('focus'))",
+                "() => window.dispatchEvent(new Event('focus'))",
+            ]
+            for _ev_js in _REFRESH_EVENTS:
+                try:
+                    page.evaluate(_ev_js)
+                    page.wait_for_timeout(400)
+                except Exception:
+                    pass
+
+            # Phase E: Response body scan for payment intents / client secrets
+            # After all interactions — wait for async SDK calls to settle
             try:
                 page.wait_for_load_state("networkidle", timeout=6_000)
             except Exception:
                 pass
-            # Short flush — lets fetch .then() / XHR onload callbacks write to __streamLog
-            # 1.5s is enough for 99% of SPAs; saves 1.5s per scan vs old 3s
-            page.wait_for_timeout(1500)
-            # Trigger any deferred API calls via focus/blur cycle (auth token refresh)
+
+            # Capture any late dynamic tokens injected into DOM after interactions
             try:
-                page.evaluate("() => { document.dispatchEvent(new Event('visibilitychange')); }")
-                page.wait_for_timeout(500)
+                _post_interact_tokens = page.evaluate("""() => {
+                    const results = {};
+                    // CSRF/nonce hidden fields (may rotate after interaction)
+                    document.querySelectorAll('input[type="hidden"]').forEach(el => {
+                        const n = el.name || el.id || '';
+                        const v = el.value || '';
+                        if (n && v && /token|csrf|nonce|_wp/i.test(n))
+                            results[n] = v.slice(0, 200);
+                    });
+                    // Meta CSRF tags
+                    document.querySelectorAll('meta[name*="csrf"], meta[name*="token"]')
+                        .forEach(m => {
+                            const n = m.getAttribute('name') || '';
+                            const v = m.getAttribute('content') || '';
+                            if (n && v) results['meta:' + n] = v.slice(0, 200);
+                        });
+                    // Stripe payment intent client_secret in global vars
+                    const _keys = ['__stripe_params', 'stripePublishableKey',
+                                   '__payment_intent', 'paymentIntentClientSecret'];
+                    _keys.forEach(k => {
+                        try {
+                            const v = window[k];
+                            if (v) results['js:' + k] = String(v).slice(0, 200);
+                        } catch(e) {}
+                    });
+                    return results;
+                }""")
+                if _post_interact_tokens:
+                    # Inject into __streamLog so secret extractor picks them up
+                    for _tok_name, _tok_val in _post_interact_tokens.items():
+                        if _tok_val and len(_tok_val) > 6:
+                            raw_log_extra = {
+                                "type":   "fetch_response",
+                                "url":    url + "#post_interact_dom",
+                                "body":   f'{{"__live_dom_token":"{_tok_name}","value":"{_tok_val}"}}',
+                                "status": 200,
+                                "source": "post_interact_dom",
+                            }
+                            # Will be merged into raw_log below
+                            _plw_response_bodies[url + f"#dom_{_tok_name}"] = (
+                                f'"{_tok_name}":"{_tok_val}"'
+                            )
+                    if progress_cb:
+                        progress_cb(
+                            f"🔑 Post-interact DOM: {len(_post_interact_tokens)} token(s) captured"
+                        )
             except Exception:
                 pass
+
+            # Final flush — lets remaining async callbacks write to __streamLog
+            page.wait_for_timeout(1500)
 
             # ── Read JS hook log ───────────────────────────────────────────
             try:
@@ -10187,10 +10333,77 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     val = m.group(1) if m.lastindex else m.group(0)
                     _add_live(label, val.strip(), src, confidence="HIGH")
 
+        # 6. ENHANCED: Payment-specific response patterns
+        # Stripe client_secret / payment_intent — only in response bodies
+        _PAYMENT_RESP_PATTERNS = [
+            ("Stripe client_secret",
+             re.compile(r'["\']client_secret["\']\s*:\s*["\']'
+                        r'(pi_[A-Za-z0-9_]+_secret_[A-Za-z0-9_]+)["\']', re.I)),
+            ("Stripe PaymentIntent ID",
+             re.compile(r'["\'](?:id|payment_intent)["\']\s*:\s*["\']'
+                        r'(pi_[A-Za-z0-9]{20,})["\']', re.I)),
+            ("Stripe SetupIntent secret",
+             re.compile(r'["\']client_secret["\']\s*:\s*["\']'
+                        r'(seti_[A-Za-z0-9_]+_secret_[A-Za-z0-9_]+)["\']', re.I)),
+            ("Braintree client_token",
+             re.compile(r'["\'](?:clientToken|client_token)["\']\s*:\s*["\']'
+                        r'([A-Za-z0-9+/=]{40,})["\']', re.I)),
+            ("PayPal order_id",
+             re.compile(r'["\'](?:orderID|order_id|id)["\']\s*:\s*["\']'
+                        r'([A-Z0-9]{17})["\']')),
+            ("CSRF token (response)",
+             re.compile(r'["\'](?:csrf_?token|_token|csrfmiddlewaretoken)["\']\s*:\s*["\']'
+                        r'([A-Za-z0-9+/=_\-]{20,})["\']', re.I)),
+            ("Session token (response)",
+             re.compile(r'["\'](?:session_?id|sess_?token|session_?token)["\']\s*:\s*["\']'
+                        r'([A-Za-z0-9+/=_\-]{16,})["\']', re.I)),
+            ("JWT (response)",
+             re.compile(r'(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)')),
+            ("Access token (response)",
+             re.compile(r'["\']access_?token["\']\s*:\s*["\']'
+                        r'([A-Za-z0-9+/=_\-\.]{20,})["\']', re.I)),
+            ("Nonce (response)",
+             re.compile(r'["\']nonce["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{8,})["\']', re.I)),
+        ]
+
+        _PAY_URLS = re.compile(
+            r'stripe|braintree|paypal|adyen|checkout|payment|pay|order|cart|billing',
+            re.I
+        )
+        for u, body in _plw_response_bodies.items():
+            if not body:
+                continue
+            src = f"Pay-Response ← {u[:60]}"
+            is_pay_url = bool(_PAY_URLS.search(u))
+            for label, pat in _PAYMENT_RESP_PATTERNS:
+                for m in pat.finditer(body):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    val = val.strip()
+                    if len(val) < 8:
+                        continue
+                    # For generic session/CSRF patterns, only report from payment URLs
+                    if not is_pay_url and label in (
+                        "Session token (response)", "Nonce (response)"
+                    ):
+                        continue
+                    _add_live(label, val, src, confidence="HIGH")
+
+        # 7. Post-interact DOM tokens (captured in Phase E above)
+        for u, body in _plw_response_bodies.items():
+            if "#dom_" not in u and "#post_interact" not in u:
+                continue
+            src = "Post-interact DOM token"
+            for label, pat in _PAYMENT_RESP_PATTERNS:
+                for m in pat.finditer(body):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    if val and len(val.strip()) > 6:
+                        _add_live(label, val.strip(), src, confidence="HIGH")
+
         if progress_cb:
             progress_cb(
                 f"🔴 Live findings: `{len(live_findings)}` secrets | "
-                f"`{len(_ws_frames)}` WS frames scanned"
+                f"`{len(_ws_frames)}` WS frames | "
+                f"Phases: focus-probe → pay-click → field-fill → token-refresh → DOM-scan"
             )
 
         return {
@@ -27256,6 +27469,630 @@ def _resolve_dynamic_tokens(
     return resolved
 
 
+def _detect_anti_fraud_layers(html: str, js_text: str,
+                               script_urls: list = None,
+                               resp_headers: dict = None,
+                               all_forms: list = None) -> list:
+    """
+    Detect anti-fraud middleware layers sitting between checkout and
+    payment processor. These are distinct from device fingerprinting SDKs:
+    they perform real-time transaction risk scoring and inject their own
+    required fields/tokens.
+
+    Detection covers:
+      - Client-side JS SDK presence (script src + globals)
+      - Hidden form fields with fraud-layer field names
+      - Response headers from fraud-layer proxies/APIs
+      - API endpoint patterns in XHR calls
+
+    Returns list of dicts:
+        name         – display name
+        vendor       – vendor slug
+        layer        – 'pre_auth' | 'post_auth' | 'realtime' | 'batch'
+        fields       – list of {name, role, required, example}
+        headers      – list of {name, value_pattern, required}
+        api_endpoints – list of known API call patterns
+        evidence     – {js_url, global_var, field_found, header_found}
+        risk_impact  – human-readable note on what breaks when absent
+        confidence   – 'high' | 'medium' | 'low'
+    """
+    combined   = (html or '') + (js_text or '') + ' '.join(script_urls or [])
+    resp_hdrs  = {k.lower(): v for k, v in (resp_headers or {}).items()}
+    form_fields = {
+        f.get('name', '').lower()
+        for form in (all_forms or [])
+        for f in form.get('fields', [])
+        if f.get('name')
+    }
+
+    findings: list   = []
+    seen_vendors: set = set()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Vendor table — each entry:
+    # (vendor, name, layer, confidence,
+    #  src_pats, js_pats, header_pats, field_pats, api_pats,
+    #  fields_spec, headers_spec, api_endpoints, risk_impact)
+    # ─────────────────────────────────────────────────────────────────────
+    _AF_TABLE = [
+
+        # ── Kount ────────────────────────────────────────────────────────
+        (
+            'kount',
+            'Kount (Equifax)',
+            'pre_auth',
+            'high',
+            # src_pats — script URLs
+            [re.compile(r'kount\.com|kaxsdc\.js|kountcollect', re.I)],
+            # js_pats — globals/calls
+            [re.compile(r'kaxsdc|ka\.sessionId|Kount\.init|KOUNT_SESSION|kountSessionId', re.I)],
+            # header_pats
+            [re.compile(r'x-kount', re.I)],
+            # field_pats — form field names
+            [re.compile(r'kount.?session|session.?kount|ka\.sessionId|device_id.*kount', re.I)],
+            # api_pats
+            [re.compile(r'kount\.com/api|api\.kount\.net', re.I)],
+            # fields_spec
+            [
+                {'name': 'ka.sessionId',   'role': 'device_session',  'required': True,  'example': '<kount_session_uuid>'},
+                {'name': 'merchant_id',    'role': 'kount_merchant',   'required': True,  'example': '<6_digit_merchant_id>'},
+                {'name': 'device_id',      'role': 'device_fingerprint','required': False, 'example': '<kount_device_id>'},
+            ],
+            # headers_spec
+            [{'name': 'X-Kount-Session', 'value_pattern': 'session-uuid', 'required': False}],
+            # api_endpoints
+            ['/api/v0/call', '/api/v1/risk/inquiry'],
+            # risk_impact
+            'Kount scores transaction pre-auth — absent session_id → REVIEW hold or DECLINE',
+        ),
+
+        # ── Forter ───────────────────────────────────────────────────────
+        (
+            'forter',
+            'Forter Anti-Fraud',
+            'realtime',
+            'high',
+            [re.compile(r'forter\.com/forter\.js|cdn\.forter\.com|api\.forter\.com', re.I)],
+            [re.compile(r'forterToken|ftrToken|window\.Forter|FORTER_TOKEN|forter\.init', re.I)],
+            [re.compile(r'x-forter-token|forter-site-id', re.I)],
+            [re.compile(r'forter.?token|ftr.?token', re.I)],
+            [re.compile(r'api\.forter\.com/v\d+|forter\.com/api', re.I)],
+            [
+                {'name': 'forterToken',   'role': 'realtime_decision', 'required': True,  'example': '<forter_token_string>'},
+                {'name': 'forter_site_id','role': 'merchant_id',        'required': True,  'example': '<forter_site_id>'},
+            ],
+            [{'name': 'X-Forter-Token', 'value_pattern': 'forter-token-jwt', 'required': True}],
+            ['/v1/fraud/decisions', '/v2/orders'],
+            'Forter gives approve/decline in <300ms — missing token → automatic DECLINE',
+        ),
+
+        # ── Signifyd ─────────────────────────────────────────────────────
+        (
+            'signifyd',
+            'Signifyd Guarantee',
+            'post_auth',
+            'high',
+            [re.compile(r'cdn\.signifyd\.com|signifyd\.js|signifyd\.fingerprint', re.I)],
+            [re.compile(r'SIGNIFYD_SESSION_ID|signifydFingerprint|Signifyd\.init|signifydOrderSessionId', re.I)],
+            [re.compile(r'x-signifyd|signifyd-order', re.I)],
+            [re.compile(r'signifyd.?session|signifyd.?id|checkout.?id.*signifyd', re.I)],
+            [re.compile(r'api\.signifyd\.com/v\d+|signifyd\.com/api', re.I)],
+            [
+                {'name': 'SIGNIFYD_SESSION_ID',      'role': 'device_session',  'required': True,  'example': '<signifyd_session_uuid>'},
+                {'name': 'purchase[checkoutId]',      'role': 'checkout_id',     'required': True,  'example': '<checkout_uuid>'},
+                {'name': 'purchase[orderId]',         'role': 'order_id',        'required': False, 'example': '<merchant_order_id>'},
+            ],
+            [{'name': 'X-Signifyd-Sec-Hmac-Sha256', 'value_pattern': 'base64-hmac', 'required': True}],
+            ['/v2/cases', '/v2/orders', '/v2/checkouts'],
+            'Signifyd guarantees chargebacks — absent session_id → order held for manual review',
+        ),
+
+        # ── Riskified ────────────────────────────────────────────────────
+        (
+            'riskified',
+            'Riskified Chargeback Guarantee',
+            'post_auth',
+            'high',
+            [re.compile(r'beacon\.riskified\.com|riskified\.js|checkout\.riskified', re.I)],
+            [re.compile(r'riskified|RISKIFIED_SESSION|riskifiedSession|riskified\.init', re.I)],
+            [re.compile(r'x-riskified-hmac|x-riskified-session', re.I)],
+            [re.compile(r'riskified.?session|riskified.?token', re.I)],
+            [re.compile(r'api\.riskified\.com/decide|beacon\.riskified\.com', re.I)],
+            [
+                {'name': 'riskifiedSession',  'role': 'device_session',   'required': True,  'example': '<riskified_session_id>'},
+                {'name': 'cart_token',        'role': 'cart_reference',    'required': True,  'example': '<shopify_cart_token>'},
+            ],
+            [
+                {'name': 'X-RISKIFIED-HMAC-SHA256', 'value_pattern': 'base64-hmac', 'required': True},
+                {'name': 'X-Riskified-Shop-Domain', 'value_pattern': 'shop.domain', 'required': True},
+            ],
+            ['/decide', '/api/v2/orders'],
+            'Riskified chargeback guarantee — absent session → rejected from guarantee program',
+        ),
+
+        # ── NoFraud ──────────────────────────────────────────────────────
+        (
+            'nofraud',
+            'NoFraud Screening',
+            'realtime',
+            'high',
+            [re.compile(r'nofraud\.com|nf\.js|nofraud-protect', re.I)],
+            [re.compile(r'NoFraud|nf\.token|nofraud\.token|NoFraud\.init', re.I)],
+            [re.compile(r'x-nofraud|nofraud-api-key', re.I)],
+            [re.compile(r'nofraud.?token|nf.?session', re.I)],
+            [re.compile(r'api\.nofraud\.com|gateway\.nofraud\.com', re.I)],
+            [
+                {'name': 'nf_token',    'role': 'session_token', 'required': True,  'example': '<nofraud_token>'},
+                {'name': 'nf_order_id', 'role': 'order_ref',     'required': False, 'example': '<order_id>'},
+            ],
+            [{'name': 'X-NoFraud-API-Key', 'value_pattern': 'api-key', 'required': True}],
+            ['/api/check', '/transaction/check'],
+            'NoFraud screens in real-time — missing token → transaction skips screening (fraud risk flagged)',
+        ),
+
+        # ── Stripe Radar (server-side rules) ─────────────────────────────
+        (
+            'stripe_radar',
+            'Stripe Radar Rules',
+            'realtime',
+            'medium',
+            [re.compile(r'js\.stripe\.com/v3', re.I)],
+            [re.compile(r'stripe\.Radar|radar\.session|stripe_mid|risk_level', re.I)],
+            [],
+            [re.compile(r'radar.?session|stripe.?session.?id', re.I)],
+            [re.compile(r'api\.stripe\.com/v1/radar', re.I)],
+            [
+                {'name': 'radar[session]',  'role': 'radar_session',    'required': True,  'example': '<stripe_radar_session>'},
+                {'name': 'stripe_mid',      'role': 'device_fingerprint','required': False, 'example': '<stripe_mids>'},
+            ],
+            [],
+            ['/v1/radar/sessions', '/v1/payment_intents'],
+            'Stripe Radar uses radar[session] for ML scoring — absent → default rule set only',
+        ),
+
+        # ── ClearSale ────────────────────────────────────────────────────
+        (
+            'clearsale',
+            'ClearSale Fraud Prevention',
+            'post_auth',
+            'medium',
+            [re.compile(r'clearsale\.com\.br|clearsale\.js|fp\.clearsale', re.I)],
+            [re.compile(r'ClearSale|clearSaleSession|cs\.session|ClearSaleToken', re.I)],
+            [re.compile(r'x-clearsale|clearsale-app-key', re.I)],
+            [re.compile(r'clearsale.?session|cs.?token', re.I)],
+            [re.compile(r'api\.clearsale\.com\.br|integration\.clearsale', re.I)],
+            [
+                {'name': 'csSessionId',      'role': 'device_session', 'required': True,  'example': '<clearsale_session>'},
+                {'name': 'clearSaleAppKey',  'role': 'merchant_key',   'required': True,  'example': '<clearsale_app_key>'},
+            ],
+            [{'name': 'X-ClearSale-AppKey', 'value_pattern': 'app-key', 'required': True}],
+            ['/api/v1/orders', '/api/v2/decisions'],
+            'ClearSale required for LatAm markets — absent session → order suspended',
+        ),
+
+        # ── Accertify ────────────────────────────────────────────────────
+        (
+            'accertify',
+            'Accertify (Amex)',
+            'pre_auth',
+            'medium',
+            [re.compile(r'accertify\.com|accertify\.js|fingerprint\.accertify', re.I)],
+            [re.compile(r'Accertify|accertifySessionId|ACCERTIFY|acc\.session', re.I)],
+            [re.compile(r'x-accertify|accertify-merchant', re.I)],
+            [re.compile(r'accertify.?session|acc.?session', re.I)],
+            [re.compile(r'api\.accertify\.com|accertify\.com/api', re.I)],
+            [
+                {'name': 'accertifySessionId', 'role': 'device_session', 'required': True,  'example': '<accertify_session>'},
+                {'name': 'merchantId',         'role': 'merchant_id',    'required': True,  'example': '<accertify_merchant_id>'},
+            ],
+            [],
+            ['/v1/transactions/evaluate'],
+            'Amex-owned fraud tool — common in large retail; absent → manual review queue',
+        ),
+
+        # ── PayPal Fraud Net ──────────────────────────────────────────────
+        (
+            'paypal_fraudnet',
+            'PayPal Fraud Net',
+            'pre_auth',
+            'high',
+            [re.compile(r'c\.paypal\.com/da/r/fb\.js|fraudnet\.js|paypalobjects.*fraudnet', re.I)],
+            [re.compile(r'PAYPAL_FRAUD|fraudNetId|fnparams|fraudnet\.init|fncls', re.I)],
+            [re.compile(r'x-paypal-fraudnet|paypal-client-metadata-id', re.I)],
+            [re.compile(r'fnparams|fraudnet.?id|paypal.?fraud.?id|paypal.?client.?metadata', re.I)],
+            [re.compile(r'api\.paypal\.com/v\d+/fraud|c\.paypal\.com', re.I)],
+            [
+                {'name': 'fnparams-dede07f6-e604-4571-b7c7-c5838c9b0f1b',
+                                         'role': 'fraudnet_session', 'required': True,  'example': '<paypal_fraudnet_session>'},
+                {'name': 'paypal-client-metadata-id', 'role': 'metadata', 'required': True, 'example': '<uuid>'},
+            ],
+            [{'name': 'PayPal-Client-Metadata-Id', 'value_pattern': 'uuid', 'required': True}],
+            ['/v1/risk/transaction-contexts', '/v2/checkout/orders'],
+            'PayPal FraudNet required for PayPal checkout — absent → higher decline rate',
+        ),
+
+        # ── Cybersource Decision Manager ──────────────────────────────────
+        (
+            'cybersource_dm',
+            'CyberSource Decision Manager',
+            'pre_auth',
+            'high',
+            [re.compile(r'cybersource\.com.*dm|decision.?manager.*cybersource|deviceFingerprint.*cyber', re.I)],
+            [re.compile(r'CyberSource|cybs\.device|dmMerchantId|merchant_defined_data|cybersource.*session', re.I)],
+            [re.compile(r'x-cybersource|cybersource-merchant', re.I)],
+            [re.compile(r'merchant_defined_data|cybs.?device|device.?fingerprint.*cybs', re.I)],
+            [re.compile(r'api\.cybersource\.com/risk|cybersource\.com/transactions', re.I)],
+            [
+                {'name': 'device_fingerprint_id', 'role': 'device_session',  'required': True,  'example': '<cybs_device_fp_id>'},
+                {'name': 'merchant_defined_data1','role': 'custom_fraud_data','required': False, 'example': '<custom_value>'},
+                {'name': 'merchant_id',           'role': 'cybersource_mid',  'required': True,  'example': '<merchant_id>'},
+            ],
+            [],
+            ['/risk/v1/decisions', '/pts/v2/payments'],
+            'CyberSource DM blocks at payment gateway level — absent device_fp → REVIEW',
+        ),
+
+        # ── SEON ─────────────────────────────────────────────────────────
+        (
+            'seon',
+            'SEON Fraud Prevention',
+            'realtime',
+            'medium',
+            [re.compile(r'cdn\.seon\.io|seon\.js|seondf\.com', re.I)],
+            [re.compile(r'seon\.init|SEON\.init|seonSession|seon_session_id', re.I)],
+            [re.compile(r'x-seon|seon-api-key', re.I)],
+            [re.compile(r'seon.?session|seon.?token', re.I)],
+            [re.compile(r'api\.seon\.io/SeonRestService|seon\.io/api', re.I)],
+            [
+                {'name': 'seon_session_id', 'role': 'device_session', 'required': True,  'example': '<seon_session_id>'},
+            ],
+            [{'name': 'X-API-KEY', 'value_pattern': 'seon-api-key', 'required': True}],
+            ['/SeonRestService/api/v2/fraud-api/check'],
+            'SEON email/phone/IP intelligence — absent session → risk score unavailable',
+        ),
+
+        # ── Bolt Checkout ─────────────────────────────────────────────────
+        (
+            'bolt',
+            'Bolt Checkout (Fraud)',
+            'realtime',
+            'high',
+            [re.compile(r'connect\.bolt\.com|bolt\.js|bolt-checkout', re.I)],
+            [re.compile(r'Bolt\.configure|BoltCheckout|bolt\.authorizationToken|bolt_publishable_key', re.I)],
+            [re.compile(r'x-bolt-hmac|bolt-api-key', re.I)],
+            [re.compile(r'bolt.?token|bolt.?auth|bolt.?session', re.I)],
+            [re.compile(r'api\.bolt\.com/v\d+/orders|bolt\.com/api', re.I)],
+            [
+                {'name': 'bolt_token',          'role': 'bolt_auth_token',  'required': True,  'example': '<bolt_oauth_token>'},
+                {'name': 'publishable_key',      'role': 'bolt_pub_key',     'required': True,  'example': '<bolt_publishable_key>'},
+            ],
+            [
+                {'name': 'X-Bolt-HMAC-SHA256', 'value_pattern': 'base64-hmac',    'required': True},
+                {'name': 'X-Bolt-Nonce',       'value_pattern': 'epoch-timestamp', 'required': True},
+            ],
+            ['/v1/transactions/authorize', '/v1/account/exists'],
+            'Bolt handles full checkout + fraud — bypassing Bolt JS breaks entire checkout flow',
+        ),
+    ]
+
+    # ── Scan all patterns ─────────────────────────────────────────────────
+    _src_urls = re.findall(r'<script[^>]+src=["\'"]([^"\']+)["\'"]', html or '', re.I)
+    _src_str  = ' '.join(_src_urls + (script_urls or []))
+
+    for (vendor, name, layer, confidence,
+         src_pats, js_pats, hdr_pats, field_pats, api_pats,
+         fields_spec, headers_spec, api_endpoints, risk_impact) in _AF_TABLE:
+
+        if vendor in seen_vendors:
+            continue
+
+        matched_src    = any(p.search(combined) or p.search(_src_str) for p in src_pats)
+        matched_js     = any(p.search(combined) for p in js_pats)
+        matched_hdr    = any(p.search(k) for p in hdr_pats for k in resp_hdrs)
+        matched_field  = any(p.search(fn) for p in field_pats for fn in form_fields)
+        matched_api    = any(p.search(combined) for p in api_pats)
+
+        hit_count = sum([matched_src, matched_js, matched_hdr,
+                         matched_field, matched_api])
+        if hit_count == 0:
+            continue
+
+        seen_vendors.add(vendor)
+
+        # Confidence: 2+ signals → original, 1 signal → downgrade one level
+        _conf_map = {'high': 'medium', 'medium': 'low', 'low': 'low'}
+        eff_confidence = confidence if hit_count >= 2 else _conf_map[confidence]
+
+        # Build evidence dict
+        evidence: dict = {}
+        if matched_src:
+            for u in _src_urls + (script_urls or []):
+                if any(p.search(u) for p in src_pats):
+                    evidence['js_url'] = u[:120]
+                    break
+        if matched_js:
+            for p in js_pats:
+                m = p.search(combined)
+                if m:
+                    evidence['global_var'] = m.group(0)[:60]
+                    break
+        if matched_field:
+            evidence['field_found'] = next(
+                fn for fn in form_fields
+                if any(p.search(fn) for p in field_pats)
+            )
+        if matched_hdr:
+            evidence['header_found'] = next(
+                k for k in resp_hdrs
+                if any(p.search(k) for p in hdr_pats)
+            )
+
+        findings.append({
+            'name':         name,
+            'vendor':       vendor,
+            'layer':        layer,
+            'fields':       fields_spec,
+            'headers':      headers_spec,
+            'api_endpoints': api_endpoints,
+            'evidence':     evidence,
+            'risk_impact':  risk_impact,
+            'confidence':   eff_confidence,
+        })
+
+    return findings
+
+
+def _detect_device_fingerprints(html: str, js_text: str,
+                                 script_urls: list = None,
+                                 resp_headers: dict = None) -> list:
+    """
+    Detect device/browser fingerprinting SDKs that inject hidden tokens
+    into payment forms (fp_token, _dd_s, __cf_bm, etc.).
+
+    Returns list of dicts:
+        name          – SDK display name
+        vendor        – vendor slug  (fingerprintjs|datadome|maxmind|...)
+        field_name    – the hidden POST field name injected (if known)
+        header_name   – request header name (if SDK sends via header)
+        js_url        – first matching script URL (for evidence)
+        confidence    – 'high' | 'medium' | 'low'
+        note          – human-readable payload impact note
+    """
+    combined    = (html or '') + (js_text or '') + ' '.join(script_urls or [])
+    resp_hdrs   = {k.lower(): v for k, v in (resp_headers or {}).items()}
+
+    findings  = []
+    seen_vendors: set = set()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Detection table
+    # (vendor, name, confidence, src_patterns, html_patterns, field_name,
+    #  header_name, note)
+    # ─────────────────────────────────────────────────────────────────────
+    _FP_TABLE = [
+        # ── FingerprintJS / Fingerprint Pro ──────────────────────────────
+        (
+            'fingerprintjs',
+            'FingerprintJS / Fingerprint Pro',
+            'high',
+            [re.compile(r'fpnpmcdn\.net|fp\.min\.js|fingerprint(?:js)?(?:\-pro)?(?:\.min)?\.js|@fingerprintjs/fingerprintjs', re.I),
+             re.compile(r'fp\.fingerprintjs\.com|cdn\.jsdelivr\.net.*fingerprintjs', re.I)],
+            [re.compile(r'FingerprintJS\.load|fpAgent\.get\(|requestId.*visitorId|visitorId.*requestId', re.I),
+             re.compile(r'new\s+FingerprintJS|FpjsClient|getResult\(|fpPromise\.then', re.I)],
+            'visitorId',   # field name that POST body usually carries
+            None,
+            'Injects visitorId + requestId into POST — missing token → order rejected',
+        ),
+        # ── DataDome ─────────────────────────────────────────────────────
+        (
+            'datadome',
+            'DataDome',
+            'high',
+            [re.compile(r'tag\.datadome\.co|datadome\.co/js|dd\.js', re.I)],
+            [re.compile(r'DataDome|window\.__DD_|_dd_s\s*=|datadome\.cookie', re.I)],
+            '_dd_s',
+            'X-DataDome-ClientID',
+            'Sets _dd_s cookie + X-DataDome-ClientID header — absent → 403 block',
+        ),
+        # ── MaxMind minFraud / Device Intelligence ────────────────────────
+        (
+            'maxmind',
+            'MaxMind Device Intelligence',
+            'high',
+            [re.compile(r'device\.maxmind\.com|minfraud.*device|maxmind.*device', re.I),
+             re.compile(r'maxmind\.com/js|minFraud\.js', re.I)],
+            [re.compile(r'geoip2\.deviceType|minFraud|maxmind\.SessionId|maxmind_session', re.I)],
+            'maxmind_session_id',
+            None,
+            'Sends device_session_id hidden field to /minfraud endpoint',
+        ),
+        # ── Cloudflare Bot Management (__cf_bm) ───────────────────────────
+        (
+            'cloudflare_bot',
+            'Cloudflare Bot Management',
+            'high',
+            [re.compile(r'challenges\.cloudflare\.com|cf-challenge|__cf_bm', re.I)],
+            [re.compile(r'__cf_bm|cf_clearance|turnstile\.cloudflare\.com', re.I)],
+            '__cf_bm',
+            'CF-Connecting-IP',
+            '__cf_bm cookie auto-set by CF — intercepting bypasses it but re-request needed',
+        ),
+        # ── Cloudflare Turnstile ──────────────────────────────────────────
+        (
+            'cloudflare_turnstile',
+            'Cloudflare Turnstile',
+            'high',
+            [re.compile(r'challenges\.cloudflare\.com/turnstile|turnstile\.cloudflare\.com', re.I)],
+            [re.compile(r'cf-turnstile|data-sitekey.*turnstile|turnstile\.ready|TURNSTILE', re.I)],
+            'cf-turnstile-response',
+            None,
+            'cf-turnstile-response token required in POST — solve via 2captcha/capsolver',
+        ),
+        # ── PerimeterX / HUMAN ────────────────────────────────────────────
+        (
+            'perimeterx',
+            'PerimeterX / HUMAN',
+            'high',
+            [re.compile(r'client\.perimeterx\.net|px\.js|human\.security\.com', re.I)],
+            [re.compile(r'_pxhd|_pxvid|_px3|PX\.init|pxCallback|window\._pxParam', re.I)],
+            '_pxhd',
+            'X-PX-Authorization',
+            'Injects _pxhd + _px3 cookies; X-PX-Authorization header blocks headless',
+        ),
+        # ── Akamai Bot Manager ────────────────────────────────────────────
+        (
+            'akamai_bot',
+            'Akamai Bot Manager',
+            'high',
+            [re.compile(r'akamai-bot-manager|bm\.js|bm-telemetry', re.I),
+             re.compile(r'akamaized\.net.*bm|sensor_data', re.I)],
+            [re.compile(r'sensor_data|_abck|bm_sz|akamai.*telemetry|bmak\.', re.I)],
+            'sensor_data',
+            None,
+            'sensor_data + _abck cookie required — collected via JS telemetry on page load',
+        ),
+        # ── Imperva / Incapsula ───────────────────────────────────────────
+        (
+            'imperva',
+            'Imperva / Incapsula',
+            'medium',
+            [re.compile(r'imperva\.com|incapsula\.com|visid_incap|___utmvc', re.I)],
+            [re.compile(r'incap_ses|visid_incap|___utmvc|reese84', re.I)],
+            'reese84',
+            None,
+            'reese84 cookie challenge — must be solved before checkout POST',
+        ),
+        # ── Signifyd device fingerprint ───────────────────────────────────
+        (
+            'signifyd',
+            'Signifyd Device Fingerprint',
+            'high',
+            [re.compile(r'cdn\.signifyd\.com|signifyd\.js|signifyd\.fingerprint', re.I)],
+            [re.compile(r'SIGNIFYD_SESSION_ID|signifydFingerprint|Signifyd\.init', re.I)],
+            'purchase[checkoutId]',
+            None,
+            'SIGNIFYD_SESSION_ID injected into checkout form — absent → fraud decline',
+        ),
+        # ── Sift Science / Sift ───────────────────────────────────────────
+        (
+            'sift',
+            'Sift Science',
+            'high',
+            [re.compile(r'cdn\.sift\.com|sift\.js|_sift\.js', re.I)],
+            [re.compile(r'\_sift|sift\.beacon|sift\.userId|SiftScience', re.I)],
+            '_sift_session_id',
+            None,
+            '_sift session score sent server-side — missing → order held for review',
+        ),
+        # ── Kount ────────────────────────────────────────────────────────
+        (
+            'kount',
+            'Kount / Equifax Fraud',
+            'medium',
+            [re.compile(r'kount\.com/collect|kountcollect\.js|kaxsdc', re.I)],
+            [re.compile(r'kaxsdc|merchant_id.*kount|KOUNT_SESSION|ka\.sessionId', re.I)],
+            'ka.sessionId',
+            None,
+            'Kount collects device data → session_id must match on backend verify',
+        ),
+        # ── ThreatMetrix / LexisNexis ─────────────────────────────────────
+        (
+            'threatmetrix',
+            'ThreatMetrix / LexisNexis',
+            'high',
+            [re.compile(r'h\.online-metrix\.net|threatmetrix\.js|nfl\.js', re.I)],
+            [re.compile(r'ThreatMetrix|tmx_session|h\.online-metrix|tmxSession', re.I)],
+            'session_id',
+            None,
+            'ThreatMetrix session_id collected via hidden iframe — required at checkout',
+        ),
+        # ── Forter ───────────────────────────────────────────────────────
+        (
+            'forter',
+            'Forter Anti-Fraud',
+            'high',
+            [re.compile(r'forter\.com/forter\.js|cdn\.forter\.com', re.I)],
+            [re.compile(r'forterToken|ftrToken|window\.Forter|FORTER_TOKEN', re.I)],
+            'forterToken',
+            None,
+            'forterToken hidden field — Forter real-time decision blocks missing token',
+        ),
+        # ── Stripe Radar ──────────────────────────────────────────────────
+        (
+            'stripe_radar',
+            'Stripe Radar (device fingerprint)',
+            'medium',
+            [re.compile(r'js\.stripe\.com/v3.*radar|stripe.*radar', re.I)],
+            [re.compile(r'stripe\.Radar|Stripe\.setPublishableKey.*radar|stripe_mids', re.I)],
+            'stripe_mids',
+            None,
+            'Stripe Radar injects stripe_mids fingerprint into PaymentIntent metadata',
+        ),
+        # ── Sardine ──────────────────────────────────────────────────────
+        (
+            'sardine',
+            'Sardine AI Fraud',
+            'medium',
+            [re.compile(r'cdn\.sardine\.ai|sardine\.js', re.I)],
+            [re.compile(r'sardineContext|sardine\.setupSardine|SARDINE_SESSION', re.I)],
+            'sardineContext',
+            None,
+            'sardineContext token sent in POST body — absence triggers manual review',
+        ),
+    ]
+
+    # ── Extract all script src URLs from HTML for evidence ────────────────
+    _src_urls = re.findall(r'<script[^>]+src=["\']([^"\'>]+)["\']', html or '', re.I)
+    _src_str  = ' '.join(_src_urls + (script_urls or []))
+
+    for (vendor, name, confidence,
+         src_pats, html_pats, field_name, header_name, note) in _FP_TABLE:
+
+        if vendor in seen_vendors:
+            continue
+
+        matched_src  = any(p.search(combined) or p.search(_src_str) for p in src_pats)
+        matched_html = any(p.search(combined) for p in html_pats)
+
+        if not (matched_src or matched_html):
+            # Also check response headers for vendor-specific headers
+            vendor_hdr_pat = {
+                'datadome':     'x-datadome',
+                'perimeterx':   'x-px-',
+                'cloudflare_bot': 'cf-ray',
+                'akamai_bot':   'akamai-grn',
+                'imperva':      'x-iinfo',
+            }.get(vendor, '')
+            if vendor_hdr_pat:
+                matched_html = any(vendor_hdr_pat in k for k in resp_hdrs)
+
+        if matched_src or matched_html:
+            seen_vendors.add(vendor)
+            # Locate first evidence URL
+            js_url = ''
+            for p in src_pats:
+                m = p.search(_src_str)
+                if m:
+                    # Pull full URL from _src_urls list
+                    for u in _src_urls + (script_urls or []):
+                        if p.search(u):
+                            js_url = u[:120]
+                            break
+                    break
+
+            findings.append({
+                'name':        name,
+                'vendor':      vendor,
+                'field_name':  field_name,
+                'header_name': header_name,
+                'js_url':      js_url,
+                'confidence':  confidence if (matched_src and matched_html) else 'medium',
+                'note':        note,
+            })
+
+    return findings
+
+
 def _detect_payment_sdks(html: str, js_text: str) -> list:
     """
     Detect payment SDK scripts and version from HTML script tags and JS.
@@ -27574,6 +28411,26 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if _sdks:
         pass  # stored in return dict below
 
+    # ── Device Fingerprint SDK detection ─────────────────────────────
+    if progress_cb: progress_cb("🖐️ Scanning device fingerprint SDKs...")
+    _device_fps = _detect_device_fingerprints(
+        html         = static_html + js_html,
+        js_text      = js_text,
+        script_urls  = _script_srcs,
+        resp_headers = _resp_headers,
+    )
+
+    # ── Anti-Fraud Layer detection ────────────────────────────────────
+    if progress_cb: progress_cb("🛡️ Detecting anti-fraud middleware layers...")
+    _all_forms_combined = static_forms + js_forms + (subpage_forms if 'subpage_forms' in dir() else [])
+    _anti_fraud = _detect_anti_fraud_layers(
+        html         = static_html + js_html,
+        js_text      = js_text,
+        script_urls  = _script_srcs,
+        resp_headers = _resp_headers,
+        all_forms    = _all_forms_combined,
+    )
+
     # Phase 5: Header probing
     if progress_cb: progress_cb("🔍 Probing header requirements...")
     headers_result = _probe_header_requirement(url, progress_cb)
@@ -27634,14 +28491,14 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         _nk = len(_sk_findings)
         progress_cb(f"🤖 Sitekeys found: {_nk} ({', '.join(set(f.get('type','') for f in _sk_findings))})" if _nk else "🤖 No CAPTCHA sitekeys found")
 
-    # ── ENH Phase 8: Sub-page scan (parallel) ────────────────────────────
+    # ── ENH Phase 8: Sub-page scan (two-phase: static + SPA/Playwright) ────
     _SUBPAGES = [
         "/checkout", "/checkout/payment", "/cart", "/pay", "/payment",
         "/billing", "/order", "/donate", "/donation", "/subscribe",
         "/register", "/signup", "/login", "/contact",
         "/pricing", "/plans", "/membership", "/upgrade",
     ]
-    # PATCHED: priority-sort sub-pages — payment paths first
+    # Priority-sort sub-pages — payment paths first
     _SUBPAGE_PRIORITY = re.compile(
         r'/(?:checkout|payment|pay|cart|billing|order|'
         r'confirm|purchase|donate|subscribe|card)',
@@ -27658,38 +28515,300 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     _origin = f"{_parsed.scheme}://{_parsed.netloc}"
     _existing_eps = {f.get('endpoint', '') for f in static_forms + js_forms}
 
-    def _fetch_subpage(sp: str):
+    # ── SPA detection — lightweight, runs on static HTML only ─────────────
+    # Signals that the page is a JS-rendered SPA and static HTML is a shell:
+    #   • mount-point divs with no content  (<div id="root">, <div id="app">)
+    #   • framework globals in inline scripts
+    #   • zero <form> tags despite being a checkout path
+    #   • noscript fallback text indicating JS is required
+    _SPA_FRAMEWORK_RE = re.compile(
+        r'__NEXT_DATA__|/_next/static/|'
+        r'__nuxt__|/_nuxt/|'
+        r'data-reactroot|_reactFiber|react\.production|'
+        r'vue\.(?:runtime|esm)|__vue_app__|'
+        r'__remixContext|@remix-run|'
+        r'__sveltekit|'
+        r'ng-version|angular\.min',
+        re.I,
+    )
+    # Mount-point div with no child text content
+    _SPA_ROOT_RE = re.compile(
+        r'<div[^>]+id=["\'](?:root|app|__next|__nuxt|application)["\'][^>]*>\s*</div>',
+        re.I,
+    )
+    _NOSCRIPT_RE = re.compile(
+        r'<noscript[^>]*>[^<]{0,200}(?:javascript|enable\s+js|requires?\s+javascript)',
+        re.I,
+    )
+
+    def _is_spa_html(html: str) -> bool:
+        """Return True if the response looks like a SPA shell (JS not executed)."""
+        if not html:
+            return False
+        # Hard signal: known framework marker in page source
+        if _SPA_FRAMEWORK_RE.search(html):
+            return True
+        # Hard signal: empty root/app mount div
+        if _SPA_ROOT_RE.search(html):
+            return True
+        # Soft signal: noscript JS requirement notice
+        if _NOSCRIPT_RE.search(html):
+            return True
+        # Soft signal: no <form> tags at all AND page is short (shell HTML)
+        has_form = bool(re.search(r'<form[\s>]', html, re.I))
+        if not has_form and len(html) < 8_000:
+            return True
+        return False
+
+    # ── Phase 1: parallel static requests.get ─────────────────────────────
+    # Returns (path, forms, sitekey, html, is_spa) or None on failure.
+    def _fetch_subpage_static(sp: str):
         _sub_url = _origin + sp
         try:
-            _sr = requests.get(_sub_url, headers=_get_headers(),
-                               timeout=8, verify=False, allow_redirects=True)
+            _sr = requests.get(
+                _sub_url, headers=_get_headers(),
+                timeout=8, verify=False, allow_redirects=True,
+            )
             if _sr.status_code != 200:
                 return None
-            if 'text/html' not in _sr.headers.get('content-type', ''):
+            _ct = _sr.headers.get('content-type', '')
+            if 'text/html' not in _ct:
                 return None
-            _sub_forms = _extract_forms_static(_sr.text, _sub_url)
-            _sk = _extract_recaptcha_info(_sr.text, '', _sub_url)
-            return sp, _sub_forms, _sk
+            _html      = _sr.text
+            _sub_forms = _extract_forms_static(_html, _sub_url)
+            _sk        = _extract_recaptcha_info(_html, '', _sub_url)
+            _spa       = _is_spa_html(_html)
+            return sp, _sub_forms, _sk, _html, _spa
         except Exception:
             return None
 
+    # Paths that are worth the Playwright cost (payment-critical only)
+    _SPA_PW_PRIORITY = {
+        '/checkout', '/checkout/payment', '/checkout/billing',
+        '/cart', '/pay', '/payment', '/billing', '/order',
+        '/donate', '/donation', '/subscribe',
+    }
+    _spa_queue: list[str] = []   # SPA paths queued for Playwright follow-up
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=6) as _pool:
-        _futs = {_pool.submit(_fetch_subpage, sp): sp for sp in _SUBPAGES[:12]}
+        _futs = {_pool.submit(_fetch_subpage_static, sp): sp for sp in _SUBPAGES[:12]}
         for _fut in as_completed(_futs):
             _res = _fut.result()
             if not _res:
                 continue
-            _sp, _sub_forms, _sk = _res
+            _sp, _sub_forms, _sk, _sp_html, _sp_is_spa = _res
+
+            # Merge any forms that static parse found
+            _found_card = False
             for sf in _sub_forms:
-                if sf.get('endpoint') not in _existing_eps and sf.get('fields'):
+                _ep = sf.get('endpoint', '')
+                if _ep not in _existing_eps and sf.get('fields'):
                     sf['source'] = f'subpage:{_sp}'
                     subpage_forms.append(sf)
-                    _existing_eps.add(sf.get('endpoint', ''))
+                    _existing_eps.add(_ep)
+                    if sf.get('is_payment') or sf.get('card_fields'):
+                        _found_card = True
+
+            # Merge sitekey
             if _sk and _sk.get('site_key'):
-                # Enrich subpage sitekey with all_keys list if available
                 _sk.setdefault('all_keys', [_sk])
                 subpage_sitekeys.append(_sk)
+
+            # Queue for Playwright if: SPA shell AND no card fields found yet
+            # AND path is payment-priority AND Playwright is available
+            if (PLAYWRIGHT_OK
+                    and _sp_is_spa
+                    and not _found_card
+                    and _sp in _SPA_PW_PRIORITY):
+                _spa_queue.append(_sp)
+
+    # ── Phase 2: Playwright pass for SPA subpages (sequential, cap 4) ─────
+    # Sequential because each browser launch is already heavy; 4 is enough
+    # to cover the typical checkout funnel (cart → billing → payment → confirm).
+    if _spa_queue:
+        _pw_cap    = 4
+        _pw_done   = 0
+        # Sort: paths already in priority order from _SUBPAGES sort above
+        _spa_queue = sorted(
+            _spa_queue,
+            key=lambda p: (0 if _SUBPAGE_PRIORITY.search(p) else 1, p),
+        )
+        if progress_cb:
+            progress_cb(
+                f"⚛️  SPA detected — Playwright scan on "
+                f"{min(len(_spa_queue), _pw_cap)} checkout sub-page(s)..."
+            )
+        for _sp in _spa_queue[:_pw_cap]:
+            _sub_url = _origin + _sp
+            try:
+                _pw_html = fetch_with_playwright(_sub_url)
+                if not _pw_html:
+                    continue
+
+                # Skip if Playwright got same shell back (login wall / redirect)
+                if _is_spa_html(_pw_html) and not re.search(r'<form[\s>]', _pw_html, re.I):
+                    continue
+
+                _pw_forms = _extract_forms_static(_pw_html, _sub_url)
+                _pw_sk    = _extract_recaptcha_info(_pw_html, '', _sub_url)
+
+                _pw_added = 0
+                for _pwf in _pw_forms:
+                    _ep = _pwf.get('endpoint', '')
+                    if _ep not in _existing_eps and _pwf.get('fields'):
+                        _pwf['source'] = f'subpage_js:{_sp}'
+                        subpage_forms.append(_pwf)
+                        _existing_eps.add(_ep)
+                        _pw_added += 1
+
+                # Playwright DOM field extraction — catches React controlled inputs
+                # that never appear in static HTML (value= always empty in JSX)
+                try:
+                    from playwright.sync_api import sync_playwright as _spw
+                    with _spw() as _pw:
+                        _br  = _pw.chromium.launch(
+                            headless=True,
+                            args=['--no-sandbox', '--disable-dev-shm-usage',
+                                  '--disable-blink-features=AutomationControlled',
+                                  '--disable-gpu'],
+                        )
+                        _ctx = _br.new_context(
+                            user_agent=(
+                                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                'Chrome/122.0.0.0 Safari/537.36'
+                            ),
+                            viewport={'width': 1366, 'height': 768},
+                            ignore_https_errors=True,
+                        )
+                        _ctx.add_init_script(
+                            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                            "window.chrome={runtime:{}};"
+                        )
+                        _pg = _ctx.new_page()
+                        try:
+                            _pg.goto(_sub_url, wait_until='networkidle', timeout=35_000)
+                        except Exception:
+                            try:
+                                _pg.goto(_sub_url, wait_until='load', timeout=20_000)
+                            except Exception:
+                                pass
+                        try:
+                            _pg.wait_for_timeout(2500)
+                        except Exception:
+                            pass
+
+                        # DOM field extraction (mirrors _extract_requests_playwright logic)
+                        _dom_raw = _pg.evaluate("""() => {
+                            const fields = [];
+                            const seen   = new Set();
+                            function getLabel(el) {
+                                if (el.id) {
+                                    const l = document.querySelector('label[for="' + el.id + '"]');
+                                    if (l) return l.innerText.trim();
+                                }
+                                if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
+                                if (el.placeholder) return el.placeholder.trim();
+                                if (el.title) return el.title.trim();
+                                let sib = el.previousElementSibling;
+                                while (sib) {
+                                    const t = (sib.innerText||'').trim();
+                                    if (t && t.length > 1 && t.length < 80) return t;
+                                    sib = sib.previousElementSibling;
+                                }
+                                return el.name || el.id || '';
+                            }
+                            document.querySelectorAll('input,textarea,select').forEach(el => {
+                                const name = el.name || el.id || '';
+                                const type = (el.type || 'text').toLowerCase();
+                                if (!name || ['submit','button','image','reset'].includes(type)) return;
+                                if (seen.has(name)) return;
+                                seen.add(name);
+                                try {
+                                    const cs = window.getComputedStyle(el);
+                                    if (cs.display==='none' || cs.visibility==='hidden') return;
+                                } catch(e) {}
+                                fields.push({
+                                    name: name,
+                                    type: type,
+                                    label: getLabel(el),
+                                    value: el.value || el.getAttribute('value') || '',
+                                    required: el.required || el.getAttribute('required') !== null,
+                                });
+                            });
+                            const fa = document.querySelector('form');
+                            return {
+                                fields: fields,
+                                action: fa ? (fa.action || fa.getAttribute('action') || '') : '',
+                                method: fa ? (fa.method || 'POST').toUpperCase() : 'POST',
+                            };
+                        }""")
+
+                        _br.close()
+
+                        if _dom_raw and _dom_raw.get('fields'):
+                            _dom_fields = []
+                            for _df in _dom_raw['fields']:
+                                _nm  = _df.get('name', '')
+                                _lbl = _df.get('label', '') or _nm
+                                _ft  = _df.get('type', 'text')
+                                _val = _df.get('value', '')
+                                _label, _icon, _is_dyn, _card_type = _classify_field(_nm, _val)
+                                _dom_fields.append({
+                                    'name':        _nm,
+                                    'type':        _ft,
+                                    'value':       _val[:80],
+                                    'required':    bool(_df.get('required')),
+                                    'field_label': _lbl or _label,
+                                    'icon':        _icon,
+                                    'is_dynamic':  _is_dyn,
+                                    'is_card':     _card_type is not None,
+                                    'card_type':   _card_type,
+                                })
+                            # Only add if we got new fields not already seen
+                            _dom_ep = _dom_raw.get('action') or _sub_url
+                            _new_dom_fields = [
+                                df for df in _dom_fields
+                                if df['name'] not in {
+                                    f['name']
+                                    for frm in subpage_forms
+                                    for f in frm.get('fields', [])
+                                }
+                            ]
+                            if _new_dom_fields and _dom_ep not in _existing_eps:
+                                _card_fs = [f for f in _new_dom_fields if f.get('is_card')]
+                                subpage_forms.append({
+                                    'source':      f'subpage_js_dom:{_sp}',
+                                    'endpoint':    _dom_ep,
+                                    'method':      _dom_raw.get('method', 'POST'),
+                                    'enctype':     'application/x-www-form-urlencoded',
+                                    'fields':      _new_dom_fields,
+                                    'card_fields': _card_fs,
+                                    'is_payment':  len(_card_fs) > 0,
+                                    'note':        f'Playwright DOM extract — SPA ({_sp})',
+                                })
+                                _existing_eps.add(_dom_ep)
+                                _pw_added += len(_new_dom_fields)
+
+                except Exception:
+                    pass   # Playwright DOM pass failed — static parse result kept
+
+                if _pw_sk and _pw_sk.get('site_key'):
+                    _pw_sk.setdefault('all_keys', [_pw_sk])
+                    _existing_sk = {
+                        s.get('site_key', '') for s in subpage_sitekeys
+                    }
+                    if _pw_sk['site_key'] not in _existing_sk:
+                        subpage_sitekeys.append(_pw_sk)
+
+                _pw_done += 1
+
+            except Exception:
+                pass   # network / Playwright error for this subpage — skip
+
+        if progress_cb and _pw_done:
+            progress_cb(f"⚛️  SPA Playwright scan done: {_pw_done} sub-page(s) rendered")
 
     if progress_cb:
         progress_cb(f"🔗 Sub-page scan complete: {len(subpage_forms)} extra form(s)")
@@ -27775,6 +28894,34 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
          if f.get('is_payment')),
         next(iter(static_forms + js_forms + real_requests), None)
     )
+    # Augment resolved_tokens with device fingerprint placeholders
+    # so they appear in the generated curl/Python snippets
+    _resolved_with_fps = dict(resolved_tokens or {})
+    for _fp in (_device_fps or []):
+        _fn = _fp.get('field_name')
+        if _fn and _fn not in _resolved_with_fps:
+            _resolved_with_fps[_fn] = {
+                'value':      f'<{_fp["vendor"]}_token>',
+                'confidence': 'inferred',
+                'method':     'fingerprint_sdk',
+                'header_key': _fp.get('header_name'),
+            }
+    # Also inject anti-fraud layer required fields
+    for _af in (_anti_fraud or []):
+        for _aff in _af.get('fields', []):
+            _fn = _aff.get('name', '')
+            if _fn and _aff.get('required') and _fn not in _resolved_with_fps:
+                _hdr = next(
+                    (h['name'] for h in _af.get('headers', []) if h.get('required')),
+                    None
+                )
+                _resolved_with_fps[_fn] = {
+                    'value':      _aff.get('example', f'<{_af["vendor"]}_{_fn}>'),
+                    'confidence': 'inferred',
+                    'method':     'anti_fraud_layer',
+                    'header_key': _hdr,
+                }
+
     curl_snippet = None
     if _snippet_form:
         curl_snippet = _generate_curl_snippet(
@@ -27783,7 +28930,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             enctype        = _snippet_form.get('enctype', 'application/x-www-form-urlencoded'),
             all_fields     = _snippet_form.get('fields', []),
             headers_required = headers_result,
-            resolved_tokens  = resolved_tokens,
+            resolved_tokens  = _resolved_with_fps,
         )
 
     # ── ENH: Live network intercept — capture real tokens & sitekeys ─────
@@ -27950,6 +29097,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'content_type_mismatches': _ct_mismatches,  # PATCHED
         'braintree_hosted':  _bt,                   # PATCHED (None if not detected)
         'payment_sdks':      _sdks,                 # PATCHED
+        'device_fingerprints': _device_fps,          # fingerprint SDKs
+        'anti_fraud_layers':   _anti_fraud,           # anti-fraud middleware
     }
 
 
@@ -28249,6 +29398,18 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                  (f"  _({pay_cnt} payment)_" if pay_cnt else ""))
     lines.append(f"📡 XHR       `{total_xhr}` intercepted")
     lines.append(f"⚠️  Risk      {risk_badge}  _{escape_md(risk_note)}_")
+    if _dfps_ov := data.get('device_fingerprints', []):
+        _fp_names_ov = " · ".join(fp["vendor"] for fp in _dfps_ov[:3])
+        lines.append(
+            f"🖐️  FP SDKs   `{raw_code(_fp_names_ov, 50)}`  "
+            f"_{len(_dfps_ov)} SDK(s) — hidden token(s) required_"
+        )
+    if _afl_ov := data.get('anti_fraud_layers', []):
+        _afl_names_ov = " · ".join(af["vendor"] for af in _afl_ov[:3])
+        lines.append(
+            f"🛡️  Anti-Fraud `{raw_code(_afl_names_ov, 50)}`  "
+            f"_{len(_afl_ov)} layer(s) — extra fields required_"
+        )
 
     if _all_sitekeys:
         lines.append(_sec(f"CAPTCHA / Anti-bot  ·  {len(_all_sitekeys)} key(s) found", "🤖"))
@@ -28285,16 +29446,47 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     # ── LIVE INTERCEPT FINDINGS ───────────────────────────────
     live_findings = data.get('live_findings', [])
     if live_findings:
-        lines.append(_sec(f"Live Network Secrets  ·  {len(live_findings)} found", "🔴"))
-        jlines = ["{"]
-        for lf in live_findings:
-            ltype  = raw_code(lf.get('type', 'secret'), 40)
-            lval   = raw_code(lf.get('value', ''), 120)
-            lsrc   = raw_code(lf.get('source', '')[:60])
-            lconf  = lf.get('confidence', 'HIGH')
-            jlines.append(f'  "{ltype}": "{lval}",  // {lconf} — {lsrc}')
-        jlines.append("}")
-        lines.append("```json\n" + "\n".join(jlines) + "\n```")
+        # Tier findings: CRITICAL (payment secrets) vs HIGH vs MEDIUM
+        _CRITICAL_TYPES = {
+            "Stripe client_secret", "Stripe PaymentIntent ID",
+            "Stripe SetupIntent secret", "Braintree client_token",
+            "PayPal order_id", "Access token (response)", "Live JWT (WebSocket)",
+        }
+        _crit_lf  = [lf for lf in live_findings
+                     if lf.get('type','') in _CRITICAL_TYPES]
+        _other_lf = [lf for lf in live_findings
+                     if lf.get('type','') not in _CRITICAL_TYPES]
+
+        lines.append(_sec(
+            f"Live Intercept  ·  {len(live_findings)} secret(s) found"
+            + (f"  ·  {len(_crit_lf)} 🔴 CRITICAL" if _crit_lf else ""),
+            "🔴"
+        ))
+
+        # Critical findings get their own highlighted block
+        if _crit_lf:
+            lines.append("🔴 *CRITICAL — Payment secrets captured:*")
+            crit_lines = ["{"]
+            for lf in _crit_lf:
+                ltype = raw_code(lf.get('type', 'secret'), 40)
+                lval  = raw_code(lf.get('value', ''), 120)
+                lsrc  = raw_code(lf.get('source', '')[:55])
+                crit_lines.append(f'  "{ltype}": "{lval}",')
+                crit_lines.append(f'  //  src: {lsrc}')
+            crit_lines.append("}")
+            lines.append("```json\n" + "\n".join(crit_lines) + "\n```")
+
+        # Other findings in compact block
+        if _other_lf:
+            lines.append(f"🔑 *Other secrets* ({len(_other_lf)}):")
+            jlines = ["{"]
+            for lf in _other_lf:
+                ltype = raw_code(lf.get('type', 'secret'), 40)
+                lval  = raw_code(lf.get('value', ''), 80)
+                lconf = lf.get('confidence', 'HIGH')
+                jlines.append(f'  "{ltype}": "{lval}",  // {lconf}')
+            jlines.append("}")
+            lines.append("```json\n" + "\n".join(jlines) + "\n```")
 
     # Summary (compact)
     s_parts = [f"*{len(ordered)}* unique form(s)"]
@@ -28366,123 +29558,86 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
 
         # Iframe hosted fields
         if iframe:
-            lines.append(f"🖼️ *Hosted iframe* ({len(iframe)}):")
-            for f in iframe[:3]:
-                lines.append(f"  `{raw_code(f.get('label', f['name']), 80)}`")
+            _iframe_row = "  ".join(
+                f"`{raw_code(f.get('label', f['name']), 40)}`" for f in iframe[:3]
+            )
+            lines.append(f"🖼️ *iframe* ({len(iframe)}): {_iframe_row}")
 
-        # ── Card / Payment / User → JSON block ──────────────────
-        if card or pay or user:
-            def _field_to_obj(f: dict) -> dict:
-                """Convert a field dict → clean, rich JSON-serializable object.
-                ENH: Includes autocomplete hint, HTML5 validation rules, source tag.
-                """
-                name  = f.get("name", "")
-                label = f.get("field_label") or f.get("label", "")
-                ftype = f.get("type", "text")
-                obj: dict = {
-                    "name":        name,
-                    "label":       label,
-                    "type":        ftype,
-                    "placeholder": _smart_placeholder(name, label, ftype),
-                    "required":    bool(f.get("required", False)),
-                }
-                # ── autocomplete hint (browser/CC manager uses this) ──
-                ac = f.get("autocomplete", "")
-                if ac and ac.lower() not in ("", "on", "off"):
-                    obj["autocomplete"] = ac
+        # ── COMPACT field pills ──────────────────────────────────
+        # Card fields — name · name · name  (N card)
+        if card:
+            _card_names = " · ".join(
+                f"`{raw_code(f['name'], 22)}`"
+                + (_opts_hint(f) if f.get('options') else "")
+                for f in card
+            )
+            lines.append(f"💳 {_card_names}  _({len(card)} card)_")
 
-                # ── HTML5 validation constraints ──────────────────────
-                validation: dict = {}
-                if f.get("pattern"):    validation["pattern"]   = f["pattern"]
-                if f.get("minlength"):  validation["minlength"] = f["minlength"]
-                if f.get("maxlength"):  validation["maxlength"] = f["maxlength"]
-                if f.get("min"):        validation["min"]       = f["min"]
-                if f.get("max"):        validation["max"]       = f["max"]
-                if validation:
-                    obj["validation"] = validation
+        # Payment info — name=value · name  (N pay)
+        if pay:
+            _pay_parts = []
+            for f in pay:
+                _pn = raw_code(f['name'], 20)
+                _pv = f.get('value', '')
+                if _pv and _pv not in ('', '0', '0.00'):
+                    _pay_parts.append(f"`{_pn}`=`{raw_code(_pv, 15)}`")
+                else:
+                    _pay_parts.append(f"`{_pn}`{_opts_hint(f)}")
+            lines.append(f"💰 {' · '.join(_pay_parts)}  _({len(pay)} pay)_")
 
-                # ── select options — hidden from output (use _opts_hint for compact display) ──
-
-                # ── prefilled/live value (amount, currency, etc.) ─────
-                val = f.get("value", "")
-                if val and val not in ("", "0", "0.00"):
-                    obj["value"] = val[:80]
-
-                # ── field origin (static HTML / DOM / iframe / live) ──
-                src = f.get("source", "") or entry.get("source", "")
-                if src:
-                    _SRC_LABELS = {
-                        "static":           "html",
-                        "static_orphan":    "html_orphan",
-                        "playwright":       "xhr_intercept",
-                        "playwright_dom":   "dom",
-                        "live_intercept":   "live",
-                    }
-                    obj["source"] = _SRC_LABELS.get(src, src)
-
-                return obj
-
-            # ── Per-group sections (card / payment / user) ──────────
-            _GROUP_CFG = [
-                ("card",    "💳", "CARD FIELDS",    card),
-                ("payment", "💰", "PAYMENT FIELDS", pay),
-                ("user",    "✏️", "USER FIELDS",    user),
+        # User fields — pill row, max 6 shown
+        if user:
+            _user_parts = [
+                f"`{raw_code(f['name'], 20)}`"
+                + ("*" if f.get('required') else "")
+                for f in user[:6]
             ]
-            for _gkey, _gicon, _glabel, _gfields in _GROUP_CFG:
-                if not _gfields:
+            _user_extra = f" _+{len(user)-6}_" if len(user) > 6 else ""
+            lines.append(f"✏️ {' · '.join(_user_parts)}{_user_extra}  _({len(user)} user)_")
+
+        # ── Compact POST body template ──────────────────────────
+        # Single flat key=placeholder block (replaces the 3+1 JSON blocks)
+        if card or pay or user:
+            _FIELD_ORDER = [
+                "Email", "Phone", "Cardholder Name",
+                "Billing First Name", "Billing Last Name", "Billing Company",
+                "Billing Address", "Billing City", "Billing State",
+                "Billing Zip", "Billing Country", "Billing Province",
+                "Card Number", "Expiry Month", "Expiry Year",
+                "CVV/CVC", "Routing Number", "Account Number", "Account Type",
+                "Amount", "Currency", "Order/Txn ID", "Customer ID",
+            ]
+            def _order_key(f):
+                ct = f.get("card_type") or f.get("field_label", "")
+                try:    return _FIELD_ORDER.index(ct)
+                except: return 99
+
+            _resolved = (entry.get('_resolved_tokens', {})
+                         or data.get('resolved_tokens', {}))
+            _all_tpl_fields = sorted(card + pay + user, key=_order_key)
+            tpl: dict = {}
+            for f in _all_tpl_fields:
+                fname = f.get("name", "")
+                if not fname:
                     continue
-                _gobjs = [_field_to_obj(f) for f in _gfields]
-                _gjson = json.dumps(_gobjs, ensure_ascii=False, indent=2)
-                lines.append(f"\n{SEP_MINOR}")
-                lines.append(f"{_gicon} *{_glabel}*  `({len(_gfields)})`")
-                lines.append(f"```json\n{_gjson}\n```")
+                ph = _smart_placeholder(
+                    fname,
+                    f.get("field_label") or f.get("label", ""),
+                    f.get("type", "text")
+                )
+                tpl[fname] = ph
+            # Add dynamic tokens (CSRF/nonce) with resolved live values
+            for f in dyn:
+                fname = f.get("name", "")
+                if fname and fname not in tpl:
+                    res_info = _resolved.get(fname, {}) if _resolved else {}
+                    res_val  = res_info.get('value', '') if res_info else ''
+                    tpl[fname] = res_val or f.get("value", "") or "<token>"
 
-            # ── ENH: POST body template — flat {name: placeholder} ───
-            # Only for payment forms (card fields present) — practical POST payload
-            if card or pay:
-                _FIELD_ORDER = [
-                    # user identity first
-                    "Email", "Phone", "Cardholder Name",
-                    "Billing First Name", "Billing Last Name", "Billing Company",
-                    # address block
-                    "Billing Address", "Billing City", "Billing State",
-                    "Billing Zip", "Billing Country", "Billing Province",
-                    # card block
-                    "Card Number", "Expiry Month", "Expiry Year",
-                    "CVV/CVC", "Routing Number", "Account Number", "Account Type",
-                    # transaction
-                    "Amount", "Currency", "Order/Txn ID", "Customer ID",
-                ]
-                def _order_key(f):
-                    ct = f.get("card_type") or f.get("field_label", "")
-                    try:    return _FIELD_ORDER.index(ct)
-                    except: return 99
-
-                all_fields = sorted(card + pay + user, key=_order_key)
-                tpl: dict = {}
-                for f in all_fields:
-                    fname = f.get("name", "")
-                    if not fname:
-                        continue
-                    ph = _smart_placeholder(
-                        fname,
-                        f.get("field_label") or f.get("label", ""),
-                        f.get("type", "text")
-                    )
-                    tpl[fname] = ph
-                # add any dynamic tokens (CSRF/nonce) the server will check
-                # ENH: inject resolved live values when available
-                _resolved = entry.get('_resolved_tokens', {}) or data.get('resolved_tokens', {}) if 'data' in dir() else {}
-                for f in dyn:
-                    fname = f.get("name", "")
-                    if fname and fname not in tpl:
-                        res_info = _resolved.get(fname, {})
-                        res_val  = res_info.get('value', '') if res_info else ''
-                        tpl[fname] = res_val or f.get("value", "") or "<token>"
-                tpl_str = json.dumps(tpl, ensure_ascii=False, indent=2)
-                lines.append(f"\n{SEP_MINOR}")
-                lines.append("📤 *POST Body Template*  _(ready\\-to\\-fill)_")
-                lines.append(f"```json\n{tpl_str}\n```")
+            # Render as compact key=value lines (not indented JSON)
+            _tpl_lines = [f'  {k} = "{v}"' for k, v in tpl.items()]
+            lines.append("📤 *POST Body:*")
+            lines.append("```\n" + "\n".join(_tpl_lines) + "\n```")
 
             # PATCHED: Content-Type mismatch display
             _ep = entry.get('endpoint', '') or entry.get('action', '')
@@ -28558,52 +29713,33 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     if skipped:
         lines.append(f"\n_... +{skipped} more form(s) — see JSON file_")
 
-    # ── MERGED FIELDS SUMMARY (cross-form, deduped) ──────────
+    # ── MERGED FIELDS SUMMARY (cross-form, deduped, compact) ─
     if _summary_card or _summary_pay or _summary_user:
         total_fields = len(_summary_card) + len(_summary_pay) + len(_summary_user)
-        lines.append(_sec(f"MERGED FIELD SUMMARY  ·  {total_fields} unique field(s)", "📦"))
+        lines.append(_sec(
+            f"Merged Fields  ·  {total_fields} unique  "
+            f"({len(_summary_card)}💳 {len(_summary_pay)}💰 {len(_summary_user)}✏️)",
+            "📦"
+        ))
 
-        def _field_to_obj_summary(f: dict) -> dict:
-            name  = f.get("name", "")
-            label = f.get("field_label") or f.get("label", "")
-            ftype = f.get("type", "text")
-            obj: dict = {
-                "name":        name,
-                "label":       label,
-                "type":        ftype,
-                "placeholder": _smart_placeholder(name, label, ftype),
-                "required":    bool(f.get("required", False)),
-            }
-            ac = f.get("autocomplete", "")
-            if ac and ac.lower() not in ("", "on", "off"):
-                obj["autocomplete"] = ac
-            validation: dict = {}
-            if f.get("pattern"):   validation["pattern"]   = f["pattern"]
-            if f.get("minlength"): validation["minlength"] = f["minlength"]
-            if f.get("maxlength"): validation["maxlength"] = f["maxlength"]
-            if validation:
-                obj["validation"] = validation
-            val = f.get("value", "")
-            if val and val not in ("", "0", "0.00"):
-                obj["value"] = val[:80]
-            return obj
+        # Compact pill rows per group
+        if _summary_card:
+            _sc_row = " · ".join(f"`{raw_code(f['name'],22)}`" for f in _summary_card)
+            lines.append(f"💳 {_sc_row}")
+        if _summary_pay:
+            _sp_row = " · ".join(
+                f"`{raw_code(f['name'],20)}`"
+                + (f"=`{raw_code(f.get('value',''),12)}`"
+                   if f.get('value') not in ('','0','0.00','') else "")
+                for f in _summary_pay
+            )
+            lines.append(f"💰 {_sp_row}")
+        if _summary_user:
+            _su_row = " · ".join(f"`{raw_code(f['name'],20)}`" for f in _summary_user[:8])
+            _su_extra = f" _+{len(_summary_user)-8}_" if len(_summary_user) > 8 else ""
+            lines.append(f"✏️ {_su_row}{_su_extra}")
 
-        # ── Each group separate ───────────────────────────────
-        _SUMMARY_GROUPS = [
-            ("💳", "CARD FIELDS",    _summary_card),
-            ("💰", "PAYMENT FIELDS", _summary_pay),
-            ("✏️", "USER FIELDS",    _summary_user),
-        ]
-        for _sicon, _slabel, _sfields in _SUMMARY_GROUPS:
-            if not _sfields:
-                continue
-            _sobjs = [_field_to_obj_summary(f) for f in _sfields]
-            _sjson = json.dumps(_sobjs, ensure_ascii=False, indent=2)
-            lines.append(f"\n{SEP_MINOR}")
-            lines.append(f"{_sicon} *{_slabel}*  `({len(_sfields)})`")
-            lines.append(f"```json\n{_sjson}\n```")
-
-        # ── Flat POST template from merged fields ─────────────
+        # Single flat merged POST template
         _FIELD_ORDER_M = [
             "Email", "Phone", "Cardholder Name",
             "Billing First Name", "Billing Last Name", "Billing Company",
@@ -28632,10 +29768,9 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                     f.get("type", "text")
                 )
         if flat_tpl:
-            flat_str = json.dumps(flat_tpl, ensure_ascii=False, indent=2)
-            lines.append(f"\n{SEP_MINOR}")
-            lines.append("📤 *Merged POST Body Template*  _(all forms combined)_")
-            lines.append(f"```json\n{flat_str}\n```")
+            _mtpl_lines = [f'  {k} = "{v}"' for k, v in flat_tpl.items()]
+            lines.append("📤 *Merged POST Body:*")
+            lines.append("```\n" + "\n".join(_mtpl_lines) + "\n```")
 
     # ── HEADERS ───────────────────────────────────────────────
     headers_result = data.get('headers', [])
@@ -28836,6 +29971,65 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         for fw in fws[:2]:
             if fw.get('note'):
                 lines.append(f"  _{escape_md(fw['note'][:80])}_")
+
+    # ── DEVICE FINGERPRINT SDKs ──────────────────────────────
+    _dfps = data.get('device_fingerprints', [])
+    if _dfps:
+        lines.append(_sec(f"Device Fingerprint SDKs  ·  {len(_dfps)} detected", "🖐️"))
+        _CONF_ICON = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+        for fp in _dfps[:6]:
+            _icon = _CONF_ICON.get(fp.get('confidence', 'medium'), '🟡')
+            _nm   = escape_md(fp['name'])
+            _fi   = f" → field `{raw_code(fp['field_name'], 40)}`" if fp.get('field_name') else ''
+            _hi   = f" + header `{raw_code(fp['header_name'], 30)}`" if fp.get('header_name') else ''
+            lines.append(f"  {_icon} *{_nm}*{_fi}{_hi}")
+            if fp.get('note'):
+                lines.append(f"    _{escape_md(fp['note'][:100])}_")
+            if fp.get('js_url'):
+                lines.append(f"    `{raw_code(fp['js_url'], 80)}`")
+
+    # ── ANTI-FRAUD LAYERS ─────────────────────────────────────
+    _afl = data.get('anti_fraud_layers', [])
+    if _afl:
+        lines.append(_sec(f"Anti-Fraud Layers  ·  {len(_afl)} detected", "🛡️"))
+        _LAYER_LABELS = {
+            'pre_auth':  'Pre-Auth',
+            'post_auth': 'Post-Auth',
+            'realtime':  'Real-time',
+            'batch':     'Batch',
+        }
+        _CONF_ICON_AF = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+        for af in _afl[:8]:
+            _icon   = _CONF_ICON_AF.get(af.get('confidence', 'medium'), '🟡')
+            _lbl    = _LAYER_LABELS.get(af.get('layer', ''), af.get('layer', ''))
+            lines.append(f"  {_icon} *{escape_md(af['name'])}*  _({escape_md(_lbl)})_")
+            # Required fields
+            req_fields = [f for f in af.get('fields', []) if f.get('required')]
+            if req_fields:
+                fnames = "  ".join(f"`{raw_code(f['name'], 35)}`" for f in req_fields[:3])
+                lines.append(f"    Fields: {fnames}")
+                for f in req_fields[:3]:
+                    lines.append(
+                        f"    `{raw_code(f['name'], 35)}`"
+                        f" → _{escape_md(f['role'])}_"
+                        f"  `{raw_code(f['example'], 30)}`"
+                    )
+            # Required headers
+            req_hdrs = [h for h in af.get('headers', []) if h.get('required')]
+            if req_hdrs:
+                for h in req_hdrs[:2]:
+                    lines.append(f"    Header: `{raw_code(h['name'], 40)}`")
+            # Risk note
+            if af.get('risk_impact'):
+                lines.append(f"    ⚠️ _{escape_md(af['risk_impact'][:110])}_")
+            # Evidence
+            ev = af.get('evidence', {})
+            if ev.get('js_url'):
+                lines.append(f"    `{raw_code(ev['js_url'], 80)}`")
+            elif ev.get('global_var'):
+                lines.append(f"    JS: `{raw_code(ev['global_var'], 50)}`")
+            elif ev.get('field_found'):
+                lines.append(f"    Form field: `{raw_code(ev['field_found'], 40)}`")
 
     # ── MULTI-STEP ────────────────────────────────────────────
     ms = data.get('multistep')
@@ -29716,7 +30910,7 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("⚙️", "Framework detection",              ["framework", "Framework"]),
         ("🪜", "Multi-step checkout",              ["multi-step", "multi step", "checkout"]),
         ("📋", "Request snippet generation",       ["snippet", "curl"]),
-        ("🔴", "Live network intercept",           ["Live intercept", "Hooks active", "Live:", "live_result"]),
+        ("🔴", "Live intercept (Enhanced · 5-phase)",  ["Live intercept", "Hooks active", "Live:", "live_result", "focus-probe", "pay-click", "field-fill"]),
         ("🔎", "Success / Decline pattern scan",   ["success / decline", "Patterns:", "Scanning success"]),
     ]
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
