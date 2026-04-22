@@ -28411,6 +28411,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if _sdks:
         pass  # stored in return dict below
 
+    # ── Extract script src URLs early (needed by fingerprint + anti-fraud) ─
+    _script_srcs = re.findall(
+        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', static_html + js_html, re.I)
+
     # ── Device Fingerprint SDK detection ─────────────────────────────
     if progress_cb: progress_cb("🖐️ Scanning device fingerprint SDKs...")
     _device_fps = _detect_device_fingerprints(
@@ -28420,9 +28424,13 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         resp_headers = _resp_headers,
     )
 
+    # ── Early-init subpage collections (used by anti-fraud before Phase 8) ─
+    subpage_forms:    list = []
+    subpage_sitekeys: list = []
+
     # ── Anti-Fraud Layer detection ────────────────────────────────────
     if progress_cb: progress_cb("🛡️ Detecting anti-fraud middleware layers...")
-    _all_forms_combined = static_forms + js_forms + (subpage_forms if 'subpage_forms' in dir() else [])
+    _all_forms_combined = static_forms + js_forms + subpage_forms
     _anti_fraud = _detect_anti_fraud_layers(
         html         = static_html + js_html,
         js_text      = js_text,
@@ -28509,8 +28517,6 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         key=lambda u: (0 if _SUBPAGE_PRIORITY.search(u) else 1, u)
     )
     if progress_cb: progress_cb("🔗 Scanning payment sub-pages...")
-    subpage_forms: list = []
-    subpage_sitekeys: list = []
     _parsed = urlparse(url)
     _origin = f"{_parsed.scheme}://{_parsed.netloc}"
     _existing_eps = {f.get('endpoint', '') for f in static_forms + js_forms}
@@ -28879,8 +28885,6 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH: Framework detection ───────────────────────────────────────────
     if progress_cb: progress_cb("🔍 Detecting JS framework...")
-    _script_srcs = re.findall(
-        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', static_html + js_html, re.I)
     frameworks = _detect_frameworks(static_html + js_html, js_text, script_urls=_script_srcs)
 
     # ── ENH: Multi-step form detection ────────────────────────────────────
