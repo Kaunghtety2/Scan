@@ -25033,6 +25033,368 @@ def _smart_placeholder(name: str, label: str, ftype: str) -> str:
     return f'<{slug}>'
 
 
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Field Detection: Confidence Scoring
+# ══════════════════════════════════════════════════════════════
+
+def _score_field_confidence(f: dict, all_fields: list | None = None) -> int:
+    """
+    Return a 0–10 confidence score for a field's card_type classification.
+
+    Scoring factors:
+      +3  autocomplete attribute matches known cc-* value
+      +3  maxlength matches card field spec exactly
+      +2  placeholder/aria-label contains unambiguous keyword
+      +2  card_type was set by _classify_field (not inferred)
+      +1  field type (tel/number) consistent with card data
+      -2  name looks obfuscated (low vowel ratio, no real word)
+      -1  field is inside an iframe (cross-origin, lower certainty)
+
+    Used by report and JSON export to annotate field reliability.
+    """
+    score = 0
+    ct      = f.get('card_type', '')
+    ac      = f.get('autocomplete', '').lower()
+    maxlen  = str(f.get('maxlength', ''))
+    ftype   = f.get('type', 'text')
+    ph      = (f.get('placeholder') or '').lower()
+    name    = f.get('name', '')
+    label   = (f.get('field_label') or f.get('label', '')).lower()
+
+    if not ct:
+        return 0
+
+    # autocomplete — strongest signal
+    _AC_CARD = {'cc-number', 'cc-csc', 'cc-exp-month', 'cc-exp-year',
+                'cc-exp', 'cc-name', 'cc-type'}
+    if ac in _AC_CARD:
+        score += 3
+
+    # maxlength spec match
+    _ML_MAP = {'Card Number': '16', 'CVV/CVC': ('3', '4'),
+               'Expiry Month': '2', 'Expiry Year': '4'}
+    ml_expect = _ML_MAP.get(ct)
+    if ml_expect:
+        if isinstance(ml_expect, tuple):
+            if maxlen in ml_expect:
+                score += 3
+        elif maxlen == ml_expect:
+            score += 3
+
+    # placeholder / label keyword match
+    _KW_MAP = {
+        'Card Number':    re.compile(r'card\s*num|cc\s*num|\*{4}|\d{4}', re.I),
+        'CVV/CVC':        re.compile(r'cvv|cvc|csc|security\s*code', re.I),
+        'Expiry Month':   re.compile(r'\bmm\b|month', re.I),
+        'Expiry Year':    re.compile(r'\byy(yy)?\b|year', re.I),
+        'Cardholder Name': re.compile(r'name\s*on\s*card|holder', re.I),
+    }
+    kw_pat = _KW_MAP.get(ct)
+    if kw_pat and (kw_pat.search(ph) or kw_pat.search(label)):
+        score += 2
+
+    # field type consistency
+    if ct in ('Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year'):
+        if ftype in ('tel', 'number'):
+            score += 1
+
+    # obfuscation penalty
+    _KNOWN_WORD = re.compile(
+        r'name|card|num|cvv|exp|month|year|email|phone|address|token|'
+        r'csrf|amount|bill|first|last|country|state|zip|pay', re.I)
+    if not _KNOWN_WORD.search(name):
+        vowels = sum(1 for c in name.lower() if c in 'aeiou')
+        if len(name) <= 12 and vowels / max(len(name), 1) < 0.2:
+            score -= 2
+
+    # iframe penalty
+    if f.get('from_iframe'):
+        score -= 1
+
+    return max(0, min(10, score))
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Field Detection: Neighbor Context Inference
+# ══════════════════════════════════════════════════════════════
+
+def _detect_field_by_neighbors(field: dict, all_fields: list) -> str:
+    """
+    Infer a field's card_type by examining its immediate neighbors in the
+    field list (DOM order).  Used as a fallback when name/label heuristics
+    are ambiguous or the field name is obfuscated.
+
+    Returns a card_type string (matching _CARD_STRICT_TYPES) or ''.
+    """
+    try:
+        idx = next(i for i, f in enumerate(all_fields) if f is field)
+    except StopIteration:
+        return ''
+
+    prev_ct = all_fields[idx - 1].get('card_type', '') if idx > 0 else ''
+    next_ct = (all_fields[idx + 1].get('card_type', '')
+               if idx + 1 < len(all_fields) else '')
+    ftype   = field.get('type', 'text')
+    maxlen  = str(field.get('maxlength', ''))
+    ac      = field.get('autocomplete', '').lower()
+
+    # After Card Number → likely Expiry Month (short numeric)
+    if prev_ct == 'Card Number':
+        if maxlen in ('2', '') and ftype in ('text', 'number', 'tel', 'select-one'):
+            return 'Expiry Month'
+
+    # After Expiry Month → likely Expiry Year
+    if prev_ct == 'Expiry Month':
+        if ftype in ('text', 'number', 'tel', 'select-one'):
+            return 'Expiry Year'
+
+    # After Expiry Year → likely CVV (short, 3-4 chars)
+    if prev_ct in ('Expiry Year', 'Expiry MM/YY'):
+        if maxlen in ('3', '4', '') and ftype in ('text', 'number', 'tel', 'password'):
+            return 'CVV/CVC'
+
+    # Surrounded by card fields on both sides — likely a card field too
+    _CARD_TYPES = {'Card Number', 'CVV/CVC', 'Expiry Month',
+                   'Expiry Year', 'Expiry MM/YY', 'Cardholder Name'}
+    if prev_ct in _CARD_TYPES and next_ct in _CARD_TYPES:
+        # Pick by maxlength
+        if maxlen == '3':   return 'CVV/CVC'
+        if maxlen == '4':   return 'Expiry Year'
+        if maxlen == '2':   return 'Expiry Month'
+        if maxlen == '16':  return 'Card Number'
+
+    # Before CVV → likely Expiry Year
+    if next_ct == 'CVV/CVC' and ftype in ('text', 'number', 'tel', 'select-one'):
+        if maxlen in ('2', '4', ''):
+            return 'Expiry Year' if maxlen != '2' else 'Expiry Month'
+
+    return ''
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Payload Structure: Semantic Field Type
+# ══════════════════════════════════════════════════════════════
+
+def _field_semantic_type(f: dict) -> str:
+    """
+    Return a lowercase semantic type string for a field dict.
+    Used by _build_flat_post_body to populate the field_map section
+    of the JSON export.
+
+    Covers card fields, billing, tokens, CAPTCHA, and generic inputs.
+    """
+    ct    = f.get('card_type', '')
+    ftype = f.get('type', 'text')
+    name  = f.get('name', '').lower()
+
+    _CT_MAP = {
+        'Card Number':        'card_number',
+        'CVV/CVC':            'cvv',
+        'Expiry Month':       'expiry_month',
+        'Expiry Year':        'expiry_year',
+        'Expiry MM/YY':       'expiry_mmyy',
+        'Cardholder Name':    'cardholder_name',
+        'Routing Number':     'routing_number',
+        'Account Number':     'account_number',
+        'Account Type':       'account_type',
+        'Amount':             'amount',
+        'Currency':           'currency',
+        'Order/Txn ID':       'order_id',
+        'Customer ID':        'customer_id',
+        'Billing Address':    'billing_address',
+        'Billing City':       'billing_city',
+        'Billing State':      'billing_state',
+        'Billing Zip':        'billing_zip',
+        'Billing Country':    'billing_country',
+        'Billing Province':   'billing_province',
+        'Billing First Name': 'billing_fname',
+        'Billing Last Name':  'billing_lname',
+        'Billing Company':    'billing_company',
+        'CSRF Token':         'csrf_token',
+        'Nonce':              'nonce',
+        'Session Token':      'session_token',
+        'OTP/Verification':   'otp',
+        'Anti-Bot Token':     'antibot_token',
+        'Request ID':         'request_id',
+        'Timestamp':          'timestamp',
+    }
+    if ct in _CT_MAP:
+        return _CT_MAP[ct]
+
+    # Name-based fallbacks
+    if re.search(r'recaptcha|g-recaptcha', name):   return 'recaptcha_token'
+    if re.search(r'captcha', name):                 return 'captcha_token'
+    if re.search(r'card.?token|token.?card', name): return 'gateway_token'
+    if re.search(r'stripe.*token|token.*stripe', name): return 'stripe_token'
+    if re.search(r'paypal', name):                  return 'paypal_token'
+    if re.search(r'braintree|nonce', name):         return 'braintree_nonce'
+
+    # HTML type fallbacks
+    _FTYPE_MAP = {
+        'email':    'email',
+        'tel':      'phone',
+        'password': 'password',
+        'hidden':   'hidden_field',
+        'checkbox': 'checkbox',
+        'radio':    'radio',
+        'select-one': 'select',
+        'file':     'file_upload',
+    }
+    if ftype in _FTYPE_MAP:
+        return _FTYPE_MAP[ftype]
+
+    return 'text_field'
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Payload Structure: Flat POST Body Builder
+# ══════════════════════════════════════════════════════════════
+
+def _build_flat_post_body(
+    all_entries: list,
+    resolved_tokens: dict | None = None,
+) -> tuple:
+    """
+    Merge all form + XHR entries into a single flat POST body dict,
+    plus a field_map dict with semantic type annotations.
+
+    Returns:
+        (post_body: dict, field_map: dict)
+
+    Layer priority (first-wins per field name):
+        1. Static   — non-dynamic field with a real prefilled value
+        2. Token    — CSRF/nonce/dynamic, use resolved value or <placeholder>
+        3. Card     — card data fields, use _smart_placeholder sample value
+        4. Billing  — billing/user fields, use _smart_placeholder
+
+    Field order in post_body:
+        static fields (alpha) → token fields → card fields → billing → rest
+    """
+    resolved_tokens = resolved_tokens or {}
+
+    _CARD_STRICT = {
+        'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
+        'Expiry MM/YY', 'Cardholder Name',
+        'Routing Number', 'Account Number', 'Account Type',
+    }
+    _BILLING = {
+        'Amount', 'Currency', 'Order/Txn ID', 'Customer ID',
+        'Billing Address', 'Billing Zip', 'Billing City', 'Billing State',
+        'Billing Country', 'Billing Province',
+        'Billing First Name', 'Billing Last Name', 'Billing Company',
+    }
+    _DYN_TYPES = {
+        'CSRF Token', 'Nonce', 'Session Token', 'OTP/Verification',
+        'Timestamp', 'Anti-Bot Token', 'Request ID',
+    }
+
+    static_fields:  dict = {}
+    token_fields:   dict = {}
+    card_fields:    dict = {}
+    billing_fields: dict = {}
+    rest_fields:    dict = {}
+    field_map:      dict = {}
+
+    for entry in all_entries:
+        for f in entry.get('fields', []):
+            name = f.get('name', '')
+            if not name:
+                continue
+            ftype = f.get('type', 'text')
+            if ftype in ('submit', 'button', 'reset', 'image'):
+                continue
+            if f.get('is_honeypot'):
+                continue
+            # First-wins: skip if already placed
+            if name in static_fields or name in token_fields \
+                    or name in card_fields or name in billing_fields \
+                    or name in rest_fields:
+                continue
+
+            ct      = f.get('card_type', '')
+            is_dyn  = f.get('is_dynamic', False) or ct in _DYN_TYPES
+            val     = f.get('value', '')
+            label   = f.get('field_label') or f.get('label', '')
+            sem     = _field_semantic_type(f)
+
+            # Layer 2 — Token
+            if is_dyn:
+                rt = resolved_tokens.get(name, {})
+                rv = rt.get('value', '') if rt.get('confidence') in (
+                    'live', 'static', 'inferred') else ''
+                token_fields[name] = rv or f'<{name}>'
+                field_map[name] = sem
+                continue
+
+            # Layer 3 — Card
+            if ct in _CARD_STRICT:
+                card_fields[name] = _smart_placeholder(name, label, ftype)
+                field_map[name] = sem
+                continue
+
+            # Layer 4 — Billing
+            if ct in _BILLING:
+                billing_fields[name] = _smart_placeholder(name, label, ftype)
+                field_map[name] = sem
+                continue
+
+            # Layer 1 — Static (real prefilled value)
+            if val and val not in ('', '0', '0.00') and not is_dyn:
+                static_fields[name] = val
+                field_map[name] = sem
+                continue
+
+            # Rest — user inputs without prefilled value
+            rest_fields[name] = _smart_placeholder(name, label, ftype)
+            field_map[name] = sem
+
+    # ── Card field order ──────────────────────────────────────
+    _CARD_ORDER = [
+        'number', 'cardnumber', 'card_number', 'cc', 'pan',
+        'expirationdatemonth', 'exp_month', 'expmonth', 'mm',
+        'expirationdateyear',  'exp_year',  'expyear',  'yyyy',
+        'cvv2', 'cvv', 'cvc', 'csc',
+        'cardholdername', 'nameoncard',
+    ]
+
+    def _card_sort_key(k: str) -> int:
+        kl = k.lower().replace('_', '').replace('-', '')
+        try:
+            return _CARD_ORDER.index(kl)
+        except ValueError:
+            return 99
+
+    # ── Billing field order ───────────────────────────────────
+    _BILL_ORDER = [
+        'billfname', 'billlname', 'billcompany',
+        'billaddress1', 'billaddress2',
+        'billcity', 'tempbillstate', 'billstate', 'billzip',
+        'billcountry', 'email', 'phone',
+        'amount', 'total', 'currency',
+    ]
+
+    def _bill_sort_key(k: str) -> int:
+        kl = k.lower().replace('_', '').replace('-', '')
+        try:
+            return _BILL_ORDER.index(kl)
+        except ValueError:
+            return 99
+
+    post_body: dict = {}
+    for k in sorted(static_fields):
+        post_body[k] = static_fields[k]
+    for k in sorted(token_fields):
+        post_body[k] = token_fields[k]
+    for k in sorted(card_fields, key=_card_sort_key):
+        post_body[k] = card_fields[k]
+    for k in sorted(billing_fields, key=_bill_sort_key):
+        post_body[k] = billing_fields[k]
+    for k in sorted(rest_fields):
+        post_body[k] = rest_fields[k]
+
+    return post_body, field_map
+
+
 def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
     """HTML + JS မှ payment gateway detect လုပ်သည်။"""
     combined   = html + js_sources
@@ -26680,6 +27042,289 @@ def _scan_response_patterns(
 
 
 # ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Pattern Scanning: Gateway-Specific Error Codes
+# ══════════════════════════════════════════════════════════════
+
+def _extract_gateway_error_codes(
+    html: str,
+    js_text: str,
+    live_bodies: list | None = None,
+) -> list:
+    """
+    Extract gateway-specific error/decline codes from HTML, JS, and
+    live XHR response bodies for gateways NOT covered by ISO 8583:
+      Adyen · Braintree · PayPal · Square · Authorize.Net · Worldpay
+
+    Returns list of dicts:
+        {'gateway', 'code', 'meaning', 'severity', 'source', 'snippet'}
+
+    Severity: 'hard' | 'soft' | 'info'
+    """
+    sources = [(html or '', 'static_html'), (js_text or '', 'js_source')]
+    for body in (live_bodies or []):
+        if isinstance(body, str) and body:
+            sources.append((body[:40_000], 'xhr_response'))
+
+    # ── Gateway-specific code patterns ───────────────────────
+    # (gateway, pattern, meaning_fn_or_str, severity)
+    _GW_PATTERNS = [
+        # Adyen resultCode
+        ('Adyen',
+         re.compile(r'"resultCode"\s*:\s*"([A-Za-z]+)"', re.I),
+         {
+             'Authorised':        ('Authorised — payment accepted',         'info'),
+             'Pending':           ('Pending — awaiting authorisation',      'info'),
+             'Received':          ('Received — async processing',           'info'),
+             'Refused':           ('Refused — hard decline',                'hard'),
+             'Error':             ('Error — processing error',              'hard'),
+             'Cancelled':         ('Cancelled — shopper cancelled',         'soft'),
+             'ChallengeShopper':  ('3DS challenge required',                'soft'),
+             'IdentifyShopper':   ('Shopper identification required (3DS)', 'soft'),
+             'RedirectShopper':   ('Redirect to issuer required',           'soft'),
+             'PresentToShopper':  ('Voucher/QR — present to shopper',       'info'),
+         }),
+
+        # Braintree status
+        ('Braintree',
+         re.compile(r'"status"\s*:\s*"([a-z_]+)"', re.I),
+         {
+             'authorized':             ('Authorized — ready to capture',        'info'),
+             'submitted_for_settlement': ('Submitted for settlement',           'info'),
+             'settled':                ('Settled',                              'info'),
+             'processor_declined':     ('Processor declined — hard decline',    'hard'),
+             'gateway_rejected':       ('Gateway rejected (fraud/CVV/AVS)',     'hard'),
+             'settlement_declined':    ('Settlement declined',                  'hard'),
+             'voided':                 ('Voided — transaction cancelled',       'soft'),
+             'failed':                 ('Failed',                               'hard'),
+         }),
+
+        # PayPal order status
+        ('PayPal',
+         re.compile(r'"status"\s*:\s*"([A-Z_]+)"', re.I),
+         {
+             'COMPLETED':          ('Order completed',                     'info'),
+             'APPROVED':           ('Payer approved — capture pending',    'info'),
+             'CREATED':            ('Order created — not yet approved',    'soft'),
+             'SAVED':              ('Order saved',                         'soft'),
+             'VOIDED':             ('Voided',                              'soft'),
+             'PAYER_ACTION_REQUIRED': ('Payer action required (3DS/auth)', 'soft'),
+         }),
+
+        # PayPal issue codes (inside "details" array)
+        ('PayPal',
+         re.compile(r'"issue"\s*:\s*"([A-Z_]+)"', re.I),
+         {
+             'INSTRUMENT_DECLINED':   ('Instrument declined by PayPal/issuer', 'hard'),
+             'PAYER_CANNOT_PAY':      ('Payer account cannot pay',             'hard'),
+             'PAYMENT_DENIED':        ('Payment denied',                       'hard'),
+             'ORDER_ALREADY_CAPTURED': ('Order already captured',              'soft'),
+             'MAX_PAYMENT_ATTEMPTS_EXCEEDED': ('Too many payment attempts',    'hard'),
+             'DUPLICATE_INVOICE_ID':  ('Duplicate invoice ID',                 'soft'),
+         }),
+
+        # Square error codes
+        ('Square',
+         re.compile(r'"code"\s*:\s*"([A-Z_]{4,40})"', re.I),
+         {
+             'CARD_DECLINED':              ('Card declined',                    'hard'),
+             'CVV_FAILURE':                ('CVV mismatch',                     'hard'),
+             'ADDRESS_VERIFICATION_FAILURE': ('AVS failure',                   'hard'),
+             'CARD_EXPIRED':               ('Card expired',                     'hard'),
+             'CARD_NOT_SUPPORTED':         ('Card type not supported',          'hard'),
+             'CARD_VELOCITY_EXCEEDED':     ('Too many attempts — retry later',  'soft'),
+             'GENERIC_DECLINE':            ('Generic decline',                  'hard'),
+             'INSUFFICIENT_FUNDS':         ('Insufficient funds',               'hard'),
+             'INVALID_CARD':               ('Invalid card',                     'hard'),
+             'INVALID_EXPIRATION':         ('Invalid expiration date',          'hard'),
+             'VOICE_FAILURE':              ('Voice authorisation required',     'soft'),
+             'PAN_FAILURE':                ('Card number invalid',              'hard'),
+         }),
+
+        # Authorize.Net response_reason_code
+        ('Authorize.Net',
+         re.compile(r'"response_reason_code"\s*:\s*"?(\d+)"?', re.I),
+         {
+             '1':  ('Approved',                                  'info'),
+             '2':  ('Declined',                                  'hard'),
+             '3':  ('Error',                                     'hard'),
+             '4':  ('Held for review',                           'soft'),
+             '27': ('AVS mismatch',                              'hard'),
+             '28': ('Card type not accepted',                    'hard'),
+             '37': ('Card number invalid',                       'hard'),
+             '44': ('CVV mismatch',                              'hard'),
+             '45': ('AVS + CVV both failed',                     'hard'),
+             '65': ('Transaction declined — anti-fraud filter',  'hard'),
+         }),
+
+        # Worldpay paymentStatus
+        ('Worldpay',
+         re.compile(r'"paymentStatus"\s*:\s*"([A-Z_]+)"', re.I),
+         {
+             'AUTHORIZED':   ('Authorised',            'info'),
+             'CAPTURED':     ('Captured',              'info'),
+             'SETTLED':      ('Settled',               'info'),
+             'REFUSED':      ('Refused — declined',    'hard'),
+             'FAILED':       ('Failed',                'hard'),
+             'CANCELLED':    ('Cancelled',             'soft'),
+             'REFUNDED':     ('Refunded',              'info'),
+             'SENT_FOR_SETTLEMENT': ('Sent for settlement', 'info'),
+         }),
+    ]
+
+    results = []
+    seen:   set = set()
+
+    def _ctx(text: str, m: re.Match, ctx: int = 80) -> str:
+        s = max(0, m.start() - ctx)
+        e = min(len(text), m.end() + ctx)
+        return text[s:e].replace('\n', ' ').strip()
+
+    for src_text, src_name in sources:
+        if not src_text:
+            continue
+        for gateway, pat, code_map in _GW_PATTERNS:
+            for m in pat.finditer(src_text):
+                code = m.group(1)
+                if code not in code_map:
+                    continue
+                meaning, severity = code_map[code]
+                dedup_key = f"{gateway}:{code}"
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                results.append({
+                    'gateway':  gateway,
+                    'code':     code,
+                    'meaning':  meaning,
+                    'severity': severity,
+                    'source':   src_name,
+                    'snippet':  _ctx(src_text, m),
+                })
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Pattern Scanning: Confidence-Scored Verdict
+# ══════════════════════════════════════════════════════════════
+
+def _score_response_confidence(
+    found_success: list,
+    found_decline: list,
+    found_codes:   list,
+    gw_codes:      list | None = None,
+) -> dict:
+    """
+    Compute a numerical confidence score (0–100) and summary for the
+    overall success/decline verdict.
+
+    Scoring weights:
+        XHR/live source match      +25 each (max 50)
+        JS source match            +15 each (max 30)
+        HTML-only match            +5  each (max 15)
+        ISO 8583 hard code         +20
+        ISO 8583 soft code         +10
+        Gateway-specific hard code +18
+        Gateway-specific soft code +8
+        Conflicting signals        -15
+
+    Returns:
+        {
+          'confidence': int (0-100),
+          'confidence_label': str ('HIGH' | 'MEDIUM' | 'LOW'),
+          'dominant': 'success' | 'decline' | 'mixed' | 'unknown',
+          'signals': int   (total signal count),
+          'summary': str   (human-readable one-liner)
+        }
+    """
+    _RELIABLE = {'xhr_response', 'live_intercept'}
+    _MEDIUM   = {'js_source'}
+
+    s_score = 0
+    d_score = 0
+
+    def _src_weight(entry: dict) -> int:
+        sources = entry.get('sources') or [entry.get('source', '')]
+        if any(s in _RELIABLE for s in sources): return 25
+        if any(s in _MEDIUM   for s in sources): return 15
+        return 5
+
+    for e in found_success:
+        s_score += _src_weight(e)
+    for e in found_decline:
+        d_score += _src_weight(e)
+
+    # ISO 8583 codes
+    for c in found_codes:
+        v = c.get('verdict', '')
+        if '✅' in v:
+            s_score += 20
+        elif 'Hard' in v:
+            d_score += 20
+        elif 'Soft' in v:
+            d_score += 10
+
+    # Gateway-specific codes
+    for c in (gw_codes or []):
+        sev = c.get('severity', '')
+        meaning = c.get('meaning', '').lower()
+        if sev == 'info' and any(kw in meaning for kw in
+                                  ('authorised', 'completed', 'settled', 'approved')):
+            s_score += 15
+        elif sev == 'hard':
+            d_score += 18
+        elif sev == 'soft':
+            d_score += 8
+
+    # Conflict penalty
+    if s_score > 0 and d_score > 0:
+        s_score = max(0, s_score - 15)
+        d_score = max(0, d_score - 15)
+
+    total   = s_score + d_score
+    signals = len(found_success) + len(found_decline) + len(found_codes)
+
+    if total == 0:
+        dominant   = 'unknown'
+        confidence = 0
+    elif s_score > d_score:
+        dominant   = 'success'
+        confidence = min(100, int((s_score / max(total, 1)) * 100))
+    elif d_score > s_score:
+        dominant   = 'decline'
+        confidence = min(100, int((d_score / max(total, 1)) * 100))
+    else:
+        dominant   = 'mixed'
+        confidence = min(100, int((max(s_score, d_score) / max(total, 1)) * 100))
+
+    if confidence >= 70:
+        conf_label = 'HIGH'
+    elif confidence >= 40:
+        conf_label = 'MEDIUM'
+    else:
+        conf_label = 'LOW'
+
+    _DOM_LABELS = {
+        'success': 'Likely success',
+        'decline': 'Likely decline',
+        'mixed':   'Mixed signals',
+        'unknown': 'No pattern match',
+    }
+    summary = (
+        f"{_DOM_LABELS.get(dominant, dominant)} "
+        f"({conf_label} confidence, {signals} signal(s) found)"
+    )
+
+    return {
+        'confidence':       confidence,
+        'confidence_label': conf_label,
+        'dominant':         dominant,
+        'signals':          signals,
+        'summary':          summary,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
 # ── /payload Enhancement Helpers (Features 1, 5–12) ──────────
 # ══════════════════════════════════════════════════════════════
 
@@ -26824,8 +27469,173 @@ def _generate_curl_snippet(endpoint: str, method: str, enctype: str,
         'curl':         curl,
         'python':       '\n'.join(py_sync_lines),
         'python_async': '\n'.join(py_async_lines),
+        'node':         _generate_node_snippet(endpoint, method, enctype,
+                                                field_map, h_dict),
+        'php':          _generate_php_snippet(endpoint, method, enctype,
+                                               field_map, h_dict),
     }
 
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Snippet Generation: Node.js fetch
+# ══════════════════════════════════════════════════════════════
+
+def _generate_node_snippet(
+    endpoint: str,
+    method:   str,
+    enctype:  str,
+    field_map: dict,
+    h_dict:   dict,
+) -> str:
+    """
+    Generate a Node.js fetch snippet for the given endpoint + fields.
+    Uses the built-in fetch (Node 18+) with no external dependencies.
+
+    Returns a formatted JS string ready to paste.
+    """
+    import json as _json
+
+    is_json      = 'json' in enctype.lower()
+    is_multipart = 'multipart' in enctype.lower()
+
+    # Build headers object
+    headers: dict = {}
+    if is_json:
+        headers['Content-Type'] = 'application/json'
+    elif not is_multipart:
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    headers.update(h_dict or {})
+
+    headers_str = _json.dumps(headers, indent=2, ensure_ascii=False)
+    payload_str = _json.dumps(field_map, indent=2, ensure_ascii=False)
+
+    if is_json:
+        body_line = f"  body: JSON.stringify(payload),"
+    elif is_multipart:
+        # Build FormData
+        fd_lines = [f"  formData.append('{k}', '{v}');"
+                    for k, v in field_map.items()]
+        body_line = "  body: formData,"
+    else:
+        body_line = "  body: new URLSearchParams(payload).toString(),"
+
+    lines = [
+        "// Node.js 18+ (no extra deps needed)",
+        f"const url     = '{endpoint}';",
+        f"const headers = {headers_str};",
+        f"const payload = {payload_str};",
+        "",
+    ]
+
+    if is_multipart:
+        lines += [
+            "const { FormData } = await import('formdata-node');",
+            "const formData = new FormData();",
+        ]
+        for k, v in field_map.items():
+            lines.append(f"formData.append('{k}', '{v}');")
+        lines += [
+            "",
+            "const resp = await fetch(url, {",
+            f"  method: '{method}',",
+            "  headers,",
+            body_line,
+            "});",
+        ]
+    else:
+        lines += [
+            "const resp = await fetch(url, {",
+            f"  method: '{method}',",
+            f"  headers: {headers_str},",
+            body_line,
+            "});",
+        ]
+
+    lines += [
+        "const text = await resp.text();",
+        "console.log(resp.status, text.slice(0, 500));",
+    ]
+    return '\n'.join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 NEW HELPER — Snippet Generation: PHP cURL
+# ══════════════════════════════════════════════════════════════
+
+def _generate_php_snippet(
+    endpoint: str,
+    method:   str,
+    enctype:  str,
+    field_map: dict,
+    h_dict:   dict,
+) -> str:
+    """
+    Generate a PHP cURL snippet for the given endpoint + fields.
+    Compatible with PHP 7.4+, uses curl extension (ubiquitous on shared hosting).
+
+    Returns a formatted PHP string ready to paste.
+    """
+    is_json      = 'json' in enctype.lower()
+    is_multipart = 'multipart' in enctype.lower()
+
+    # PHP array literal builder
+    def _php_array(d: dict) -> str:
+        if not d:
+            return '[]'
+        inner = ',\n    '.join(
+            f"'{k}' => '{v}'"
+            for k, v in d.items()
+        )
+        return f"[\n    {inner}\n]"
+
+    headers: dict = {}
+    if is_json:
+        headers['Content-Type'] = 'application/json'
+    elif not is_multipart:
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    headers.update(h_dict or {})
+
+    # Build header array lines for curl_setopt
+    header_lines = [f"    '{k}: {v}'" for k, v in headers.items()]
+    header_arr   = '[\n' + ',\n'.join(header_lines) + '\n]'
+
+    payload_arr = _php_array(field_map)
+
+    if is_json:
+        post_data_line = "$postData = json_encode($payload);"
+        post_opt       = "curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);"
+    elif is_multipart:
+        post_data_line = "$postData = $payload;  // multipart: pass array directly"
+        post_opt       = "curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);"
+    else:
+        post_data_line = "$postData = http_build_query($payload);"
+        post_opt       = "curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);"
+
+    lines = [
+        "<?php",
+        f"$url     = '{endpoint}';",
+        f"$payload = {payload_arr};",
+        "",
+        post_data_line,
+        "",
+        "$ch = curl_init();",
+        "curl_setopt($ch, CURLOPT_URL,            $url);",
+        "curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);",
+        "curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);",
+        "curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);",
+        f"curl_setopt($ch, CURLOPT_CUSTOMREQUEST,  '{method}');",
+        post_opt,
+        f"curl_setopt($ch, CURLOPT_HTTPHEADER,     {header_arr});",
+        "",
+        "$response = curl_exec($ch);",
+        "$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);",
+        "curl_close($ch);",
+        "",
+        "echo $httpCode . PHP_EOL;",
+        "echo substr($response, 0, 500) . PHP_EOL;",
+        "?>",
+    ]
+    return '\n'.join(lines)
 
 
 def _analyze_auth_cookies(url: str, resp_headers: dict = None) -> list:
