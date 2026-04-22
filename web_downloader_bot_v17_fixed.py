@@ -9810,12 +9810,29 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 proxy=_pw_proxy,
                 java_script_enabled=True,
             )
-            # Stealth init
+            # FIX 1b: Full stealth profile — matches real Chrome fingerprint
             ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-                window.chrome = {runtime: {}};
+                Object.defineProperty(navigator, 'webdriver',          {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins',            {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages',          {get: () => ['en-US','en']});
+                Object.defineProperty(navigator, 'platform',           {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'hardwareConcurrency',{get: () => 8});
+                Object.defineProperty(navigator, 'deviceMemory',       {get: () => 8});
+                Object.defineProperty(navigator, 'maxTouchPoints',     {get: () => 0});
+                window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+                Object.defineProperty(Notification, 'permission', {get: () => 'default'});
+                const _getParam = RTCPeerConnection.prototype.createOffer;
+                window.outerWidth  = 1440;
+                window.outerHeight = 900;
+                window.screenX     = 0;
+                window.screenY     = 0;
+                // Prevent headless detection via timing
+                const _origQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({state: Notification.permission})
+                        : _origQuery(parameters)
+                );
             """)
 
             # ── BUG FIX 1: Hook injected BEFORE page.goto via add_init_script ──
@@ -22226,18 +22243,35 @@ def fetch_with_playwright(url: str) -> str | None:
                 viewport={"width": 1366, "height": 768},
                 ignore_https_errors=True,
             )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                "window.chrome={runtime:{}};"
-            )
+            # FIX 1c + 2b: Full stealth + domcontentloaded
+            ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver',  {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins',    {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages',  {get: () => ['en-US','en']});
+                Object.defineProperty(navigator, 'platform',   {get: () => 'Win32'});
+                window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+                window.outerWidth = 1366; window.outerHeight = 768;
+            """)
             page = ctx.new_page()
             try:
-                page.goto(url, wait_until="networkidle", timeout=40_000)
+                page.goto(url, wait_until="domcontentloaded", timeout=28_000)
             except Exception:
                 try:
-                    page.goto(url, wait_until="load", timeout=25_000)
+                    page.goto(url, wait_until="load", timeout=20_000)
                 except Exception:
-                    pass
+                    try:
+                        page.goto(url, wait_until="commit", timeout=12_000)
+                    except Exception:
+                        pass
+            # Short settle for SPA hydration
+            try:
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
             html = page.content()
             browser.close()
             return html if html and html.strip() else None
@@ -25008,6 +25042,28 @@ def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
     iframe_based = bool(re.search(
         r'stripe\.elements|paypal\.Buttons|dropin\.create|<iframe[^>]+(stripe|paypal|braintree)',
         combined, re.I))
+    # FIX 5: Stripe Elements / Payment Element / Checkout SDK = NOT raw POST
+    # These all tokenize card data client-side → server never sees raw card
+    _stripe_sdk = bool(re.search(
+        r'stripe\.elements\(|stripe\.paymentElement\(|'
+        r'stripe\.redirectToCheckout|stripe\.confirmPayment|'
+        r'elements\.create\(["\'](card|payment)["\'\)]|'
+        r'loadStripe\(|@stripe/stripe-js|js\.stripe\.com/v3',
+        combined, re.I
+    ))
+    _braintree_sdk = bool(re.search(
+        r'braintree\.client\.create|hostedFields\.create|'
+        r'dropin\.create|braintreegateway\.com/web',
+        combined, re.I
+    ))
+    _adyen_sdk = bool(re.search(
+        r'AdyenCheckout|adyen\.com|checkoutshopper',
+        combined, re.I
+    ))
+    # Any known tokenization SDK = card data never reaches server raw
+    if _stripe_sdk or _braintree_sdk or _adyen_sdk:
+        tokenized    = True
+        iframe_based = True   # treat as safe — hosted/elements
     raw_post = not tokenized and not iframe_based
 
     found = []
@@ -25262,8 +25318,17 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                             "Chrome/122.0.0.0 Safari/537.36"),
                 viewport={"width": 1366, "height": 768},
                 ignore_https_errors=True)
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver',  {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins',    {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages',  {get: () => ['en-US','en']});
+                Object.defineProperty(navigator, 'platform',   {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+                window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+                Object.defineProperty(Notification, 'permission', {get: () => 'default'});
+                window.outerWidth  = 1366;
+                window.outerHeight = 768;
+            """)
             page = ctx.new_page()
 
             def on_request(request):
@@ -25315,14 +25380,58 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                         })
                 except Exception: pass
 
+            # FIX 3: Response body capture — GET responses contain tokens/keys
+            # that never appear in POST body (Stripe pk_, CSRF, session tokens)
+            _resp_bodies: dict = {}   # url → body text
+            _RESP_CT = ("json", "javascript", "text", "html", "xml", "form", "graphql")
+            _KEY_RE = re.compile(
+                r'pk_(?:live|test)_[A-Za-z0-9]{20,}'
+                r'|(?:csrf|_token|nonce|authenticity_token)[^\n]{0,4}:\s*["\'][^"\']{8,}["\']'
+                r'|client_secret[^\n]{0,4}:\s*["\'][^"\']{10,}["\']'
+                r'|access_token[^\n]{0,4}:\s*["\'][^"\']{10,}["\']'
+                r'|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+                re.I
+            )
+
+            def on_response(response):
+                try:
+                    ct = (response.headers.get("content-type") or "").lower()
+                    if not any(x in ct for x in _RESP_CT):
+                        return
+                    cl = int(response.headers.get("content-length") or 0)
+                    if cl > 1_000_000:   # skip files > 1MB
+                        return
+                    if _KEY_RE.search(response.url):
+                        return          # skip CDN/external JS
+                    body = response.body().decode("utf-8", errors="replace")[:12_000]
+                    if _KEY_RE.search(body):
+                        _resp_bodies[response.url] = body
+                except Exception:
+                    pass
+
+            page.on('response', on_response)
             page.on('request', on_request)
             if progress_cb: progress_cb("🌐 Playwright loading + intercepting...")
 
-            try: page.goto(url, wait_until="networkidle", timeout=40_000)
+            # FIX 2: domcontentloaded avoids networkidle hang on WS/polling sites
+            # Falls back: load → commit (bare minimum — gets HTML + fires hooks)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=28_000)
             except Exception:
-                try: page.goto(url, wait_until="load", timeout=25_000)
-                except Exception: pass
-            try: page.wait_for_timeout(4000)
+                try:
+                    page.goto(url, wait_until="load", timeout=20_000)
+                except Exception:
+                    try:
+                        page.goto(url, wait_until="commit", timeout=15_000)
+                    except Exception:
+                        pass
+            # Wait for lazy-load XHR (React hydration, SPA router settle)
+            try:
+                page.wait_for_load_state("networkidle", timeout=6_000)
+            except Exception:
+                pass
+            # Fixed flush — always wait at least 2.5s for async SDK init calls
+            try: page.wait_for_timeout(2500)
             except Exception: pass
 
             # ── ENH: DOM field extraction from rendered page + iframes ─────
@@ -25433,13 +25542,51 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                 form_info  = dom_raw.get('formInfo', []) if dom_raw else []
 
                 if dom_fields:
+                    # FIX 8: SPA endpoint detection — React/Next.js forms have no action=""
+                    # Priority: form action → intercepted POST URL → XHR payment path → page URL
                     endpoint = page.url
+
+                    # 1. Explicit form action (best)
                     if form_info:
                         act = form_info[0].get('action', '')
                         if act and act.startswith('http'):
                             endpoint = act
-                        elif act:
+                        elif act and act.strip() not in ('', '#', 'javascript:void(0)'):
                             endpoint = urljoin(url, act)
+
+                    # 2. Look in already-captured POST requests for payment endpoint
+                    if endpoint == page.url:
+                        _PAY_EP_RE = re.compile(
+                            r'/(?:checkout|payment|pay|order|cart|billing|charge|'
+                            r'confirm|purchase|subscribe|donate)(?:[/?#]|$)',
+                            re.I
+                        )
+                        for _cap in captured:
+                            _cap_ep = _cap.get('endpoint', '')
+                            if (_cap.get('source') == 'playwright'
+                                    and _cap_ep
+                                    and _PAY_EP_RE.search(_cap_ep)):
+                                endpoint = _cap_ep
+                                break
+
+                    # 3. Try JS-evaluated form submit URL from data-* attrs
+                    if endpoint == page.url:
+                        try:
+                            _js_ep = page.evaluate("""() => {
+                                const f = document.querySelector('form');
+                                if (!f) return null;
+                                return f.getAttribute('data-action') ||
+                                       f.getAttribute('data-url') ||
+                                       f.getAttribute('data-submit-url') ||
+                                       f.dataset.action || null;
+                            }""")
+                            if _js_ep and _js_ep.strip():
+                                endpoint = (
+                                    _js_ep if _js_ep.startswith('http')
+                                    else urljoin(url, _js_ep)
+                                )
+                        except Exception:
+                            pass
 
                     fields_out = []
                     existing_names: set = set()
@@ -25516,17 +25663,53 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
             except Exception:
                 pass
 
-            # Grab JS source for gateway detection
+            # FIX 7: JS bundle limit 50KB→500KB — Stripe/Adyen SDK bundles are 200KB+
+            # Skip CDN/analytics scripts — only fetch same-origin + known payment CDNs
+            _PAY_CDN_RE = re.compile(
+                r'js\.stripe\.com|braintreegateway\.com|paypal\.com/sdk|'
+                r'adyen\.com|squarecdn\.com|klarna\.com|checkout\.com|'
+                r'pay\.google\.com|applePay',
+                re.I
+            )
             try:
+                _parsed_origin = urlparse(url)
+                _origin_host   = _parsed_origin.netloc
+                _js_budget     = 0
+                _JS_TOTAL_MAX  = 2_000_000   # 2MB total JS cap across all scripts
+
                 for s in page.query_selector_all('script[src]'):
-                    src = s.get_attribute('src') or ''
-                    if src:
-                        full = urljoin(url,src) if not src.startswith('http') else src
-                        try:
-                            r = requests.get(full, timeout=5, verify=False, headers=_get_headers())
-                            if r.status_code == 200: js_text += r.text[:50000]
-                        except Exception: pass
-            except Exception: pass
+                    if _js_budget >= _JS_TOTAL_MAX:
+                        break
+                    _src = s.get_attribute('src') or ''
+                    if not _src:
+                        continue
+                    _full = urljoin(url, _src) if not _src.startswith('http') else _src
+                    _parsed_s = urlparse(_full)
+
+                    # Include: same-origin OR known payment CDN
+                    _is_same_origin = _parsed_s.netloc == _origin_host
+                    _is_pay_cdn     = bool(_PAY_CDN_RE.search(_full))
+                    if not (_is_same_origin or _is_pay_cdn):
+                        continue
+
+                    try:
+                        _r = requests.get(_full, timeout=6, verify=False,
+                                          headers=_get_headers())
+                        if _r.status_code == 200:
+                            _chunk = _r.text[:500_000]   # FIX 7: was 50_000
+                            js_text += _chunk
+                            _js_budget += len(_chunk)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # FIX 3b: attach response bodies to first captured item
+            if _resp_bodies and captured:
+                captured[0].setdefault('_resp_bodies', {}).update(_resp_bodies)
+            elif _resp_bodies:
+                captured.append({'_js_only': True, '_js_text': '',
+                                 '_resp_bodies': _resp_bodies})
 
             browser.close()
     except Exception as e:
@@ -28435,6 +28618,869 @@ def _live_match_af_fp(
 
     return findings
 
+
+def _detect_velocity_checks(
+    html: str,
+    js_text: str,
+    resp_headers: dict = None,
+    rate_limit_data: dict = None,
+    anti_fraud_layers: list = None,
+    device_fingerprints: list = None,
+    recaptcha_info: dict = None,
+    all_forms: list = None,
+) -> dict:
+    """
+    Detect 7-layer velocity/rate-limit protection across the checkout flow.
+
+    Layers checked:
+      1. HTTP rate-limit headers  (X-RateLimit-*, CF-RateLimit-*, Retry-After)
+      2. JS attempt/lockout logic (maxAttempts, lockoutPeriod, retryAfter, backoff)
+      3. Anti-fraud velocity      (Kount/Forter/Signifyd velocity rules in JS/API)
+      4. CAPTCHA bot control      (reCAPTCHA v3 score threshold, Turnstile, hCaptcha)
+      5. Device fingerprint RL    (FingerprintJS velocity, DataDome challenge trigger)
+      6. Exponential backoff      (setTimeout * 2^n patterns, Fibonacci delay patterns)
+      7. Hidden form RL signals   (disabled submit, maxlength on attempts field, countdown)
+
+    Returns:
+        {
+          'verdict':  'PROTECTED' | 'PARTIALLY' | 'UNPROTECTED',
+          'score':    int (0-7, layers that passed),
+          'layers':   [{'id', 'name', 'status', 'evidence', 'detail'}],
+          'summary':  str,
+        }
+    """
+    combined    = (html or '') + (js_text or '')
+    hdrs        = {k.lower(): v for k, v in (resp_headers or {}).items()}
+    af_vendors  = {af['vendor'] for af in (anti_fraud_layers or [])}
+    fp_vendors  = {fp['vendor'] for fp in (device_fingerprints or [])}
+    rl          = rate_limit_data or {}
+
+    layers = []
+
+    # ── Layer 1: HTTP Rate-Limit Headers ─────────────────────────────────
+    _RL_HDRS = [
+        'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset',
+        'ratelimit-limit', 'ratelimit-remaining', 'ratelimit-reset',
+        'retry-after', 'x-rate-limit-limit', 'x-rate-limit-remaining',
+        'cf-ratelimit-limit', 'cf-ratelimit-remaining',
+        'x-shopify-shop-api-call-limit',
+    ]
+    _hdr_found = [h for h in _RL_HDRS if h in hdrs]
+    _rl_from_data = [k for k in ('limit', 'remaining', 'reset', 'retry_after',
+                                  'shopify_limit') if rl.get(k)]
+    _hdr_pass = bool(_hdr_found or _rl_from_data)
+    _hdr_ev = (
+        ', '.join(f'{h}: {hdrs[h]}' for h in _hdr_found[:3])
+        or ', '.join(f'{k}={rl[k]}' for k in _rl_from_data[:3])
+        or 'None detected'
+    )
+    layers.append({
+        'id':       1,
+        'name':     'HTTP Rate-Limit Headers',
+        'status':   'PASS' if _hdr_pass else 'FAIL',
+        'evidence': _hdr_ev,
+        'detail':   f"{len(_hdr_found)} RL header(s) present" if _hdr_pass
+                    else 'No rate-limit headers — requests can be replayed freely',
+    })
+
+    # ── Layer 2: JS Attempt/Lockout Logic ────────────────────────────────
+    _JS_ATTEMPT_PATS = [
+        (re.compile(r'maxAttempts\s*[=:]\s*(\d+)', re.I),      'maxAttempts'),
+        (re.compile(r'lockoutPeriod\s*[=:]\s*(\d+)', re.I),    'lockoutPeriod'),
+        (re.compile(r'retryAfter\s*[=:]\s*(\d+)', re.I),       'retryAfter'),
+        (re.compile(r'maxRetries\s*[=:]\s*(\d+)', re.I),       'maxRetries'),
+        (re.compile(r'attemptCount\s*[>=]+\s*(\d+)', re.I),    'attemptCount check'),
+        (re.compile(r'too\s*many\s*attempts|rate\s*limit\s*exceeded', re.I), 'rate-limit message'),
+        (re.compile(r'cooldown(?:Period|Time|Ms)\s*[=:]\s*(\d+)', re.I), 'cooldown'),
+        (re.compile(r'throttle[dD]?\s*[=:(]', re.I),           'throttle call'),
+    ]
+    _js_hits = [(label, m.group(0)[:40]) for pat, label in _JS_ATTEMPT_PATS
+                for m in [pat.search(combined)] if m]
+    _js_pass = bool(_js_hits)
+    layers.append({
+        'id':       2,
+        'name':     'JS Attempt / Lockout Logic',
+        'status':   'PASS' if _js_pass else 'FAIL',
+        'evidence': ' | '.join(f'{lbl}: `{ev}`' for lbl, ev in _js_hits[:3]) or 'None',
+        'detail':   f"{len(_js_hits)} JS velocity signal(s)" if _js_pass
+                    else 'No client-side attempt limiting detected',
+    })
+
+    # ── Layer 3: Anti-Fraud Velocity ──────────────────────────────────────
+    # Known AF vendors with velocity enforcement
+    _AF_VELOCITY = {
+        'kount':       'Kount velocity rules (velocity_by_deviceid, velocity_by_email)',
+        'forter':      'Forter velocity scoring (real-time decision)',
+        'signifyd':    'Signifyd velocity intelligence',
+        'riskified':   'Riskified chargeback velocity',
+        'nofraud':     'NoFraud transaction velocity screening',
+        'seon':        'SEON email/phone/IP velocity',
+        'cybersource_dm': 'CyberSource velocity checks (velocity_check.count)',
+        'clearsale':   'ClearSale submission velocity',
+    }
+    _AF_JS_VELOCITY_PATS = [
+        re.compile(r'velocity[_\.](?:check|limit|rule|count)', re.I),
+        re.compile(r'velocity_by_(?:email|device|ip|card)', re.I),
+        re.compile(r'transaction_velocity|txn_velocity', re.I),
+    ]
+    _af_vendor_hits = [_AF_VELOCITY[v] for v in af_vendors if v in _AF_VELOCITY]
+    _af_js_hits     = [m.group(0)[:50] for p in _AF_JS_VELOCITY_PATS
+                       for m in [p.search(combined)] if m]
+    _af_pass = bool(_af_vendor_hits or _af_js_hits)
+    layers.append({
+        'id':       3,
+        'name':     'Anti-Fraud Velocity Layer',
+        'status':   'PASS' if _af_pass else 'FAIL',
+        'evidence': ' | '.join((_af_vendor_hits + _af_js_hits)[:3]) or 'None',
+        'detail':   f"AF vendors with velocity: {', '.join(v for v in af_vendors if v in _AF_VELOCITY)}"
+                    if _af_pass else 'No anti-fraud velocity layer detected',
+    })
+
+    # ── Layer 4: CAPTCHA Bot Control ──────────────────────────────────────
+    _has_captcha     = bool(recaptcha_info and recaptcha_info.get('site_key'))
+    _captcha_type    = (recaptcha_info or {}).get('captcha_type', '')
+    _v3_score        = (recaptcha_info or {}).get('min_score', '')
+    _CAPTCHA_JS_PATS = [
+        re.compile(r'grecaptcha\.execute|hcaptcha\.execute|turnstile\.render', re.I),
+        re.compile(r'captcha.*(?:submit|checkout|payment|order)', re.I),
+        re.compile(r'g-recaptcha-response|cf-turnstile-response|h-captcha-response', re.I),
+    ]
+    _cap_js = any(p.search(combined) for p in _CAPTCHA_JS_PATS)
+    _cap_pass = _has_captcha or _cap_js
+    _cap_ev = (
+        f"{_captcha_type} sitekey present"
+        + (f" (min_score={_v3_score})" if _v3_score else '')
+        if _has_captcha else ('CAPTCHA JS pattern found' if _cap_js else 'None')
+    )
+    layers.append({
+        'id':       4,
+        'name':     'CAPTCHA Bot Control',
+        'status':   'PASS' if _cap_pass else 'FAIL',
+        'evidence': _cap_ev,
+        'detail':   f"CAPTCHA present: {_cap_ev}" if _cap_pass
+                    else 'No CAPTCHA protection — bots can submit forms freely',
+    })
+
+    # ── Layer 5: Device Fingerprint Velocity ──────────────────────────────
+    _FP_VELOCITY = {
+        'fingerprintjs': 'FingerprintJS Pro velocity (visitorId rate-limit)',
+        'datadome':      'DataDome request velocity challenge',
+        'perimeterx':    'PerimeterX bot velocity scoring',
+        'akamai_bot':    'Akamai Bot Manager velocity (sensor_data)',
+        'imperva':       'Imperva session challenge velocity',
+        'cloudflare_bot': 'Cloudflare Bot Management velocity',
+        'cloudflare_turnstile': 'Cloudflare Turnstile per-submission challenge',
+    }
+    _FP_JS_VEL_PATS = [
+        re.compile(r'visitorId.*velocity|velocity.*visitorId', re.I),
+        re.compile(r'fp_velocity|fingerprint.*rate|rate.*fingerprint', re.I),
+        re.compile(r'_dd_s.*expire|datadome.*challenge', re.I),
+    ]
+    _fp_vendor_hits = [_FP_VELOCITY[v] for v in fp_vendors if v in _FP_VELOCITY]
+    _fp_js_hits     = [m.group(0)[:50] for p in _FP_JS_VEL_PATS
+                       for m in [p.search(combined)] if m]
+    _fp_pass = bool(_fp_vendor_hits or _fp_js_hits)
+    layers.append({
+        'id':       5,
+        'name':     'Device Fingerprint Velocity',
+        'status':   'PASS' if _fp_pass else 'FAIL',
+        'evidence': ' | '.join((_fp_vendor_hits + _fp_js_hits)[:3]) or 'None',
+        'detail':   f"FP vendors with velocity: {', '.join(v for v in fp_vendors if v in _FP_VELOCITY)}"
+                    if _fp_pass else 'No device fingerprint velocity layer',
+    })
+
+    # ── Layer 6: Exponential Backoff / Retry Delay ───────────────────────
+    _BACKOFF_PATS = [
+        (re.compile(r'Math\.pow\s*\(\s*2\s*,', re.I),         'Math.pow(2, ...) exponential'),
+        (re.compile(r'delay\s*\*=\s*2|delay\s*\*\s*2', re.I), 'delay *= 2 doubling'),
+        (re.compile(r'setTimeout.*\*\s*(?:attempt|retry|count)', re.I), 'setTimeout * attempt'),
+        (re.compile(r'exponential[_\s]?backoff|backoff[_\s]?delay', re.I), 'backoff keyword'),
+        (re.compile(r'jitter\s*=|Math\.random.*delay|delay.*Math\.random', re.I), 'jitter randomization'),
+        (re.compile(r'fibonacci.*delay|delay.*fibonacci', re.I), 'Fibonacci delay'),
+        (re.compile(r'retryDelay\s*[=:]\s*\d+.*\*\s*\d+', re.I), 'retryDelay multiplier'),
+    ]
+    _backoff_hits = [(lbl, m.group(0)[:50]) for pat, lbl in _BACKOFF_PATS
+                     for m in [pat.search(combined)] if m]
+    _backoff_pass = bool(_backoff_hits)
+    layers.append({
+        'id':       6,
+        'name':     'Exponential Backoff / Retry Delay',
+        'status':   'PASS' if _backoff_pass else 'FAIL',
+        'evidence': ' | '.join(f'{lbl}' for lbl, _ in _backoff_hits[:3]) or 'None',
+        'detail':   f"{len(_backoff_hits)} backoff pattern(s) found" if _backoff_pass
+                    else 'No retry delay/backoff — rapid retry loops possible',
+    })
+
+    # ── Layer 7: Hidden Form RL Signals ───────────────────────────────────
+    _FORM_RL_PATS = [
+        (re.compile(r'disabled\s+(?:after|on|when).*(?:submit|attempt)', re.I), 'button disabled after submit'),
+        (re.compile(r'maxlength=["\']?\d{1,2}["\']?.*(?:attempt|retry|code)', re.I), 'maxlength on attempt field'),
+        (re.compile(r'data-countdown|countdown.*payment|payment.*countdown', re.I), 'countdown timer'),
+        (re.compile(r'class=["\'][^"\']*(?:rate.?limit|locked.?out|too.?many)[^"\']*["\']', re.I), 'RL CSS class'),
+        (re.compile(r'aria-disabled.*true.*(?:submit|pay)', re.I), 'aria-disabled on submit'),
+    ]
+    _form_hits = []
+    for pat, lbl in _FORM_RL_PATS:
+        if pat.search(html or ''):
+            _form_hits.append(lbl)
+    # also check actual form fields for attempt-tracking names
+    _form_field_names = {
+        f.get('name', '').lower()
+        for form in (all_forms or [])
+        for f in form.get('fields', [])
+    }
+    _RL_FIELD_NAMES = {'attempt', 'attempts', 'retry_count', 'fail_count',
+                       'lockout', 'locked', 'rate_limit'}
+    _rl_fields_found = _RL_FIELD_NAMES & _form_field_names
+    if _rl_fields_found:
+        _form_hits.append(f"RL field(s): {', '.join(list(_rl_fields_found)[:3])}")
+    _form_pass = bool(_form_hits)
+    layers.append({
+        'id':       7,
+        'name':     'Hidden Form RL Signals',
+        'status':   'PASS' if _form_pass else 'FAIL',
+        'evidence': ' | '.join(_form_hits[:3]) or 'None',
+        'detail':   f"{len(_form_hits)} form RL signal(s)" if _form_pass
+                    else 'No form-level rate-limit controls found',
+    })
+
+    # ── Verdict ───────────────────────────────────────────────────────────
+    score = sum(1 for l in layers if l['status'] == 'PASS')
+    if score >= 5:
+        verdict  = 'PROTECTED'
+        v_icon   = '🟢'
+        summary  = f'{score}/7 layers active — strong velocity protection'
+    elif score >= 2:
+        verdict  = 'PARTIALLY'
+        v_icon   = '🟡'
+        failed   = [l['name'] for l in layers if l['status'] == 'FAIL']
+        summary  = f'{score}/7 layers active — gaps: {", ".join(failed[:3])}'
+    else:
+        verdict  = 'UNPROTECTED'
+        v_icon   = '🔴'
+        summary  = f'{score}/7 layers active — minimal velocity protection'
+
+    return {
+        'verdict': verdict,
+        'icon':    v_icon,
+        'score':   score,
+        'layers':  layers,
+        'summary': summary,
+    }
+
+
+def _analyze_payment_flow_sequence(data: dict) -> list:
+    """
+    Map the full checkout payment flow into 12 ordered steps.
+
+    Each step describes what happens between checkout page load and
+    response handling, and whether evidence of that step was detected.
+
+    Steps:
+      1  SDK Load             — payment SDK scripts loaded (Stripe/BT/PayPal…)
+      2  Fingerprint          — device fingerprint SDK active (FingerprintJS/DataDome…)
+      3  Anti-Fraud Pre-Auth  — pre-auth fraud scoring (Kount/Forter/Signifyd…)
+      4  CAPTCHA              — bot challenge present (reCAPTCHA/Turnstile/hCaptcha)
+      5  Card Input           — card fields detected (hosted / iframe / direct)
+      6  Wallet               — express pay method available (Apple/Google/Shop Pay…)
+      7  Multi-step           — multi-page checkout wizard detected
+      8  CSRF Token           — CSRF/nonce required in POST body
+      9  Submit               — form POST endpoint + method + content-type
+      10 3DS / SCA            — 3D Secure redirect or confirmPayment flow
+      11 Response Handling    — success/decline pattern detection
+      12 CORS Risk            — CORS misconfiguration on payment endpoint
+
+    Returns list of step dicts:
+        {
+          'step':      int,
+          'name':      str,
+          'status':    'DETECTED' | 'LIKELY' | 'NOT_FOUND',
+          'icon':      emoji,
+          'evidence':  str,
+          'detail':    str,
+          'risk_note': str,   # filled only when status is NOT_FOUND and it matters
+        }
+    """
+    steps = []
+
+    def _step(n, name, status, icon, evidence, detail, risk_note=''):
+        steps.append({
+            'step':      n,
+            'name':      name,
+            'status':    status,
+            'icon':      icon,
+            'evidence':  evidence,
+            'detail':    detail,
+            'risk_note': risk_note,
+        })
+
+    forms      = data.get('forms', [])
+    requests_  = data.get('requests', [])
+    all_fields = [f for form in forms + requests_ for f in form.get('fields', [])]
+    sdks       = data.get('payment_sdks', [])
+    dfps       = data.get('device_fingerprints', [])
+    afl        = data.get('anti_fraud_layers', [])
+    rc         = data.get('recaptcha') or {}
+    gateways   = data.get('gateways', [])
+    wallets    = data.get('wallets', [])
+    ms         = data.get('multistep') or {}
+    threeds    = data.get('threeds_signals', [])
+    cors       = data.get('cors_info') or {}
+    rp         = data.get('response_patterns') or {}
+    tok_srcs   = data.get('token_sources', [])
+    resolved   = data.get('resolved_tokens', {})
+    live_af    = data.get('live_antifraud', [])
+    live_fp    = data.get('live_fingerprints', [])
+
+    # ── Step 1: SDK Load ──────────────────────────────────────────────────
+    if sdks:
+        _sdk_names = ', '.join(s['name'] + (f" v{s['version']}" if s.get('version') else '')
+                               for s in sdks[:3])
+        _step(1, 'SDK Load', 'DETECTED', '✅',
+              _sdk_names,
+              f"{len(sdks)} payment SDK(s) loaded — tokenization active")
+    elif gateways:
+        _gw = gateways[0].get('name', '')
+        _step(1, 'SDK Load', 'LIKELY', '🟡',
+              f"Gateway detected: {_gw}",
+              'Payment gateway found but no explicit SDK script — may use server-side')
+    else:
+        _step(1, 'SDK Load', 'NOT_FOUND', '❌',
+              'No SDKs or gateway detected',
+              'No payment SDK found',
+              'Raw card POST risk — card data may be sent without tokenization')
+
+    # ── Step 2: Device Fingerprint ────────────────────────────────────────
+    _fp_live_vendors = [h['vendor'] for h in live_fp]
+    if dfps or _fp_live_vendors:
+        _all_fp = list({fp['vendor'] for fp in dfps} | set(_fp_live_vendors))
+        _src = 'static+live' if (dfps and _fp_live_vendors) else ('live' if _fp_live_vendors else 'static')
+        _step(2, 'Device Fingerprint', 'DETECTED', '✅',
+              f"{', '.join(_all_fp[:3])} [{_src}]",
+              f"{len(dfps)} static + {len(_fp_live_vendors)} live fingerprint SDK(s)")
+    else:
+        _step(2, 'Device Fingerprint', 'NOT_FOUND', '🟡',
+              'None detected',
+              'No device fingerprint SDK — lower fraud signal quality',
+              'Missing device fingerprint may cause automatic decline on fraud-heavy gateways')
+
+    # ── Step 3: Anti-Fraud Pre-Auth ───────────────────────────────────────
+    _pre_auth = [af for af in afl if af.get('layer') in ('pre_auth', 'realtime')]
+    _af_live_vendors = [h['vendor'] for h in live_af]
+    if _pre_auth or _af_live_vendors:
+        _names = ', '.join(af['name'] for af in _pre_auth[:2]) or ', '.join(_af_live_vendors[:2])
+        _step(3, 'Anti-Fraud Pre-Auth', 'DETECTED', '✅',
+              _names,
+              f"{len(_pre_auth)} pre-auth layer(s) + {len(_af_live_vendors)} live signal(s)")
+    elif afl:
+        _step(3, 'Anti-Fraud Pre-Auth', 'LIKELY', '🟡',
+              ', '.join(af['name'] for af in afl[:2]),
+              'Post-auth only fraud layers present — no real-time pre-auth blocking')
+    else:
+        _step(3, 'Anti-Fraud Pre-Auth', 'NOT_FOUND', '🟡',
+              'None detected',
+              'No anti-fraud layer found',
+              'No pre-auth fraud scoring — transaction proceeds with gateway risk only')
+
+    # ── Step 4: CAPTCHA ───────────────────────────────────────────────────
+    _sk = rc.get('site_key', '')
+    _ct = rc.get('captcha_type', '') or rc.get('type', '')
+    if _sk:
+        _score_note = f" min_score={rc['min_score']}" if rc.get('min_score') else ''
+        _step(4, 'CAPTCHA', 'DETECTED', '✅',
+              f"{_ct or 'CAPTCHA'} — key: {_sk[:20]}…{_score_note}",
+              'CAPTCHA challenge active on payment form')
+    else:
+        _step(4, 'CAPTCHA', 'NOT_FOUND', '🟡',
+              'No sitekey found',
+              'No CAPTCHA detected on payment form',
+              'Bot submissions possible — combine with rate-limit headers')
+
+    # ── Step 5: Card Input ────────────────────────────────────────────────
+    _card_types = {'Card Number', 'CVV/CVC', 'Expiry Month', 'Expiry Year',
+                   'Expiry MM/YY', 'Cardholder Name'}
+    _card_fields = [f for f in all_fields if f.get('card_type') in _card_types]
+    _iframe_fields = [f for f in all_fields if f.get('from_iframe')]
+    _bt = data.get('braintree_hosted')
+    if _iframe_fields or _bt:
+        _step(5, 'Card Input', 'DETECTED', '✅',
+              f"Hosted fields / iframe ({len(_iframe_fields)} field(s))" +
+              (' + Braintree hosted' if _bt else ''),
+              'Card data captured inside iframe — PCI scope reduced for merchant')
+    elif _card_fields:
+        _gw_tok = gateways[0].get('tokenization', '') if gateways else ''
+        if _gw_tok:
+            _step(5, 'Card Input', 'DETECTED', '🟡',
+                  f"{len(_card_fields)} card field(s) — tokenized via {_gw_tok}",
+                  'Card fields present but tokenized client-side before POST')
+        else:
+            _step(5, 'Card Input', 'DETECTED', '🔴',
+                  f"{len(_card_fields)} direct card field(s) — no tokenization",
+                  'Raw card POST detected — PCI DSS SAQ A-EP or higher required',
+                  'Unencrypted card data in POST body — HIGH risk')
+    else:
+        _step(5, 'Card Input', 'NOT_FOUND', '🟡',
+              'No card fields detected',
+              'Card fields not found in static/DOM scan — may be fully iframe-isolated')
+
+    # ── Step 6: Wallet / Express Pay ──────────────────────────────────────
+    if wallets:
+        _step(6, 'Wallet / Express Pay', 'DETECTED', '✅',
+              ', '.join(wallets[:4]),
+              f"{len(wallets)} express pay method(s) available")
+    else:
+        _step(6, 'Wallet / Express Pay', 'NOT_FOUND', '🟡',
+              'None detected',
+              'No wallet/express pay — card-only checkout')
+
+    # ── Step 7: Multi-step ────────────────────────────────────────────────
+    if ms and ms.get('signals'):
+        _sigs = ms.get('signals', [])
+        _sc   = ms.get('step_count')
+        _step(7, 'Multi-step Checkout', 'DETECTED', '✅',
+              f"{len(_sigs)} signal(s)" + (f" — {_sc} steps" if _sc else ''),
+              ', '.join(_sigs[:2]))
+    else:
+        _step(7, 'Multi-step Checkout', 'NOT_FOUND', '🟡',
+              'Single-page checkout',
+              'Single-page checkout — all fields submitted in one POST')
+
+    # ── Step 8: CSRF Token ────────────────────────────────────────────────
+    _csrf_types = {'CSRF Token', 'Nonce', 'Anti-Bot Token', 'Request ID'}
+    _csrf_fields = [f for f in all_fields if f.get('card_type') in _csrf_types
+                    or f.get('is_dynamic')]
+    _csrf_resolved = {n: v for n, v in resolved.items()
+                      if v.get('confidence') in ('live', 'static')}
+    if _csrf_resolved:
+        _step(8, 'CSRF Token', 'DETECTED', '✅',
+              f"{len(_csrf_resolved)} resolved token(s): " +
+              ', '.join(list(_csrf_resolved)[:3]),
+              'CSRF tokens resolved and ready to inject')
+    elif _csrf_fields:
+        _step(8, 'CSRF Token', 'DETECTED', '🟡',
+              f"{len(_csrf_fields)} dynamic field(s) found (unresolved)",
+              'CSRF/nonce fields present — must be fetched live before POST')
+    elif tok_srcs:
+        _step(8, 'CSRF Token', 'LIKELY', '🟡',
+              f"{len(tok_srcs)} token source(s) identified",
+              'Token sources found but field not directly observed in form')
+    else:
+        _step(8, 'CSRF Token', 'NOT_FOUND', '🟡',
+              'No CSRF field detected',
+              'No CSRF token required — stateless form or token sent via header only')
+
+    # ── Step 9: Submit (Endpoint + Method) ────────────────────────────────
+    _pay_forms = [e for e in forms + requests_ if e.get('is_payment')]
+    if _pay_forms:
+        _pf = _pay_forms[0]
+        _ep = _pf.get('endpoint', '?')
+        _mt = _pf.get('method', 'POST')
+        _et = _pf.get('enctype', 'application/x-www-form-urlencoded')
+        _step(9, 'Submit', 'DETECTED', '✅',
+              f"{_mt} {_ep[:60]}",
+              f"Content-Type: {_et}")
+    elif forms or requests_:
+        _f = (forms + requests_)[0]
+        _step(9, 'Submit', 'LIKELY', '🟡',
+              f"{_f.get('method','POST')} {_f.get('endpoint','?')[:60]}",
+              'Non-payment form endpoint — payment may use XHR after tokenization')
+    else:
+        _step(9, 'Submit', 'NOT_FOUND', '❌',
+              'No form endpoint found',
+              'No form or XHR endpoint detected',
+              'Endpoint may be built dynamically by JS — use live intercept')
+
+    # ── Step 10: 3DS / SCA ────────────────────────────────────────────────
+    if threeds:
+        _step(10, '3DS / SCA', 'DETECTED', '✅',
+              ', '.join(threeds[:2]),
+              f"{len(threeds)} 3DS signal(s) — authentication redirect expected")
+    else:
+        _step(10, '3DS / SCA', 'NOT_FOUND', '🟡',
+              'No 3DS signals detected',
+              'No 3D Secure flow detected — may be exempted or not required')
+
+    # ── Step 11: Response Handling ────────────────────────────────────────
+    _verdict = rp.get('verdict', 'unknown')
+    _succ_n  = len(rp.get('success', []))
+    _decl_n  = len(rp.get('decline', []))
+    if _verdict not in ('unknown', ''):
+        _v_icon = {'success': '✅', 'likely_success': '🟢', 'decline': '🔴',
+                   'likely_decline': '🟠', 'mixed': '⚠️'}.get(_verdict, '❓')
+        _step(11, 'Response Handling', 'DETECTED', '✅',
+              f"Verdict: {_verdict.upper()} — {_succ_n} success / {_decl_n} decline pattern(s)",
+              f"Response patterns mapped: {_verdict}")
+    else:
+        _step(11, 'Response Handling', 'NOT_FOUND', '🟡',
+              'No response patterns detected',
+              'Cannot distinguish success from decline in response — use live intercept')
+
+    # ── Step 12: CORS Risk ────────────────────────────────────────────────
+    _cors_issues = cors.get('issues', [])
+    _cors_tests  = cors.get('tests', [])
+    if _cors_issues:
+        _step(12, 'CORS Risk', 'DETECTED', '🔴',
+              ' | '.join(_cors_issues[:2]),
+              f"{len(_cors_issues)} CORS issue(s) on payment endpoint",
+              'CORS misconfiguration — cross-origin credential access possible')
+    elif _cors_tests:
+        _step(12, 'CORS Risk', 'DETECTED', '✅',
+              f"{len(_cors_tests)} origin test(s) passed",
+              'CORS policy tested — no critical issues found')
+    else:
+        _step(12, 'CORS Risk', 'NOT_FOUND', '🟡',
+              'CORS not tested or no endpoint found',
+              'CORS policy unknown — run /payload on the payment endpoint URL')
+
+    return steps
+
+
+
+# ══════════════════════════════════════════════════════════════
+# ── Enhancement Helpers ───────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def _luhn_check(card_number: str) -> bool:
+    """Return True if card_number passes the Luhn algorithm."""
+    digits = [int(c) for c in card_number if c.isdigit()]
+    if len(digits) < 13:
+        return False
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _check_form_action_security(forms: list, page_url: str) -> list:
+    """
+    Check form action URLs for security issues:
+    - action uses http:// (plaintext card transmission)
+    - action domain differs from page domain (data exfiltration risk)
+    - action is javascript: or empty (JS-only submit, hard to detect endpoint)
+    Returns list of finding dicts.
+    """
+    findings = []
+    _page_host = urlparse(page_url).netloc.lower()
+
+    for form in forms:
+        action = form.get('endpoint') or form.get('action') or ''
+        method = form.get('method', 'POST').upper()
+        is_pay = form.get('is_payment', False) or bool(form.get('card_fields'))
+
+        if not action:
+            if is_pay:
+                findings.append({
+                    'severity': 'MEDIUM',
+                    'issue': 'No explicit action URL — JS-controlled submit',
+                    'endpoint': action,
+                    'form_method': method,
+                    'detail': 'Submission endpoint not discoverable from HTML alone',
+                })
+            continue
+
+        parsed = urlparse(action)
+        action_host = parsed.netloc.lower()
+
+        # HTTP plaintext
+        if parsed.scheme == 'http':
+            findings.append({
+                'severity': 'CRITICAL',
+                'issue': 'Form action uses HTTP — card data sent in plaintext',
+                'endpoint': action[:120],
+                'form_method': method,
+                'detail': 'Upgrade action URL to HTTPS immediately',
+            })
+
+        # Cross-domain submission (data exfil risk)
+        elif (action_host and _page_host
+              and action_host != _page_host
+              and not action_host.endswith('.' + _page_host.split('.', 1)[-1])):
+            findings.append({
+                'severity': 'HIGH',
+                'issue': f'Cross-domain form submission → {action_host}',
+                'endpoint': action[:120],
+                'form_method': method,
+                'detail': (
+                    'Card data submitted to different domain — '
+                    'verify this is intentional (e.g. payment gateway iframe)'
+                    if is_pay else
+                    'Form submits to external domain'
+                ),
+            })
+
+    return findings
+
+
+def _detect_coupon_fields(forms: list) -> list:
+    """
+    Detect coupon / promo code / discount fields in payment forms.
+    Returns list of field dicts with form endpoint.
+    """
+    _COUPON_RE = re.compile(
+        r'coupon|promo(?:_?code)?|discount(?:_?code)?|voucher|gift_?card|'
+        r'referral(?:_?code)?|affiliate(?:_?code)?|offer(?:_?code)?',
+        re.I
+    )
+    findings = []
+    seen: set = set()
+
+    for form in forms:
+        ep = form.get('endpoint') or form.get('action') or ''
+        for f in form.get('fields', []):
+            nm  = f.get('name', '')
+            lbl = f.get('field_label') or f.get('label', '') or f.get('placeholder', '')
+            if not nm:
+                continue
+            if _COUPON_RE.search(nm) or _COUPON_RE.search(lbl):
+                key = nm.lower()
+                if key not in seen:
+                    seen.add(key)
+                    findings.append({
+                        'field_name':  nm,
+                        'label':       lbl or nm,
+                        'type':        f.get('type', 'text'),
+                        'form_endpoint': ep[:80],
+                        'current_value': f.get('value', '') or '',
+                    })
+    return findings
+
+
+def _extract_redirect_urls(forms: list, requests_: list) -> list:
+    """
+    Extract post-payment redirect / callback URLs from form fields and
+    live request bodies (success_url, cancel_url, return_url, notify_url, etc.)
+    Returns list of {role, url, source} dicts.
+    """
+    _REDIRECT_RE = re.compile(
+        r'(?:success|cancel|return|notify|callback|redirect|'
+        r'confirmation|complete|done|response|ipn|webhook)'
+        r'[-_]?(?:url|uri|link|endpoint|path)',
+        re.I
+    )
+    _URL_VAL_RE = re.compile(r'https?://', re.I)
+
+    findings = []
+    seen_urls: set = set()
+
+    def _add(role: str, val: str, source: str):
+        val = val.strip()[:200]
+        if val and val not in seen_urls and len(val) > 5:
+            seen_urls.add(val)
+            findings.append({'role': role, 'url': val, 'source': source})
+
+    # Scan form fields
+    for form in forms:
+        ep = form.get('endpoint') or ''
+        for f in form.get('fields', []):
+            nm  = f.get('name', '')
+            val = f.get('value', '')
+            if _REDIRECT_RE.search(nm) and val:
+                _add(nm, val, f'form:{ep[:60]}')
+
+    # Scan live request bodies
+    for req in requests_:
+        body = req.get('raw_body', '') or req.get('body', '') or ''
+        ep   = req.get('endpoint') or req.get('url', '')
+        if not body:
+            continue
+        # Try JSON parse first
+        try:
+            import json as _json
+            bd = _json.loads(body)
+            if isinstance(bd, dict):
+                for k, v in bd.items():
+                    if _REDIRECT_RE.search(k) and isinstance(v, str) and _URL_VAL_RE.search(v):
+                        _add(k, v, f'xhr:{ep[:60]}')
+        except Exception:
+            pass
+        # URL-encoded form parse
+        for kv in body.split('&'):
+            if '=' in kv:
+                k, _, v = kv.partition('=')
+                from urllib.parse import unquote_plus as _uqp
+                k, v = _uqp(k), _uqp(v)
+                if _REDIRECT_RE.search(k) and _URL_VAL_RE.search(v):
+                    _add(k, v, f'xhr:{ep[:60]}')
+
+    return findings
+
+
+def _detect_idempotency(resp_headers: dict, forms: list, requests_: list) -> dict | None:
+    """
+    Detect idempotency key support:
+    - Idempotency-Key header in response
+    - X-Idempotency-Key header
+    - idempotency_key field in request bodies
+    Returns dict with findings or None.
+    """
+    _IDEM_HEADERS = ['Idempotency-Key', 'X-Idempotency-Key', 'idempotency-key']
+    _IDEM_FIELD_RE = re.compile(r'idempoten(?:cy)?[_-]?key', re.I)
+
+    result: dict = {
+        'supported': False,
+        'signals':   [],
+    }
+
+    # Check response headers
+    hdrs_low = {k.lower(): v for k, v in (resp_headers or {}).items()}
+    for h in _IDEM_HEADERS:
+        if h.lower() in hdrs_low:
+            result['supported'] = True
+            result['signals'].append(f'Header in response: {h}')
+            result['header_name'] = h
+            break
+
+    # Check request bodies
+    for req in requests_:
+        body = req.get('raw_body', '') or req.get('body', '') or ''
+        if _IDEM_FIELD_RE.search(body):
+            result['supported'] = True
+            ep = req.get('endpoint') or req.get('url', '')
+            result['signals'].append(f'Field in request body: {ep[:60]}')
+
+    # Check form fields
+    for form in forms:
+        for f in form.get('fields', []):
+            if _IDEM_FIELD_RE.search(f.get('name', '')):
+                result['supported'] = True
+                result['signals'].append(f"Form field: {f['name']}")
+
+    return result if result['supported'] else None
+
+
+def _detect_webauthn_passkey(html: str, js_text: str) -> list:
+    """
+    Detect WebAuthn / Passkey / FIDO2 signals.
+    Returns list of finding dicts.
+    """
+    _WA_PATTERNS = [
+        (re.compile(r'navigator\.credentials\.(?:create|get)', re.I),
+         'WebAuthn credentials API call'),
+        (re.compile(r'PublicKeyCredential', re.I),
+         'PublicKeyCredential interface'),
+        (re.compile(r'credentialCreationOptions|credentialRequestOptions', re.I),
+         'WebAuthn options object'),
+        (re.compile(r'FIDO2|fido2|fido-u2f', re.I),
+         'FIDO2 / U2F reference'),
+        (re.compile(r'passkey|pass[-_]?key', re.I),
+         'Passkey reference'),
+        (re.compile(r'authenticatorAttachment|userVerification|residentKey', re.I),
+         'WebAuthn authenticator config'),
+        (re.compile(r'webauthn', re.I),
+         'WebAuthn explicit reference'),
+        (re.compile(r'SecurityKey|yubikey|yubico', re.I),
+         'Hardware security key reference'),
+    ]
+
+    combined = html + js_text
+    findings = []
+    seen: set = set()
+
+    for pat, label in _WA_PATTERNS:
+        m = pat.search(combined)
+        if m and label not in seen:
+            seen.add(label)
+            # Extract snippet
+            start = max(0, m.start() - 40)
+            end   = min(len(combined), m.end() + 40)
+            snippet = combined[start:end].replace('\n', ' ').strip()[:100]
+            findings.append({'signal': label, 'snippet': snippet})
+
+    return findings
+
+
+def _score_gateway_completeness(
+    forms: list,
+    gateways: list,
+    resolved_tokens: dict,
+) -> list:
+    """
+    Score how complete the extracted fields are for each detected gateway.
+    Returns list of {gateway, score_pct, missing, present} dicts.
+    """
+    # Required field patterns per gateway
+    _GW_REQUIREMENTS: dict[str, list[tuple[str, str]]] = {
+        'Stripe': [
+            (re.compile(r'stripe.*token|payment.*method|pm_|tok_', re.I), 'Stripe payment token'),
+            (re.compile(r'g-recaptcha|recaptcha', re.I),                  'reCAPTCHA token'),
+        ],
+        'PayPal': [
+            (re.compile(r'paypal.*order|order_?id|paypal_?token', re.I), 'PayPal order ID'),
+            (re.compile(r'nonce|client.*token', re.I),                    'Client nonce/token'),
+        ],
+        'Braintree': [
+            (re.compile(r'payment.*method.*nonce|nonce', re.I), 'Payment method nonce'),
+            (re.compile(r'device.*data|fraud.*data', re.I),     'Device data token'),
+        ],
+        'Authorize.Net': [
+            (re.compile(r'opaqueData|opaqueValue|dataValue', re.I), 'Opaque payment data'),
+            (re.compile(r'dataDescriptor', re.I),                   'Data descriptor'),
+        ],
+        'CardPointe': [
+            (re.compile(r'token|cardToken|card_?token', re.I), 'Card token'),
+            (re.compile(r'g-recaptcha|recaptcha', re.I),        'reCAPTCHA token'),
+        ],
+        'Square': [
+            (re.compile(r'sourceId|nonce|cardNonce', re.I), 'Card nonce'),
+        ],
+        'Adyen': [
+            (re.compile(r'encryptedCard|encryptedSecurity|paymentMethod', re.I), 'Encrypted card'),
+            (re.compile(r'browserInfo', re.I),                                   'Browser info'),
+        ],
+    }
+
+    # Collect all field names across all forms
+    all_names = set()
+    for form in forms:
+        for f in form.get('fields', []):
+            nm = f.get('name', '')
+            if nm:
+                all_names.add(nm)
+    # Also include resolved tokens
+    all_names.update(resolved_tokens.keys())
+    all_names_str = ' '.join(all_names)
+
+    results = []
+    for gw in gateways:
+        gw_name = gw.get('name', '')
+        reqs = _GW_REQUIREMENTS.get(gw_name, [])
+        if not reqs:
+            results.append({
+                'gateway':    gw_name,
+                'score_pct':  None,
+                'note':       'No completeness requirements defined for this gateway',
+                'present':    [],
+                'missing':    [],
+            })
+            continue
+
+        present = []
+        missing = []
+        for pat, label in reqs:
+            if pat.search(all_names_str):
+                present.append(label)
+            else:
+                missing.append(label)
+
+        score = int(len(present) / len(reqs) * 100) if reqs else 100
+        results.append({
+            'gateway':   gw_name,
+            'score_pct': score,
+            'present':   present,
+            'missing':   missing,
+            'note': (
+                '✅ All required fields present'
+                if not missing else
+                f'⚠️ Missing {len(missing)} required field(s)'
+            ),
+        })
+
+    return results
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     if progress_cb: progress_cb("⬇️ Fetching HTML...")
@@ -28491,15 +29537,20 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     dom_forms     = []
     client_storage = {'localStorage': {}, 'sessionStorage': {}}
 
+    _pw_resp_bodies: dict = {}   # url → body — from FIX 3 response capture
     for r in pw_requests:
         if r.pop('_js_only', False):
             js_text = r.pop('_js_text', '')
+            # FIX 3c: collect response bodies from js_only entries
+            _pw_resp_bodies.update(r.pop('_resp_bodies', {}))
             continue
         if r.pop('_storage_dump', False):
             client_storage['localStorage'].update(r.get('localStorage', {}))
             client_storage['sessionStorage'].update(r.get('sessionStorage', {}))
             continue
         js_text += r.pop('_js_text', '')
+        # FIX 3c: collect response bodies from normal entries too
+        _pw_resp_bodies.update(r.pop('_resp_bodies', {}))
         if r.get('source') == 'playwright_dom':
             dom_forms.append(r)
         else:
@@ -28617,7 +29668,12 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # Phase 6: Token sources — locate
     if progress_cb: progress_cb("🔎 Locating token sources...")
-    token_sources = _find_token_sources(static_html + js_html, js_text)
+    # FIX 3d: Include GET response bodies in token source scan
+    # Stripe pk_, CSRF meta tokens, session tokens appear in GET responses
+    _resp_body_text = ' '.join(_pw_resp_bodies.values())[:500_000]
+    token_sources = _find_token_sources(
+        static_html + js_html + _resp_body_text, js_text
+    )
 
     # Phase 6b: Resolve live token values
     if progress_cb: progress_cb("🔑 Resolving dynamic token values...")
@@ -28629,6 +29685,28 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         js_text       = js_text,
         progress_cb   = progress_cb,
     )
+
+    # ── Pre-Phase 7: Identify payment page URL for RECAPTCHA_PAGE_URL ──────────
+    # Use the current URL if it matches pay/checkout/donate pattern,
+    # or pick the first matching subpage URL found so far
+    _PAY_SUBPAGE_RE = re.compile(
+        r'/(?:checkout|pay|payment|donate|donation|billing|order|cart|subscribe|give)',
+        re.I
+    )
+    _payment_page_url = url  # default: scanned URL
+    if not _PAY_SUBPAGE_RE.search(url):
+        # look for a subpage form source that matches
+        for _sf in static_forms + js_forms + subpage_forms:
+            _sf_ep = _sf.get('endpoint', '') or _sf.get('action', '') or ''
+            if _PAY_SUBPAGE_RE.search(_sf_ep):
+                _payment_page_url = _sf_ep
+                break
+        # also check subpage_sitekeys
+        for _sp_sk_pre in subpage_sitekeys:
+            _sp_url_pre = _sp_sk_pre.get('page_url', '')
+            if _sp_url_pre and _PAY_SUBPAGE_RE.search(_sp_url_pre):
+                _payment_page_url = _sp_url_pre
+                break
 
     # Phase 7: CAPTCHA sitekeys — full Playwright scan (action/invisible/score/theme)
     if progress_cb: progress_cb("🤖 Running full Playwright CAPTCHA sitekey scan...")
@@ -28741,24 +29819,48 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     # ── Phase 1: parallel static requests.get ─────────────────────────────
     # Returns (path, forms, sitekey, html, is_spa) or None on failure.
     def _fetch_subpage_static(sp: str):
+        # FIX 6: Try URL variants when main path redirects or returns non-200
+        # e.g. /checkout → /checkout/step1 → /checkout/information
         _sub_url = _origin + sp
-        try:
-            _sr = requests.get(
-                _sub_url, headers=_get_headers(),
-                timeout=8, verify=False, allow_redirects=True,
-            )
-            if _sr.status_code != 200:
-                return None
-            _ct = _sr.headers.get('content-type', '')
-            if 'text/html' not in _ct:
-                return None
-            _html      = _sr.text
-            _sub_forms = _extract_forms_static(_html, _sub_url)
-            _sk        = _extract_recaptcha_info(_html, '', _sub_url)
-            _spa       = _is_spa_html(_html)
-            return sp, _sub_forms, _sk, _html, _spa
-        except Exception:
-            return None
+        _VARIANTS = [
+            _sub_url,
+            _sub_url + '/',
+            _sub_url + '/information',
+            _sub_url + '/step1',
+            _sub_url + '/payment',
+        ]
+        for _try_url in _VARIANTS:
+            try:
+                _sr = requests.get(
+                    _try_url, headers=_get_headers(),
+                    timeout=8, verify=False, allow_redirects=True,
+                )
+                # Accept 200 OR a redirect that landed on HTML
+                _ct = _sr.headers.get('content-type', '')
+                if _sr.status_code == 200 and 'text/html' in _ct:
+                    _html      = _sr.text
+                    # Skip redirect-to-login pages (no payment content)
+                    _is_login  = bool(re.search(
+                        r'<form[^>]*action[^>]*/(?:login|signin|auth)',
+                        _html, re.I
+                    ))
+                    if _is_login and not re.search(r'card|payment|checkout', _html, re.I):
+                        return None
+                    _sub_forms = _extract_forms_static(_html, _sr.url)
+                    _sk        = _extract_recaptcha_info(_html, '', _sr.url)
+                    _spa       = _is_spa_html(_html)
+                    # Use the resolved URL (after redirect) as the path
+                    _resolved_sp = urlparse(_sr.url).path or sp
+                    return _resolved_sp, _sub_forms, _sk, _html, _spa
+                elif _sr.status_code in (301, 302, 303, 307, 308):
+                    # Redirect to external domain (e.g. auth provider) — skip
+                    _loc = _sr.headers.get('location', '')
+                    if _loc and not _loc.startswith('/') and _origin not in _loc:
+                        return None
+                    # else follow via allow_redirects=True on next variant
+            except Exception:
+                continue
+        return None
 
     # Paths that are worth the Playwright cost (payment-critical only)
     _SPA_PW_PRIORITY = {
@@ -29261,9 +30363,115 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             f"🔎 Patterns: {_s} success / {_d} decline / {_c} response codes"
         )
 
+    # ── Velocity checks ───────────────────────────────────────────────
+    if progress_cb: progress_cb("⚡ Detecting velocity / rate-limit protection...")
+    _velocity = _detect_velocity_checks(
+        html               = static_html + js_html,
+        js_text            = js_text,
+        resp_headers       = _resp_headers,
+        rate_limit_data    = rate_limit,
+        anti_fraud_layers  = _anti_fraud,
+        device_fingerprints = _device_fps,
+        recaptcha_info     = recaptcha_info,
+        all_forms          = static_forms + js_forms + subpage_forms,
+    )
+
     # PATCHED: Content-Type mismatch check
     _all_forms_out = static_forms + js_forms + subpage_forms
     _ct_mismatches = _detect_content_type_mismatch(_all_forms_out, real_requests)
+
+    # ── ENH 1: Form Action Security Check ───────────────────────────────
+    if progress_cb: progress_cb("🔒 Checking form action security (HTTP/cross-domain)...")
+    _form_action_issues = _check_form_action_security(
+        _all_forms_out, url
+    )
+    if progress_cb and _form_action_issues:
+        _fa_crit = sum(1 for x in _form_action_issues if x['severity'] == 'CRITICAL')
+        progress_cb(f"🔒 Form action: {len(_form_action_issues)} issue(s) ({_fa_crit} CRITICAL)")
+
+    # ── ENH 2: Luhn check on any card number found in live requests ───────
+    if progress_cb: progress_cb("🔢 Luhn-validating intercepted card patterns...")
+    _luhn_findings = []
+    _CARD_NUM_RE = re.compile(r'(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|'
+                               r'6(?:011|5[0-9]{2})[0-9]{12}|3(?:0[0-5]|[68][0-9])[0-9]{11})'
+                               r'', re.I)
+    for _lr in live_result.get('live_requests', []):
+        _combined_lr = (_lr.get('body','') or '') + (_lr.get('post_data','') or '') +                        (_lr.get('response_body','') or '')
+        for _cm in _CARD_NUM_RE.finditer(_combined_lr):
+            _cn = _cm.group(0).replace(' ', '').replace('-', '')
+            _valid = _luhn_check(_cn)
+            _ep    = _lr.get('url', '')[:80]
+            _luhn_findings.append({
+                'pan_prefix':  _cn[:6] + '...' + _cn[-4:],
+                'luhn_valid':  _valid,
+                'endpoint':    _ep,
+                'risk':        'CRITICAL — raw PAN in network traffic',
+            })
+    if progress_cb and _luhn_findings:
+        progress_cb(f"🔢 Luhn: {len(_luhn_findings)} card pattern(s) found in live traffic")
+
+    # ── ENH 3: Coupon / promo code field detection ────────────────────────
+    if progress_cb: progress_cb("🎟️ Scanning for coupon / promo code fields...")
+    _coupon_fields = _detect_coupon_fields(_all_forms_out)
+    if progress_cb and _coupon_fields:
+        _cp_names = ', '.join(f['field_name'] for f in _coupon_fields[:3])
+        progress_cb(f"🎟️ Coupon fields found: {_cp_names}")
+
+    # ── ENH 4: Post-payment redirect URL extraction ───────────────────────
+    if progress_cb: progress_cb("🔗 Extracting post-payment redirect URLs...")
+    _redirect_urls = _extract_redirect_urls(_all_forms_out, real_requests)
+    if progress_cb and _redirect_urls:
+        progress_cb(f"🔗 Redirect URLs found: {len(_redirect_urls)}")
+
+    # ── ENH 5: Idempotency key detection ──────────────────────────────────
+    if progress_cb: progress_cb("🔑 Checking idempotency key support...")
+    _idempotency = _detect_idempotency(_resp_headers, _all_forms_out, real_requests)
+    if progress_cb and _idempotency:
+        progress_cb(f"🔑 Idempotency: {_idempotency['signals'][0][:60]}")
+
+    # ── ENH 6: WebAuthn / Passkey detection ───────────────────────────────
+    if progress_cb: progress_cb("🔐 Scanning WebAuthn / Passkey signals...")
+    _webauthn = _detect_webauthn_passkey(static_html + js_html, js_text)
+    if progress_cb and _webauthn:
+        progress_cb(f"🔐 WebAuthn signals: {len(_webauthn)} found")
+
+    # ── ENH 7: Gateway field completeness score ───────────────────────────
+    if progress_cb: progress_cb("📊 Scoring gateway field completeness...")
+    _gw_completeness = _score_gateway_completeness(
+        _all_forms_out, gateways, resolved_tokens
+    )
+    if progress_cb and _gw_completeness:
+        _gc_summary = ', '.join(
+            f"{g['gateway']} {g['score_pct']}%"
+            for g in _gw_completeness if g.get('score_pct') is not None
+        )
+        if _gc_summary:
+            progress_cb(f"📊 Completeness: {_gc_summary}")
+
+    # ── Payment flow sequence map ─────────────────────────────────────
+    if progress_cb: progress_cb("🗺️ Mapping payment flow sequence...")
+    _flow_data = {
+        'forms':              static_forms + js_forms + subpage_forms,
+        'requests':           real_requests,
+        'payment_sdks':       _sdks,
+        'device_fingerprints':_device_fps,
+        'anti_fraud_layers':  _anti_fraud,
+        'recaptcha':          recaptcha_info,
+        'gateways':           gateways,
+        'wallets':            wallets,
+        'multistep':          multistep,
+        'threeds_signals':    threeds_signals,
+        'cors_info':          cors_info,
+        'response_patterns':  _scan_response_patterns(
+                                  static_html + js_html, js_text, url, []) \
+                               if not locals().get('response_patterns') else response_patterns,
+        'token_sources':      token_sources,
+        'resolved_tokens':    resolved_tokens,
+        'braintree_hosted':   _bt,
+        'live_antifraud':     live_antifraud_hits,
+        'live_fingerprints':  live_fingerprint_hits,
+    }
+    _payment_flow = _analyze_payment_flow_sequence(_flow_data)
 
     # PATCHED: 3DS redirect field extraction
     for form in _all_forms_out:
@@ -29309,6 +30517,16 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'anti_fraud_layers':   _anti_fraud,           # anti-fraud middleware
         'live_antifraud':      live_antifraud_hits,   # NEW — live AF signals
         'live_fingerprints':   live_fingerprint_hits, # NEW — live FP signals
+        'velocity_checks':     _velocity,             # velocity/rate-limit layers
+        'payment_flow':        _payment_flow,         # 12-step flow map
+        'payment_page_url':    _payment_page_url,     # URL where payment form lives
+        'form_action_issues':  _form_action_issues,   # ENH1 — HTTP/cross-domain form actions
+        'luhn_findings':       _luhn_findings,         # ENH2 — Luhn-validated PANs in traffic
+        'coupon_fields':       _coupon_fields,         # ENH3 — coupon/promo code fields
+        'redirect_urls':       _redirect_urls,         # ENH4 — post-payment redirect URLs
+        'idempotency':         _idempotency,           # ENH5 — idempotency key support
+        'webauthn':            _webauthn,              # ENH6 — WebAuthn/Passkey signals
+        'gw_completeness':     _gw_completeness,       # ENH7 — gateway field completeness
     }
 
 
@@ -30276,6 +31494,41 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             lines.append(f"  • `{raw_code(h['vendor'])}`{_tk}")
             lines.append(f"    `{raw_code(h['endpoint'], 80)}`")
 
+    # ── PAYMENT FLOW SEQUENCE ─────────────────────────────────
+    _pflow = data.get('payment_flow', [])
+    if _pflow:
+        _det  = sum(1 for s in _pflow if s['status'] == 'DETECTED')
+        _tot  = len(_pflow)
+        lines.append(_sec(f"Payment Flow Sequence  ·  {_det}/{_tot} steps detected", "🗺️"))
+        for step in _pflow:
+            _sicon = step['icon']
+            _sname = escape_md(step['name'])
+            _sevid = escape_md(step['evidence'][:70]) if step.get('evidence') else ''
+            lines.append(f"  {_sicon} *{step['step']}. {_sname}*" +
+                         (f"  `{raw_code(step['evidence'][:55])}`" if step.get('evidence') else ''))
+            if step.get('risk_note'):
+                lines.append(f"    ⚠️ _{escape_md(step['risk_note'][:90])}_")
+
+    # ── VELOCITY CHECKS ───────────────────────────────────────
+    _vel = data.get('velocity_checks')
+    if _vel:
+        _vicon  = _vel.get('icon', '❓')
+        _vverd  = _vel.get('verdict', 'UNKNOWN')
+        _vscore = _vel.get('score', 0)
+        lines.append(_sec(
+            f"Velocity Protection  ·  {_vicon} {escape_md(_vverd)}  `{_vscore}/7`", "⚡"))
+        lines.append(f"  _{escape_md(_vel.get('summary', '')[:100])}_")
+        for lyr in _vel.get('layers', []):
+            _lpass = lyr['status'] == 'PASS'
+            _lic   = '✅' if _lpass else '❌'
+            _lname = escape_md(lyr['name'])
+            _lev   = escape_md(lyr['evidence'][:60]) if lyr.get('evidence') else ''
+            lines.append(f"  {_lic} *{lyr['id']}. {_lname}*")
+            if _lev and _lev != 'None':
+                lines.append(f"    `{raw_code(lyr['evidence'][:60])}`")
+            if not _lpass and lyr.get('detail'):
+                lines.append(f"    _{escape_md(lyr['detail'][:80])}_")
+
     # ── MULTI-STEP ────────────────────────────────────────────
     ms = data.get('multistep')
     if ms:
@@ -30387,6 +31640,83 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             lines.append("\n```python\n" + snip['python'][:500] + "\n```")
         if snip.get('python_async'):
             lines.append("\n```python\n" + snip['python_async'][:600] + "\n```")
+
+    # ── ENH1: Form Action Security Issues ───────────────────────────────
+    _fa_issues = data.get('form_action_issues', [])
+    if _fa_issues:
+        lines.append(_sec(f"Form Action Security  ·  {len(_fa_issues)} issue(s)", "🔒"))
+        for _fa in _fa_issues[:5]:
+            _sev_icon = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡'}.get(_fa['severity'], '⚠️')
+            lines.append(f"  {_sev_icon} *{escape_md(_fa['severity'])}* — {escape_md(_fa['issue'][:80])}")
+            if _fa.get('endpoint'):
+                lines.append(f"    `{raw_code(_fa['endpoint'], 80)}`")
+            if _fa.get('detail'):
+                lines.append(f"    _{escape_md(_fa['detail'][:100])}_")
+
+    # ── ENH2: Luhn Findings (raw PAN in live traffic) ────────────────────
+    _luhn = data.get('luhn_findings', [])
+    if _luhn:
+        lines.append(_sec(f"🚨 RAW Card Numbers in Live Traffic  ·  {len(_luhn)}", "🔴"))
+        for _lf in _luhn[:5]:
+            _lv = "✅ valid" if _lf['luhn_valid'] else "❌ invalid"
+            lines.append(f"  🔴 `{raw_code(_lf['pan_prefix'])}` Luhn: {escape_md(_lv)}")
+            lines.append(f"    `{raw_code(_lf['endpoint'], 80)}`")
+            lines.append(f"    _{escape_md(_lf['risk'])}_")
+
+    # ── ENH3: Coupon / Promo Fields ───────────────────────────────────────
+    _coupons = data.get('coupon_fields', [])
+    if _coupons:
+        lines.append(_sec(f"Coupon / Promo Code Fields  ·  {len(_coupons)}", "🎟️"))
+        for _cf in _coupons[:6]:
+            _cv = f" = `{raw_code(_cf['current_value'], 30)}`" if _cf.get('current_value') else ""
+            lines.append(
+                f"  🎟️ `{raw_code(_cf['field_name'], 35)}`"
+                f" _{escape_md(_cf['label'][:35])}_"
+                f"{_cv}"
+            )
+
+    # ── ENH4: Post-Payment Redirect URLs ─────────────────────────────────
+    _redirects = data.get('redirect_urls', [])
+    if _redirects:
+        lines.append(_sec(f"Post-Payment Redirect URLs  ·  {len(_redirects)}", "🔗"))
+        for _ru in _redirects[:6]:
+            lines.append(
+                f"  🔗 `{raw_code(_ru['role'], 30)}`"
+                f" → `{raw_code(_ru['url'], 60)}`"
+            )
+            lines.append(f"    _{escape_md(_ru['source'][:60])}_")
+
+    # ── ENH5: Idempotency Key Support ─────────────────────────────────────
+    _idem = data.get('idempotency')
+    if _idem and _idem.get('supported'):
+        lines.append(_sec("Idempotency Key Support", "🔑"))
+        for _is in _idem.get('signals', [])[:3]:
+            lines.append(f"  ✅ {escape_md(_is[:100])}")
+        if _idem.get('header_name'):
+            lines.append(f"  Header: `{raw_code(_idem['header_name'])}`")
+
+    # ── ENH6: WebAuthn / Passkey Signals ─────────────────────────────────
+    _wa = data.get('webauthn', [])
+    if _wa:
+        lines.append(_sec(f"WebAuthn / Passkey  ·  {len(_wa)} signal(s)", "🔐"))
+        for _ws in _wa[:5]:
+            lines.append(f"  🔐 {escape_md(_ws['signal'])}")
+            if _ws.get('snippet'):
+                lines.append(f"    `{raw_code(_ws['snippet'], 80)}`")
+
+    # ── ENH7: Gateway Field Completeness ─────────────────────────────────
+    _gc = data.get('gw_completeness', [])
+    if _gc:
+        lines.append(_sec("Gateway Field Completeness", "📊"))
+        for _g in _gc:
+            _pct  = _g.get('score_pct')
+            _pct_str = f"`{_pct}%`" if _pct is not None else "_unknown_"
+            _pct_icon = ('✅' if _pct == 100 else '🟡' if _pct and _pct >= 50 else '🔴') if _pct is not None else '❓'
+            lines.append(f"  {_pct_icon} *{escape_md(_g['gateway'])}* — {_pct_str}")
+            for _mp in _g.get('missing', [])[:3]:
+                lines.append(f"    ❌ Missing: _{escape_md(_mp)}_")
+            for _pp in _g.get('present', [])[:3]:
+                lines.append(f"    ✅ `{escape_md(_pp)}`")
 
     lines.append(f"\n{SEP_MINOR}")
     lines.append("⚠️ _Authorized testing only._")
@@ -30528,6 +31858,41 @@ def _build_json_export(data: dict) -> str:
     # RECAPTCHA info
     rc_info = data.get('recaptcha')
 
+    # ── Smarter RECAPTCHA_PAGE_URL: prefer checkout/pay/donate pages ──────────
+    # Priority: subpage sitekeys found on pay pages > main page URL
+    _PAY_URL_KEYWORDS = re.compile(
+        r'/(?:checkout|pay|payment|donate|donation|billing|order|cart|subscribe|give)',
+        re.I
+    )
+    _recaptcha_page_url = rc_info.get('page_url', '') if rc_info else ''
+    # Override with payment-specific subpage URL if available
+    for _sp_sk in data.get('subpage_sitekeys', []):
+        _sp_url = _sp_sk.get('page_url', '')
+        if _sp_url and _PAY_URL_KEYWORDS.search(_sp_url):
+            _recaptcha_page_url = _sp_url
+            break
+    # Also scan all_keys for payment page URL
+    if not _PAY_URL_KEYWORDS.search(_recaptcha_page_url):
+        if rc_info and rc_info.get('all_keys'):
+            for _sk in rc_info['all_keys']:
+                _sk_url = _sk.get('page_url', '')
+                if _sk_url and _PAY_URL_KEYWORDS.search(_sk_url):
+                    _recaptcha_page_url = _sk_url
+                    break
+    # Final fallback: if main URL itself is a pay page, use it
+    if not _recaptcha_page_url and _PAY_URL_KEYWORDS.search(data.get('url', '')):
+        _recaptcha_page_url = data.get('url', '')
+    # Override with pre-detected payment_page_url from _payload_sync if available
+    _predet = data.get('payment_page_url', '')
+    if _predet and _PAY_URL_KEYWORDS.search(_predet):
+        _recaptcha_page_url = _predet
+
+    # ── BASE_URL: clean origin only (scheme + host, no path) ─────────────────
+    _raw_base = data.get('base_url', '') or data.get('url', '')
+    _parsed_base = urlparse(_raw_base)
+    _clean_base = (f"{_parsed_base.scheme}://{_parsed_base.netloc}"
+                   if _parsed_base.netloc else _raw_base)
+
     # SUBPAGE_URLS — collect from subpage form sources + subpage_sitekeys
     _STANDARD_PAY_PATHS = {
         '/checkout', '/pay', '/payment', '/donate', '/donation',
@@ -30563,10 +31928,10 @@ def _build_json_export(data: dict) -> str:
             _seen_subpages.add(_sp)
 
     info: dict = {
-        'BASE_URL':           _base_url,
+        'BASE_URL':           _clean_base,
         'SUBMIT_ENDPOINT':    _submit_ep,
         'SUBMIT_METHOD':      _submit_method,
-        'RECAPTCHA_PAGE_URL': rc_info.get('page_url', '')     if rc_info else '',
+        'RECAPTCHA_PAGE_URL': _recaptcha_page_url,
         'RECAPTCHA_SITE_KEY': rc_info.get('site_key', '')     if rc_info else '',
         'RECAPTCHA_TYPE':     rc_info.get('captcha_type', '') if rc_info else '',
         'GATEWAY':            gateways[0].get('name', '')     if gateways else '',
@@ -30690,6 +32055,72 @@ def _build_json_export(data: dict) -> str:
 
     if post_body:
         out['post_body'] = post_body
+
+    # ── Per-form post_body sections (form-order preserved) ────────────────────
+    # Mirrors the screenshot format: each payment form gets its own dict
+    # with fields in their actual form order — static values included as-is
+    _pay_forms = [
+        e for e in all_entries
+        if e.get('is_payment') or e.get('card_fields') or
+           any(f.get('is_card') for f in e.get('fields', []))
+    ]
+    if _pay_forms:
+        per_form_bodies = []
+        for _pf_idx, _pf in enumerate(_pay_forms[:6]):  # cap at 6
+            _pf_body: dict = {}
+            _pf_ep   = _pf.get('endpoint') or _pf.get('action') or ''
+            _pf_meth = (_pf.get('method') or 'POST').upper()
+            _pf_src  = _pf.get('source', '')
+
+            for _f in _pf.get('fields', []):
+                _nm  = _f.get('name', '')
+                _ft  = _f.get('type', 'text')
+                _ct  = _f.get('card_type') or ''
+                _val = _f.get('value', '')
+                _dyn = bool(_f.get('is_dynamic', False))
+                _lbl = _f.get('field_label') or _f.get('label', '') or _nm
+
+                if not _nm or _ft in _SKIP_FTYPES:
+                    continue
+
+                # Use real static value if non-empty and not dynamic
+                if _val and _val not in _STATIC_SKIP_VALS and not _dyn:
+                    _pf_body[_nm] = _val
+                # Dynamic / token fields: use resolved value or placeholder
+                elif _dyn or _ct in _TOKEN_CARD_TYPES:
+                    _res = resolved_tokens.get(_nm, {})
+                    _pf_body[_nm] = (
+                        _res.get('value')
+                        or _CT_TO_PLACEHOLDER.get(_ct)
+                        or f'<{_nm}>'
+                    )
+                # Card data fields
+                elif _ct in _CARD_TYPES:
+                    _pf_body[_nm] = _CT_TO_PLACEHOLDER.get(_ct, f'<{_nm}>')
+                # Billing / user fields
+                elif _ct in _PAY_TYPES:
+                    _pf_body[_nm] = _CT_TO_PLACEHOLDER.get(_ct, _ph(_nm, _lbl, _ft))
+                # recaptcha response field
+                elif re.search(r'g-recaptcha|recaptcha', _nm.lower()):
+                    _pf_body[_nm] = '<recaptcha_token>'
+                # All other fields: use value or placeholder
+                elif _val:
+                    _pf_body[_nm] = _val
+                else:
+                    _pf_body[_nm] = _ph(_nm, _lbl, _ft)
+
+            if _pf_body:
+                _pf_entry: dict = {
+                    'endpoint': _pf_ep,
+                    'method':   _pf_meth,
+                    'body':     _pf_body,
+                }
+                if _pf_src:
+                    _pf_entry['source'] = _pf_src
+                per_form_bodies.append(_pf_entry)
+
+        if per_form_bodies:
+            out['per_form_bodies'] = per_form_bodies
 
     # ── Build field_map (name → semantic type) ────────────────
     _CT_TO_SEMANTIC: dict[str, str] = {
@@ -31055,6 +32486,41 @@ def _build_json_export(data: dict) -> str:
                 for s in rp['stripe_codes']
             ]
         out['response_patterns'] = rp_out
+
+    # ── ENH1: form_action_issues ─────────────────────────────
+    _fai = data.get('form_action_issues', [])
+    if _fai:
+        out['form_action_issues'] = _fai
+
+    # ── ENH2: luhn_findings ───────────────────────────────────
+    _lf_exp = data.get('luhn_findings', [])
+    if _lf_exp:
+        out['luhn_findings'] = _lf_exp
+
+    # ── ENH3: coupon_fields ───────────────────────────────────
+    _cf_exp = data.get('coupon_fields', [])
+    if _cf_exp:
+        out['coupon_fields'] = _cf_exp
+
+    # ── ENH4: redirect_urls ───────────────────────────────────
+    _ru_exp = data.get('redirect_urls', [])
+    if _ru_exp:
+        out['redirect_urls'] = _ru_exp
+
+    # ── ENH5: idempotency ────────────────────────────────────
+    _id_exp = data.get('idempotency')
+    if _id_exp:
+        out['idempotency'] = _id_exp
+
+    # ── ENH6: webauthn ───────────────────────────────────────
+    _wa_exp = data.get('webauthn', [])
+    if _wa_exp:
+        out['webauthn'] = _wa_exp
+
+    # ── ENH7: gw_completeness ────────────────────────────────
+    _gc_exp = data.get('gw_completeness', [])
+    if _gc_exp:
+        out['gw_completeness'] = _gc_exp
 
     safe = _sanitize_for_json(out)
     return json.dumps(safe, indent=2, ensure_ascii=False)
