@@ -35311,7 +35311,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Intelligence Report export ─────────────────────────────
     try:
         intel_str  = _build_intelligence_report(data)
-        intel_name = f"intel_{re.sub(r'[^\\w\\-]', '_', domain)[:36]}.json"
+        _safe_domain = re.sub(r'[^\w\-]', '_', domain)[:36]
+        intel_name = f"intel_{_safe_domain}.json"
         intel_tmp  = os.path.join(tempfile.gettempdir(), intel_name)
         with open(intel_tmp, 'w', encoding='utf-8') as f:
             f.write(intel_str)
@@ -35332,7 +35333,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Blueprint export ───────────────────────────────────────
     try:
         bp_str  = _build_blueprint(data)
-        bp_name = f"blueprint_{re.sub(r'[^\\w\\-]', '_', domain)[:34]}.json"
+        _safe_domain_bp = re.sub(r'[^\w\-]', '_', domain)[:34]
+        bp_name = f"blueprint_{_safe_domain_bp}.json"
         bp_tmp  = os.path.join(tempfile.gettempdir(), bp_name)
         with open(bp_tmp, 'w', encoding='utf-8') as f:
             f.write(bp_str)
