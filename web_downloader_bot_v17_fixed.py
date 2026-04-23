@@ -35162,7 +35162,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Payment Flow JSON export ───────────────────────────────
     try:
         flow_str  = _build_payment_flow_json(data)
-        flow_name = f"flow_{re.sub(r'[^\w\-]', '_', domain)[:36]}.json"
+        _safe_flow_dom = re.sub(r'[^\w\-]', '_', domain)[:36]
+        flow_name = f"flow_{_safe_flow_dom}.json"
         flow_tmp  = os.path.join(tempfile.gettempdir(), flow_name)
         with open(flow_tmp, 'w', encoding='utf-8') as f:
             f.write(flow_str)
@@ -35804,7 +35805,8 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Attach flow_result to data for _build_payment_flow_json
         data['flow_result'] = flow_result
         flow_str  = _build_payment_flow_json(data)
-        flow_name = f"flow_{re.sub(r'[^\\w\\-]', '_', domain)[:36]}.json"
+        _safe_flow_dom2 = re.sub(r'[^\w\-]', '_', domain)[:36]
+        flow_name = f"flow_{_safe_flow_dom2}.json"
         flow_tmp  = os.path.join(tempfile.gettempdir(), flow_name)
         with open(flow_tmp, 'w', encoding='utf-8') as f:
             f.write(flow_str)
