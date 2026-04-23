@@ -31912,6 +31912,14 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         [e for e in unique_entries if not e.get('is_payment')]
     )
 
+    # Pre-compute embed forms list so overview and embed section share same data
+    _embed_forms_ov = [
+        f for f in ordered
+        if f.get('enctype') == 'cross-origin-iframe'
+        and f.get('provider')
+        and f.get('source') != 'braintree_hosted'
+    ]
+
     # ── HEADER BLOCK ─────────────────────────────────────────
     rc          = data.get('recaptcha')
     threeds     = data.get('threeds_signals', [])
@@ -32061,14 +32069,6 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     total_forms   = len(ordered)
     total_xhr     = len(requests_)
 
-    # Pre-compute embed forms list so overview and embed section share same data
-    _embed_forms_ov = [
-        f for f in ordered
-        if f.get('enctype') == 'cross-origin-iframe'
-        and f.get('provider')
-        and f.get('source') != 'braintree_hosted'
-    ]
-
     # UI/UX refactor: icon-prefixed rows replace fixed-width backtick column table
     lines.append("*── Overview ──────────────────*")
     lines.append(f"💳 Gateway   `{raw_code(gw_label, 28)}`")
@@ -32088,7 +32088,7 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                         f"  🔗 `{raw_code(tf['field'], 28)}` "
                         f"_{escape_md(tf['role'])}_"
                         + (f"\n    `{raw_code(tf['value'], 60)}`"
-                           if tf['value'] else '')
+                           if tf.get('value') else '')
                     )
     lines.append(f"📋 Forms     `{total_forms}`" +
                  (f"  _({pay_cnt} payment)_" if pay_cnt else "") +
@@ -32870,9 +32870,10 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 _conf      = item.get('confidence', '')
                 _conf_tag  = f" 〰 _{escape_md(_conf)}_" if _conf else ''
                 _fuzzy_pfx = "〰 " if _is_fuzzy else ""
-                src_tag    = f" _{escape_md(item['source'])}_"
+                src_tag    = (f" _{escape_md(item['source'])}_"
+                              if item.get('source') else "")
                 lines.append(
-                    f"  • {_fuzzy_pfx}{escape_md(item['label'])}{src_tag}{_conf_tag}"
+                    f"  • {_fuzzy_pfx}{escape_md(item.get('label', ''))}{src_tag}{_conf_tag}"
                 )
                 if item.get('snippet'):
                     lines.append(f"    `{escape_md(item['snippet'][:90])}`")
@@ -32886,9 +32887,10 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 _conf      = item.get('confidence', '')
                 _conf_tag  = f" 〰 _{escape_md(_conf)}_" if _conf else ''
                 _fuzzy_pfx = "〰 " if _is_fuzzy else ""
-                src_tag    = f" _{escape_md(item['source'])}_"
+                src_tag    = (f" _{escape_md(item['source'])}_"
+                              if item.get('source') else "")
                 lines.append(
-                    f"  • {_fuzzy_pfx}{escape_md(item['label'])}{src_tag}{_conf_tag}"
+                    f"  • {_fuzzy_pfx}{escape_md(item.get('label', ''))}{src_tag}{_conf_tag}"
                 )
                 if item.get('stripe_decline_code'):
                     lines.append(
