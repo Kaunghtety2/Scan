@@ -28410,6 +28410,261 @@ def _analyze_cors(url: str, endpoint: str = None) -> dict | None:
 
 
 
+def _detect_api_versioning(base_url: str) -> dict | None:
+    """
+    Enumerate active API versions by probing common versioning patterns.
+    Detects: path-based (/api/v1), header-based (API-Version:), and
+    subdomain-based (v1.api.example.com) versioning schemes.
+    Returns active versions, deprecated gaps, and any interesting endpoints.
+    """
+    from urllib.parse import urlparse as _up
+
+    parsed    = _up(base_url)
+    origin    = f"{parsed.scheme}://{parsed.netloc}"
+    headers   = _get_headers()
+    found_versions: list[dict] = []
+    interesting_eps: list[str] = []
+
+    # ── Path-based version probing ─────────────────────────────
+    _BASE_PATHS = ['/api', '/api/v{v}', '/v{v}', '/rest/v{v}',
+                   '/service/v{v}', '/public/v{v}']
+    _INTERESTING_SUFFIXES = ['/status', '/health', '/ping', '/me',
+                              '/users', '/products', '/payments', '/orders']
+
+    for v in range(1, 6):
+        for tpl in _BASE_PATHS:
+            path = tpl.replace('{v}', str(v))
+            url  = origin + path
+            try:
+                r = requests.get(
+                    url, headers=headers, timeout=6,
+                    verify=False, allow_redirects=False,
+                    proxies=proxy_manager.get_proxy(),
+                )
+                if r.status_code in (200, 201, 400, 401, 403, 405, 422):
+                    entry = {
+                        'version':     f'v{v}',
+                        'path':        path,
+                        'status':      r.status_code,
+                        'accessible':  r.status_code not in (404, 410),
+                        'deprecated':  'deprecated' in r.text.lower()
+                                       or 'sunset' in r.headers.get('Sunset', '').lower()
+                                       or r.headers.get('Deprecation', ''),
+                        'sunset_date': r.headers.get('Sunset', ''),
+                        'content_type': r.headers.get('Content-Type', '').split(';')[0].strip(),
+                    }
+                    # Check for interesting sub-endpoints on accessible versions
+                    if r.status_code in (200, 401, 403):
+                        for sfx in _INTERESTING_SUFFIXES[:4]:
+                            try:
+                                sr = requests.get(
+                                    origin + path + sfx, headers=headers,
+                                    timeout=5, verify=False,
+                                    allow_redirects=False,
+                                    proxies=proxy_manager.get_proxy(),
+                                )
+                                if sr.status_code in (200, 401, 403):
+                                    interesting_eps.append(
+                                        f'{path}{sfx} [{sr.status_code}]'
+                                    )
+                            except Exception:
+                                pass
+                    found_versions.append(entry)
+                    break   # one match per version number is enough
+            except Exception:
+                continue
+
+    # ── Header-based versioning probe ─────────────────────────
+    header_versioning = None
+    for v_str in ('1', '2', '2023-10-01', '2024-01-01'):
+        try:
+            r = requests.get(
+                origin + '/api',
+                headers={**headers, 'API-Version': v_str, 'Accept-Version': v_str},
+                timeout=6, verify=False, allow_redirects=False,
+                proxies=proxy_manager.get_proxy(),
+            )
+            if r.status_code in (200, 400, 401, 403):
+                returned_ver = (
+                    r.headers.get('API-Version')
+                    or r.headers.get('X-API-Version')
+                    or r.headers.get('Accept-Version')
+                )
+                if returned_ver:
+                    header_versioning = {
+                        'scheme': 'header',
+                        'header': 'API-Version',
+                        'server_returned': returned_ver,
+                    }
+                break
+        except Exception:
+            pass
+
+    # ── Latest version shortcut (/api/latest, /api/current) ───
+    for alias in ('/api/latest', '/api/current', '/api/stable'):
+        try:
+            r = requests.get(
+                origin + alias, headers=headers, timeout=5,
+                verify=False, allow_redirects=True,
+                proxies=proxy_manager.get_proxy(),
+            )
+            if r.status_code == 200:
+                interesting_eps.append(f'{alias} [200] alias→{r.url}')
+                break
+        except Exception:
+            pass
+
+    if not found_versions and not header_versioning:
+        return None
+
+    # ── Gap analysis: detect version jumps (v1 dead, v2 live = v1 deprecated) ─
+    active = [v for v in found_versions if v['accessible']]
+    versions_nums = [int(v['version'][1:]) for v in active if v['version'][1:].isdigit()]
+    gaps = []
+    if len(versions_nums) >= 2:
+        mn, mx = min(versions_nums), max(versions_nums)
+        gaps = [f'v{n}' for n in range(mn, mx + 1) if n not in versions_nums]
+
+    return {
+        'versions':          found_versions,
+        'active':            active,
+        'latest':            active[-1]['version'] if active else None,
+        'gaps':              gaps,
+        'header_versioning': header_versioning,
+        'interesting_eps':   list(dict.fromkeys(interesting_eps))[:12],
+    }
+
+
+def _probe_well_known_paths(base_url: str) -> dict | None:
+    """
+    Probe standard disclosure paths for security-relevant information:
+    /.well-known/security.txt, /robots.txt, /sitemap.xml, /humans.txt,
+    /security.txt, /crossdomain.xml, /.well-known/change-password.
+    Extracts contacts, disclosures, disallowed paths, and tech hints.
+    """
+    from urllib.parse import urlparse as _up
+
+    parsed  = _up(base_url)
+    origin  = f"{parsed.scheme}://{parsed.netloc}"
+    headers = _get_headers()
+    results: dict = {}
+
+    _PATHS = [
+        ('security_txt',     '/.well-known/security.txt'),
+        ('security_txt_alt', '/security.txt'),
+        ('robots',           '/robots.txt'),
+        ('sitemap',          '/sitemap.xml'),
+        ('sitemap_idx',      '/sitemap_index.xml'),
+        ('humans',           '/humans.txt'),
+        ('crossdomain',      '/crossdomain.xml'),
+        ('change_password',  '/.well-known/change-password'),
+        ('ads_txt',          '/ads.txt'),
+    ]
+
+    for key, path in _PATHS:
+        try:
+            r = requests.get(
+                origin + path, headers=headers,
+                timeout=7, verify=False, allow_redirects=True,
+                proxies=proxy_manager.get_proxy(),
+            )
+            if r.status_code != 200:
+                continue
+            body = r.text[:8000]
+
+            # ── security.txt parsing ───────────────────────────
+            if key in ('security_txt', 'security_txt_alt'):
+                contacts   = re.findall(r'(?i)^Contact:\s*(.+)', body, re.M)
+                pgp        = re.findall(r'(?i)^Encryption:\s*(.+)', body, re.M)
+                policy_url = re.findall(r'(?i)^Policy:\s*(.+)', body, re.M)
+                expires    = re.findall(r'(?i)^Expires:\s*(.+)', body, re.M)
+                scope      = re.findall(r'(?i)^Scope:\s*(.+)', body, re.M)
+                if contacts or pgp or policy_url:
+                    results['security_txt'] = {
+                        'url':        origin + path,
+                        'contacts':   [c.strip() for c in contacts[:3]],
+                        'pgp_key':    pgp[0].strip() if pgp else None,
+                        'policy':     policy_url[0].strip() if policy_url else None,
+                        'expires':    expires[0].strip() if expires else None,
+                        'scope':      [s.strip() for s in scope[:3]],
+                        'has_bug_bounty': bool(re.search(
+                            r'hackerone|bugcrowd|intigriti|bugbounty|vulnerability',
+                            body, re.I
+                        )),
+                    }
+
+            # ── robots.txt parsing ────────────────────────────
+            elif key == 'robots':
+                disallowed  = re.findall(r'(?i)^Disallow:\s*(.+)', body, re.M)
+                allowed     = re.findall(r'(?i)^Allow:\s*(.+)', body, re.M)
+                sitemaps    = re.findall(r'(?i)^Sitemap:\s*(.+)', body, re.M)
+                # Interesting disallowed paths (payment/admin/api related)
+                _interesting_re = re.compile(
+                    r'admin|api|payment|checkout|dashboard|panel|'
+                    r'account|secret|private|internal|staging|dev',
+                    re.I
+                )
+                interesting_dis = [
+                    p.strip() for p in disallowed
+                    if _interesting_re.search(p)
+                ]
+                results['robots'] = {
+                    'url':             origin + path,
+                    'disallowed_count': len(disallowed),
+                    'disallowed':      [p.strip() for p in disallowed[:20]],
+                    'interesting':     interesting_dis[:10],
+                    'sitemaps':        [s.strip() for s in sitemaps[:5]],
+                    'exposes_admin':   bool(re.search(r'/admin|/wp-admin', body, re.I)),
+                    'exposes_api':     bool(re.search(r'/api/', body, re.I)),
+                }
+
+            # ── sitemap.xml parsing ───────────────────────────
+            elif key in ('sitemap', 'sitemap_idx'):
+                urls_found  = re.findall(r'<loc>\s*(https?://[^<]+)\s*</loc>', body)
+                # Interesting URLs from sitemap
+                _pay_re = re.compile(
+                    r'checkout|payment|cart|donate|pay|billing|order|account',
+                    re.I
+                )
+                pay_urls = [u for u in urls_found if _pay_re.search(u)]
+                results['sitemap'] = {
+                    'url':         origin + path,
+                    'total_urls':  len(urls_found),
+                    'pay_urls':    pay_urls[:8],
+                    'sample_urls': urls_found[:5],
+                }
+
+            # ── crossdomain.xml ───────────────────────────────
+            elif key == 'crossdomain':
+                allow_all = bool(re.search(r'domain="?\*"?', body))
+                domains   = re.findall(r'domain="([^"]+)"', body)
+                results['crossdomain'] = {
+                    'url':        origin + path,
+                    'allow_all':  allow_all,
+                    'domains':    domains[:10],
+                    'severity':   'HIGH' if allow_all else 'INFO',
+                    'note':       'Wildcard domain allows any origin — Flash/Silverlight legacy risk'
+                                  if allow_all else '',
+                }
+
+            # ── humans.txt (tech hints) ───────────────────────
+            elif key == 'humans':
+                tech_hints = re.findall(
+                    r'(?i)(?:software|language|standards|platform|cms|framework)\s*[:\-]\s*(.+)',
+                    body
+                )
+                results['humans'] = {
+                    'url':        origin + path,
+                    'tech_hints': [t.strip() for t in tech_hints[:5]],
+                    'snippet':    body[:200],
+                }
+
+        except Exception:
+            continue
+
+    return results if results else None
+
+
 def _detect_rate_limit_headers(resp_headers: dict, endpoint: str = None,
                                probe_post: bool = False) -> dict | None:
     """Extract rate limit info from response headers."""
@@ -31340,6 +31595,23 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("📖 Checking OpenAPI/Swagger schema...")
     api_schema = _check_api_schema(base_url)
 
+    # ── ENH: API version enumeration ──────────────────────────────────────
+    if progress_cb: progress_cb("🔢 Enumerating API versions...")
+    api_versioning = _detect_api_versioning(base_url)
+    if progress_cb and api_versioning:
+        _av_summary = ', '.join(
+            v['version'] for v in api_versioning.get('active', [])[:4]
+        )
+        if _av_summary:
+            progress_cb(f"🔢 API versions found: {_av_summary}")
+
+    # ── ENH: Well-known path probing ───────────────────────────────────────
+    if progress_cb: progress_cb("📂 Probing well-known paths...")
+    well_known = _probe_well_known_paths(base_url)
+    if progress_cb and well_known:
+        _wk_keys = ', '.join(well_known.keys())
+        progress_cb(f"📂 Well-known: {_wk_keys}")
+
     # ── ENH: Framework detection ───────────────────────────────────────────
     if progress_cb: progress_cb("🔍 Detecting JS framework...")
     frameworks = _detect_frameworks(static_html + js_html, js_text, script_urls=_script_srcs)
@@ -31710,6 +31982,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'idempotency':         _idempotency,           # ENH5 — idempotency key support
         'webauthn':            _webauthn,              # ENH6 — WebAuthn/Passkey signals
         'gw_completeness':     _gw_completeness,       # ENH7 — gateway field completeness
+        'api_versioning':      api_versioning,          # NEW — API version enumeration
+        'well_known':          well_known,              # NEW — well-known path recon
     }
 
 
@@ -32689,6 +32963,95 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 + (f" _{escape_md(ep['summary'])}_" if ep.get('summary') else "")
             )
 
+    # ── API VERSIONING ────────────────────────────────────────
+    _av = data.get('api_versioning')
+    if _av:
+        _active = _av.get('active', [])
+        _latest = _av.get('latest') or '?'
+        lines.append(_sec(
+            f"API Versions  ·  {len(_active)} active  ·  latest {escape_md(_latest)}",
+            "🔢"
+        ))
+        for v in _active[:5]:
+            _dep_tag = " ⚠️ _deprecated_" if v.get('deprecated') else ""
+            _sun_tag = (f" _{escape_md(v['sunset_date'])}_"
+                        if v.get('sunset_date') else "")
+            _st      = v.get('status', '')
+            lines.append(
+                f"  `{raw_code(v['version'])}` "
+                f"`{raw_code(v['path'], 30)}` "
+                f"[{_st}]{_dep_tag}{_sun_tag}"
+            )
+        if _av.get('gaps'):
+            lines.append(
+                f"  ⚠️ _Version gap(s): "
+                f"{escape_md(', '.join(_av['gaps']))} — may be undocumented_"
+            )
+        if _av.get('header_versioning'):
+            _hv = _av['header_versioning']
+            lines.append(
+                f"  🔖 Header versioning: `{raw_code(_hv['header'])}` "
+                f"→ server returns `{raw_code(_hv.get('server_returned','?'), 30)}`"
+            )
+        if _av.get('interesting_eps'):
+            for ep_str in _av['interesting_eps'][:4]:
+                lines.append(f"  📌 `{raw_code(ep_str, 60)}`")
+
+    # ── WELL-KNOWN PATHS ──────────────────────────────────────
+    _wk = data.get('well_known')
+    if _wk:
+        lines.append(_sec("Well-Known Paths", "📂"))
+
+        if _wk.get('security_txt'):
+            _st = _wk['security_txt']
+            _bb = " 🎯 _Bug bounty program_" if _st.get('has_bug_bounty') else ""
+            lines.append(f"  🔐 *security.txt*{_bb}")
+            for c in _st.get('contacts', [])[:2]:
+                lines.append(f"    📧 `{raw_code(c, 60)}`")
+            if _st.get('policy'):
+                lines.append(f"    📋 `{raw_code(_st['policy'], 60)}`")
+            if _st.get('expires'):
+                lines.append(f"    ⏰ Expires: _{escape_md(_st['expires'][:40])}_")
+
+        if _wk.get('robots'):
+            _rb = _wk['robots']
+            _admin_tag = " ⚠️ _exposes /admin_" if _rb.get('exposes_admin') else ""
+            _api_tag   = " 📡 _exposes /api_"   if _rb.get('exposes_api')   else ""
+            lines.append(
+                f"  🤖 *robots.txt*  "
+                f"{_rb.get('disallowed_count', 0)} disallowed"
+                f"{_admin_tag}{_api_tag}"
+            )
+            for p in _rb.get('interesting', [])[:4]:
+                lines.append(f"    `{raw_code(p, 55)}`")
+            if _rb.get('sitemaps'):
+                lines.append(
+                    f"    Sitemap: `{raw_code(_rb['sitemaps'][0], 55)}`"
+                )
+
+        if _wk.get('sitemap'):
+            _sm = _wk['sitemap']
+            lines.append(
+                f"  🗺️ *sitemap.xml*  {_sm.get('total_urls', 0)} URLs"
+            )
+            for pu in _sm.get('pay_urls', [])[:3]:
+                lines.append(f"    💳 `{raw_code(pu, 60)}`")
+
+        if _wk.get('crossdomain'):
+            _cd = _wk['crossdomain']
+            _cd_sev = "🔴" if _cd.get('allow_all') else "🟡"
+            lines.append(f"  {_cd_sev} *crossdomain.xml*")
+            if _cd.get('note'):
+                lines.append(f"    _{escape_md(_cd['note'][:80])}_")
+
+        if _wk.get('humans'):
+            _hm = _wk['humans']
+            if _hm.get('tech_hints'):
+                _th = "  ".join(
+                    f"`{raw_code(t, 30)}`" for t in _hm['tech_hints'][:3]
+                )
+                lines.append(f"  👤 *humans.txt*  {_th}")
+
     # ── FRAMEWORK ─────────────────────────────────────────────
     fws = data.get('frameworks', [])
     if fws:
@@ -33045,29 +33408,21 @@ def _run_payload_flow_sync(
     progress_cb=None,
 ) -> dict:
     """
-    Execute the full 4-step authenticated payment submission flow
-    using extracted payload data. Returns flow_result dict.
+    Enhanced 6-step payment flow simulation.
 
     Steps:
-      1. Session Initialization  — GET to prime cookies/CSRF
-      2. Stripe Tokenization     — POST card data to Stripe API → get tok_xxx/pm_xxx token
-      3. Auth Submission         — POST final_data to site endpoint
-      4. Response Classification — classify response as success/decline/error
-
-    Only runs if:
-      - A payment form endpoint was found
-      - Gateway is Stripe (or raw POST — other gateways not tokenized here)
-      - Called with explicit user confirmation
+      1. Session Initialization  — GET page, prime cookies + fresh CSRF tokens
+      2. Gateway Tokenization    — Stripe pm_ (v3) → tok_ fallback; Braintree probe
+      2b. Multi-Card Probe       — Visa / MC / Amex / Decline per-card cvv+avs+3DS
+      3. Auth Submission         — POST full body with best token + idempotency key
+      4. Response Classification — pattern scan + JSON parse + 3DS detection
     """
 
     # ── STEP 1: Session Initialization ───────────────────────────────────
     all_entries = data.get('forms', []) + data.get('requests', [])
     pay_entry   = next(
         (e for e in all_entries if e.get('is_payment') and e.get('action')),
-        next(
-            (e for e in all_entries if e.get('action')),
-            None
-        )
+        next((e for e in all_entries if e.get('action')), None)
     )
     if not pay_entry:
         return {'error': 'No payment endpoint found', 'step': 0}
@@ -33081,23 +33436,16 @@ def _run_payload_flow_sync(
     if not submit_url:
         return {'error': 'Submit URL is empty', 'step': 0}
 
-    # Use _make_engine for TLS fingerprint + persistent cookie jar
     engine = _make_engine("chrome")
 
     if progress_cb:
         progress_cb("⬇️ Step 1: Initializing session (GET)...")
 
     try:
-        # GET the payment page to prime:
-        #   - Session cookies (PHPSESSID, __session, csrf_cookie…)
-        #   - Hidden-input CSRF tokens
-        #   - Meta-tag nonces
         init_resp    = engine.get(page_url)
         init_html    = init_resp.text
-        init_cookies = engine.cookies   # dict via @property
+        init_cookies = engine.cookies
 
-        # Re-resolve tokens from freshly fetched HTML
-        # (nonces rotate on each GET — stale resolved values are useless)
         fresh_token_sources = _find_token_sources(init_html, '')
         fresh_resolved = _resolve_dynamic_tokens(
             url           = page_url,
@@ -33107,12 +33455,10 @@ def _run_payload_flow_sync(
             js_text       = '',
             progress_cb   = progress_cb,
         )
-        # Merge: fresh values win over pre-scan resolved values
         resolved = {**data.get('resolved_tokens', {}), **fresh_resolved}
 
         if progress_cb:
-            live_n = sum(1 for v in resolved.values()
-                         if v.get('confidence') == 'live')
+            live_n = sum(1 for v in resolved.values() if v.get('confidence') == 'live')
             progress_cb(
                 f"✅ Step 1 done — {live_n} live token(s), "
                 f"{len(init_cookies)} cookie(s)"
@@ -33121,100 +33467,242 @@ def _run_payload_flow_sync(
     except Exception as e:
         return {'error': f'Step 1 failed: {str(e)[:80]}', 'step': 1}
 
-    # ── STEP 2: Stripe Tokenization ───────────────────────────────────────
-    stripe_token = None
-    stripe_pm    = None
+    # ── STEP 2: Gateway-Aware Tokenization ───────────────────────────────
     gateway      = (data.get('gateways') or [{}])[0]
     gateway_name = gateway.get('name', '')
     stripe_pk    = None
+    stripe_token = None   # tok_xxx  (legacy v2)
+    stripe_pm_id = None   # pm_xxx   (v3 PaymentMethod)
+    stripe_pm    = None   # card dict from Stripe response
+    braintree_client_token = None
+    token_type   = 'direct'
 
-    # Extract Stripe publishable key from resolved tokens or token_sources
+    # CVV / AVS / 3DS from Stripe tokenization step
+    stripe_cvv_check      = None
+    stripe_avs_check      = None
+    stripe_3ds_supported  = None
+    stripe_error_code     = None
+
+    # ── Find Stripe publishable key ──────────────────────────────────────
     for _tname, _rt in resolved.items():
         if re.search(r'\bpk_(live|test)_', _rt.get('value', '')):
             stripe_pk = _rt['value']
             break
     if not stripe_pk:
         for ts in data.get('token_sources', []):
-            vp = ts.get('value_preview', '')
-            if re.search(r'\bpk_(live|test)_', vp):
-                stripe_pk = vp
+            if re.search(r'\bpk_(live|test)_', ts.get('value_preview', '')):
+                stripe_pk = ts['value_preview']
                 break
-    # Also check live_findings for pk_ key
     if not stripe_pk:
         for lf in data.get('live_findings', []):
-            lv = lf.get('value', '')
-            if re.search(r'\bpk_(live|test)_', lv):
-                stripe_pk = lv
+            if re.search(r'\bpk_(live|test)_', lf.get('value', '')):
+                stripe_pk = lf['value']
                 break
 
+    # ── Stripe tokenization ──────────────────────────────────────────────
     if gateway_name == 'Stripe' and stripe_pk:
-        if progress_cb:
-            progress_cb("💳 Step 2: Tokenizing card via Stripe API...")
-
-        # Test card — Stripe universal test card (never declines)
-        _test_card = {
-            'card[number]':    '4242424242424242',
-            'card[exp_month]': '12',
-            'card[exp_year]':  '2029',
-            'card[cvc]':       '123',
+        _stripe_hdrs = {
+            'Authorization':  f'Bearer {stripe_pk}',
+            'Content-Type':   'application/x-www-form-urlencoded',
+            'Stripe-Version': '2024-06-20',
+            'Origin':         base_url or page_url,
+            'Referer':        page_url,
+            'User-Agent':     HEADERS['User-Agent'],
         }
 
+        # Try v3 PaymentMethod first (modern Stripe)
+        if progress_cb:
+            progress_cb("💳 Step 2: Stripe — trying PaymentMethod v3 (pm_)...")
         try:
-            stripe_resp = requests.post(
-                'https://api.stripe.com/v1/tokens',
-                data    = _test_card,
-                headers = {
-                    'Authorization':  f'Bearer {stripe_pk}',
-                    'Content-Type':   'application/x-www-form-urlencoded',
-                    'Stripe-Version': '2023-10-16',
-                    'Origin':         base_url or page_url,
-                    'Referer':        page_url,
-                    'User-Agent':     (
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/120.0.0.0 Safari/537.36'
-                    ),
+            _pm_resp = requests.post(
+                'https://api.stripe.com/v1/payment_methods',
+                data={
+                    'type':                              'card',
+                    'card[number]':                      '4242424242424242',
+                    'card[exp_month]':                   '12',
+                    'card[exp_year]':                    '2029',
+                    'card[cvc]':                         '123',
+                    'billing_details[name]':             'John Doe',
+                    'billing_details[email]':            'test@test.com',
+                    'billing_details[address][line1]':   '123 Test St',
+                    'billing_details[address][city]':    'New York',
+                    'billing_details[address][state]':   'NY',
+                    'billing_details[address][postal_code]': '10001',
+                    'billing_details[address][country]': 'US',
                 },
-                timeout = 15,
-                verify  = True,   # Stripe uses real TLS — never skip
+                headers=_stripe_hdrs, timeout=15, verify=True,
             )
-            stripe_body = stripe_resp.json()
-
-            if stripe_resp.status_code == 200 and stripe_body.get('id'):
-                stripe_token = stripe_body['id']           # tok_xxx
-                stripe_pm    = stripe_body.get('card', {})
+            _pm_body = _pm_resp.json()
+            if _pm_resp.status_code == 200 and _pm_body.get('id', '').startswith('pm_'):
+                stripe_pm_id = _pm_body['id']
+                stripe_pm    = _pm_body.get('card', {})
+                token_type   = 'pm'
+                _checks            = stripe_pm.get('checks', {})
+                stripe_cvv_check   = _checks.get('cvc_check')
+                stripe_avs_check   = _checks.get('address_postal_code_check')
+                stripe_3ds_supported = stripe_pm.get(
+                    'three_d_secure_usage', {}
+                ).get('supported')
                 if progress_cb:
                     progress_cb(
-                        f"✅ Step 2 done — token: {stripe_token[:12]}…  "
-                        f"brand: {stripe_pm.get('brand','?')}  "
-                        f"last4: {stripe_pm.get('last4','?')}"
+                        f"✅ Step 2 pm_: {stripe_pm_id[:16]}…  "
+                        f"brand:{stripe_pm.get('brand','?')}  "
+                        f"cvv:{stripe_cvv_check}  avs:{stripe_avs_check}  "
+                        f"3ds:{stripe_3ds_supported}"
                     )
             else:
-                _err = (stripe_body.get('error') or {})
+                stripe_error_code = (_pm_body.get('error') or {}).get('code', '')
                 if progress_cb:
                     progress_cb(
-                        f"⚠️ Step 2: Stripe error — "
-                        f"{_err.get('message', '?')[:60]}"
+                        f"⚠️ pm_ failed ({stripe_error_code}) — "
+                        "falling back to tok_..."
                     )
-                stripe_token = None   # site may still accept direct POST
-
-        except Exception as e:
+        except Exception as _pme:
             if progress_cb:
-                progress_cb(f"⚠️ Step 2 failed: {str(e)[:60]}")
-            stripe_token = None
+                progress_cb(f"⚠️ pm_ error: {str(_pme)[:50]} — trying tok_...")
+
+        # Fallback: legacy Token (tok_xxx)
+        if not stripe_pm_id:
+            try:
+                _tok_resp = requests.post(
+                    'https://api.stripe.com/v1/tokens',
+                    data={
+                        'card[number]':    '4242424242424242',
+                        'card[exp_month]': '12',
+                        'card[exp_year]':  '2029',
+                        'card[cvc]':       '123',
+                    },
+                    headers=_stripe_hdrs, timeout=15, verify=True,
+                )
+                _tok_body = _tok_resp.json()
+                if _tok_resp.status_code == 200 and _tok_body.get('id'):
+                    stripe_token = _tok_body['id']
+                    stripe_pm    = _tok_body.get('card', {})
+                    token_type   = 'tok'
+                    stripe_cvv_check = stripe_pm.get('cvc_check')
+                    stripe_avs_check = stripe_pm.get('address_zip_check')
+                    if progress_cb:
+                        progress_cb(
+                            f"✅ Step 2 tok_: {stripe_token[:12]}…  "
+                            f"brand:{stripe_pm.get('brand','?')}  "
+                            f"cvv:{stripe_cvv_check}"
+                        )
+                else:
+                    _terr = (_tok_body.get('error') or {})
+                    if progress_cb:
+                        progress_cb(
+                            f"⚠️ tok_ error — {_terr.get('message','?')[:60]}"
+                        )
+            except Exception as _te:
+                if progress_cb:
+                    progress_cb(f"⚠️ tok_ failed: {str(_te)[:50]}")
+
+    elif 'Braintree' in gateway_name:
+        # Probe common Braintree client-token endpoints
+        if progress_cb:
+            progress_cb("💳 Step 2: Braintree — probing client_token endpoint...")
+        _bt_origin = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+        for _bt_ep in (
+            '/braintree/client_token',
+            '/api/braintree/token',
+            '/checkout/client-token',
+            '/payment/client-token',
+            '/v1/client_token',
+        ):
+            try:
+                _bt_r = requests.get(
+                    _bt_origin + _bt_ep,
+                    headers={**_get_headers(), 'Accept': 'application/json'},
+                    timeout=6, verify=False,
+                )
+                if _bt_r.status_code == 200 and len(_bt_r.text.strip()) > 20:
+                    braintree_client_token = _bt_r.text.strip()[:300]
+                    token_type = 'braintree'
+                    if progress_cb:
+                        progress_cb(
+                            f"✅ Step 2: Braintree client token @ {_bt_ep} "
+                            f"({len(braintree_client_token)} chars)"
+                        )
+                    break
+            except Exception:
+                continue
+        if not braintree_client_token:
+            token_type = 'direct'
+            if progress_cb:
+                progress_cb(
+                    "⚠️ Step 2: Braintree client token not found — direct submit"
+                )
 
     elif 'Stripe' in gateway_name and not stripe_pk:
         if progress_cb:
             progress_cb(
-                "⚠️ Step 2: Stripe detected but pk_ key not found — "
+                "⚠️ Step 2: Stripe detected but pk_ key missing — "
                 "skipping tokenization"
             )
     else:
         if progress_cb:
             progress_cb(
                 f"ℹ️ Step 2: Gateway={gateway_name or 'unknown'} — "
-                "no Stripe tokenization"
+                "direct field inject"
             )
+
+    # ── STEP 2b: Multi-Card Probe (Stripe only) ───────────────────────────
+    multi_card_results: list = []
+    if stripe_pk and gateway_name == 'Stripe':
+        if progress_cb:
+            progress_cb("🃏 Step 2b: Multi-card probe (Visa/MC/Amex/Decline)...")
+        _PROBE_CARDS = [
+            ('Visa 4242',      '4242424242424242', '123',  'Visa'),
+            ('MC 5555',        '5555555555554444', '123',  'MasterCard'),
+            ('Amex 3782',      '378282246310005',  '1234', 'Amex'),
+            ('Visa Decline',   '4000000000000002', '123',  'Visa'),
+        ]
+        _probe_hdrs = {
+            'Authorization':  f'Bearer {stripe_pk}',
+            'Content-Type':   'application/x-www-form-urlencoded',
+            'Stripe-Version': '2024-06-20',
+        }
+        for _cname, _cnum, _ccvc, _cbrand in _PROBE_CARDS:
+            try:
+                _cr = requests.post(
+                    'https://api.stripe.com/v1/payment_methods',
+                    data={
+                        'type':                'card',
+                        'card[number]':        _cnum,
+                        'card[exp_month]':     '12',
+                        'card[exp_year]':      '2029',
+                        'card[cvc]':           _ccvc,
+                    },
+                    headers=_probe_hdrs, timeout=10, verify=True,
+                )
+                _cb = _cr.json()
+                if _cr.status_code == 200 and _cb.get('id', '').startswith('pm_'):
+                    _cc    = _cb.get('card', {})
+                    _chks  = _cc.get('checks', {})
+                    multi_card_results.append({
+                        'label':     _cname,
+                        'brand':     _cc.get('brand', _cbrand),
+                        'status':    '✅ tokenized',
+                        'pm_id':     _cb['id'][:18] + '…',
+                        'cvv_check': _chks.get('cvc_check', '?'),
+                        'avs_check': _chks.get('address_postal_code_check', '?'),
+                        '3ds':       _cc.get(
+                            'three_d_secure_usage', {}
+                        ).get('supported', '?'),
+                    })
+                else:
+                    _cerr = (_cb.get('error') or {})
+                    multi_card_results.append({
+                        'label':  _cname,
+                        'brand':  _cbrand,
+                        'status': f"❌ {_cerr.get('code','error')[:30]}",
+                    })
+            except Exception as _mce:
+                multi_card_results.append({
+                    'label':  _cname,
+                    'brand':  _cbrand,
+                    'status': f'❌ {str(_mce)[:30]}',
+                })
 
     # ── STEP 3: Auth Submission ───────────────────────────────────────────
     if progress_cb:
@@ -33230,7 +33718,7 @@ def _run_payload_flow_sync(
         'Expiry Year':        '2029',
         'Expiry MM/YY':       '12/29',
         'Cardholder Name':    'John Doe',
-        'Amount':             '5.00',
+        'Amount':             '1.00',
         'Currency':           'USD',
         'Billing First Name': 'John',
         'Billing Last Name':  'Doe',
@@ -33241,6 +33729,8 @@ def _run_payload_flow_sync(
         'Billing Country':    'US',
     }
 
+    _best_token = stripe_pm_id or stripe_token or braintree_client_token
+
     for f in fields:
         nm  = f.get('name', '')
         ft  = f.get('type', 'text')
@@ -33250,7 +33740,7 @@ def _run_payload_flow_sync(
         if not nm or ft in ('submit', 'button', 'reset', 'image', 'iframe'):
             continue
         if f.get('is_honeypot'):
-            continue   # never fill honeypots — server will reject
+            continue
 
         # Priority 1: resolved live/static token (CSRF, nonce, session)
         rt = resolved.get(nm, {})
@@ -33258,15 +33748,16 @@ def _run_payload_flow_sync(
             post_body[nm] = rt['value']
             continue
 
-        # Priority 2: Stripe token → inject into cardToken / stripeToken field
-        if stripe_token and re.search(
-            r'card.?token|stripe.?token|payment.?method|token.?card',
+        # Priority 2: best payment token → inject into matching field
+        if _best_token and re.search(
+            r'card.?token|stripe.?token|payment.?method|token.?card|'
+            r'pm_id|payment_method_id|nonce|braintree',
             nm, re.I
         ):
-            post_body[nm] = stripe_token
+            post_body[nm] = _best_token
             continue
 
-        # Priority 3: reCAPTCHA — leave empty (cannot auto-solve in sync context)
+        # Priority 3: reCAPTCHA — leave empty
         if re.search(r'g-recaptcha-response|recaptcha', nm, re.I):
             post_body[nm] = ''
             continue
@@ -33276,7 +33767,7 @@ def _run_payload_flow_sync(
             post_body[nm] = _CARD_TEST[ct]
             continue
 
-        # Priority 5: static prefilled value already in form
+        # Priority 5: static prefilled value
         if val and len(val) > 1 and not f.get('is_dynamic'):
             post_body[nm] = val
             continue
@@ -33294,19 +33785,23 @@ def _run_payload_flow_sync(
         elif re.search(r'country',            nm_l): post_body[nm] = 'US'
         elif val:
             post_body[nm] = val
-        # else: skip — unknown field with no value
 
-    # Build submit headers — carry session cookies automatically via engine
+    # Build submit headers
     submit_headers: dict = {
         **_get_headers(),
         'Referer': page_url,
         'Origin':  base_url or f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}",
     }
-    # Inject CSRF / nonce as HTTP header where applicable
     for _tname, _rt in resolved.items():
         _hk = _rt.get('header_key')
         if _hk and _rt.get('value'):
             submit_headers[_hk] = _rt['value']
+    # Idempotency key for Stripe — prevents duplicate charge on retry
+    if gateway_name == 'Stripe':
+        import hashlib as _hl2
+        submit_headers['Idempotency-Key'] = _hl2.md5(
+            f"payflow-{page_url}-{time.time()}".encode()
+        ).hexdigest()
 
     try:
         _is_json_enc = 'json' in enctype.lower()
@@ -33325,7 +33820,6 @@ def _run_payload_flow_sync(
                     headers = submit_headers,
                 )
         else:
-            # GET with params (rare but possible)
             submit_resp = engine.get(
                 submit_url + '?' + '&'.join(f"{k}={v}" for k, v in post_body.items()),
                 headers = submit_headers,
@@ -33334,18 +33828,40 @@ def _run_payload_flow_sync(
         submit_status = submit_resp.status_code
         submit_body   = submit_resp.text[:10_000]
 
-        # Capture redirect Location header for step 4
         _redirect_loc = ''
         try:
             _redirect_loc = submit_resp.headers.get('Location', '')
         except Exception:
             pass
 
+        # ── Parse JSON response ───────────────────────────────────────
+        _resp_json      = None
+        _resp_json_keys: dict = {}
+        _content_type   = ''
+        try:
+            _content_type = submit_resp.headers.get('Content-Type', '')
+        except Exception:
+            pass
+        if 'json' in _content_type or submit_body.lstrip().startswith('{'):
+            try:
+                _resp_json = json.loads(submit_body)
+                for _rk in (
+                    'status', 'message', 'error', 'code', 'success',
+                    'declined', 'transaction_id', 'order_id', 'result',
+                    'response_code', 'auth_code', 'description',
+                ):
+                    _rv = _resp_json.get(_rk)
+                    if _rv is not None:
+                        _resp_json_keys[_rk] = str(_rv)[:80]
+            except Exception:
+                pass
+
         if progress_cb:
             progress_cb(
-                f"📡 Step 3 done — HTTP {submit_status}  "
+                f"📡 Step 3 done — HTTP {submit_status} "
                 f"({len(submit_body)} chars)"
-                + (f"  →  {_redirect_loc[:60]}" if _redirect_loc else '')
+                + (f"  → {_redirect_loc[:60]}" if _redirect_loc else '')
+                + ('  [JSON]' if _resp_json is not None else '')
             )
 
     except Exception as e:
@@ -33356,11 +33872,10 @@ def _run_payload_flow_sync(
             'post_body': post_body,
         }
 
-    # ── STEP 4: Response Classification ──────────────────────────────────
+    # ── STEP 4: Enhanced Response Classification ──────────────────────────
     if progress_cb:
-        progress_cb("🔎 Step 4: Classifying response...")
+        progress_cb("🔎 Step 4: Classifying (pattern + JSON + 3DS)...")
 
-    # Run existing pattern scanner on live response body
     live_patterns = _scan_response_patterns(
         html        = submit_body,
         js_text     = '',
@@ -33368,7 +33883,22 @@ def _run_payload_flow_sync(
         live_bodies = [submit_body],
     )
 
-    # HTTP-status-based preliminary verdict
+    # ── 3DS challenge detection ───────────────────────────────────────────
+    _3ds_triggered = False
+    _3ds_signals: list = []
+    for _3pat, _3label in [
+        (r'requires_action|next_action|authentication_required',  'Stripe 3DS'),
+        (r'3ds|3d.secure|acs.url|pareq|md=',                     '3DS ACS challenge'),
+        (r'creq|cres|threeDSMethodData',                          'EMV 3DS'),
+    ]:
+        if re.search(_3pat, submit_body, re.I):
+            _3ds_triggered = True
+            _3ds_signals.append(_3label)
+    if _resp_json and _resp_json.get('status') == 'requires_action':
+        _3ds_triggered = True
+        _3ds_signals.append('Stripe requires_action (JSON)')
+
+    # ── HTTP-status verdict ───────────────────────────────────────────────
     if submit_status in (200, 201):
         http_verdict = 'possible_success'
     elif submit_status in (400, 402, 422):
@@ -33389,9 +33919,20 @@ def _run_payload_flow_sync(
     else:
         http_verdict = f'http_{submit_status}'
 
-    # Pattern scan verdict overrides HTTP verdict (more specific)
+    # ── JSON verdict override ─────────────────────────────────────────────
+    if _resp_json:
+        _js  = str(_resp_json.get('status', '')).lower()
+        _jok = _resp_json.get('success')
+        if _js in ('success', 'approved', 'ok') or _jok is True:
+            http_verdict = 'json_success'
+        elif _js in ('failed', 'declined', 'error') or _jok is False:
+            http_verdict = 'json_decline'
+
+    # ── Final verdict ─────────────────────────────────────────────────────
     pattern_verdict = live_patterns.get('verdict', 'unknown')
-    if pattern_verdict == 'success':
+    if _3ds_triggered:
+        final_verdict = '🔐 3DS CHALLENGE — authentication required'
+    elif pattern_verdict == 'success':
         final_verdict = '✅ SUCCESS'
     elif pattern_verdict == 'likely_success':
         final_verdict = '✅ LIKELY SUCCESS (low confidence)'
@@ -33401,10 +33942,10 @@ def _run_payload_flow_sync(
         final_verdict = '🔴 LIKELY DECLINED (low confidence)'
     elif pattern_verdict == 'mixed':
         final_verdict = '⚠️ MIXED — check response manually'
-    elif http_verdict in ('redirect_success', 'possible_success'):
-        final_verdict = '✅ POSSIBLE SUCCESS (HTTP signal only)'
-    elif http_verdict in ('redirect_decline', 'decline_or_validation_error'):
-        final_verdict = '🔴 POSSIBLE DECLINE (HTTP signal only)'
+    elif http_verdict in ('json_success', 'redirect_success', 'possible_success'):
+        final_verdict = '✅ POSSIBLE SUCCESS (HTTP/JSON signal)'
+    elif http_verdict in ('json_decline', 'redirect_decline', 'decline_or_validation_error'):
+        final_verdict = '🔴 POSSIBLE DECLINE (HTTP/JSON signal)'
     elif http_verdict == 'blocked_csrf_or_auth':
         final_verdict = '🚫 BLOCKED — CSRF / session expired'
     elif http_verdict == 'rate_limited':
@@ -33420,21 +33961,33 @@ def _run_payload_flow_sync(
     engine.close()
 
     return {
-        'step':             4,
-        'verdict':          final_verdict,
-        'http_status':      submit_status,
-        'http_verdict':     http_verdict,
-        'pattern_verdict':  pattern_verdict,
-        'stripe_token':     stripe_token,
-        'stripe_pk_used':   (stripe_pk[:20] + '…') if stripe_pk else None,
-        'stripe_card_info': stripe_pm or None,
-        'post_body':        post_body,
-        'response_body':    submit_body[:2000],
-        'redirect_url':     _redirect_loc or None,
-        'success_signals':  live_patterns.get('success', []),
-        'decline_signals':  live_patterns.get('decline', []),
-        'response_codes':   live_patterns.get('response_codes', []),
-        'stripe_codes':     live_patterns.get('stripe_codes', []),
+        'step':                   4,
+        'verdict':                final_verdict,
+        'http_status':            submit_status,
+        'http_verdict':           http_verdict,
+        'pattern_verdict':        pattern_verdict,
+        'gateway_name':           gateway_name or 'unknown',
+        'token_type':             token_type,
+        'stripe_token':           stripe_token,
+        'stripe_pm_id':           stripe_pm_id,
+        'stripe_pk_used':         (stripe_pk[:20] + '…') if stripe_pk else None,
+        'stripe_card_info':       stripe_pm or None,
+        'stripe_cvv_check':       stripe_cvv_check,
+        'stripe_avs_check':       stripe_avs_check,
+        'stripe_3ds_supported':   stripe_3ds_supported,
+        'stripe_error_code':      stripe_error_code,
+        'braintree_token_found':  bool(braintree_client_token),
+        'multi_card_results':     multi_card_results,
+        'post_body':              post_body,
+        'response_body':          submit_body[:2000],
+        'response_json_keys':     _resp_json_keys,
+        'redirect_url':           _redirect_loc or None,
+        '3ds_triggered':          _3ds_triggered,
+        '3ds_signals':            _3ds_signals,
+        'success_signals':        live_patterns.get('success', []),
+        'decline_signals':        live_patterns.get('decline', []),
+        'response_codes':         live_patterns.get('response_codes', []),
+        'stripe_codes':           live_patterns.get('stripe_codes', []),
         'resolved_tokens_used': {
             k: (v.get('value', '')[:20] + '…')
             for k, v in resolved.items()
@@ -35572,7 +36125,7 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/payflow <url> — Run full 4-step payment flow simulation (GET→Stripe→POST→Classify)"""
     if not context.args:
         await update.effective_message.reply_text(
-            "🔀 *PayFlow — 4-Step Payment Simulation*\n"
+            "🔀 *PayFlow \u2014 4\\-Step Payment Simulation*\n"
             "`/payflow <url>`\n\n"
             "*Step 1*  Session init · cookies · CSRF token\n"
             "*Step 2*  Stripe tokenization · pk\\_ key · tok\\_xxx\n"
@@ -35703,19 +36256,30 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         editor_task.cancel()
 
     # ── Format flow result ────────────────────────────────────────
-    _verdict = flow_result.get('verdict', '❓ UNKNOWN')
-    _status  = flow_result.get('http_status', '?')
-    _tok     = flow_result.get('stripe_token', '')
-    _pk      = flow_result.get('stripe_pk_used', '')
-    _card    = flow_result.get('stripe_card_info') or {}
-    _succ    = flow_result.get('success_signals', [])
-    _decl    = flow_result.get('decline_signals', [])
-    _rcodes  = flow_result.get('response_codes', [])
-    _scodes  = flow_result.get('stripe_codes', [])
-    _rtoks   = flow_result.get('resolved_tokens_used', {})
-    _rbody   = flow_result.get('response_body', '')
-    _redir   = flow_result.get('redirect_url', '')
-    _err     = flow_result.get('error', '')
+    _verdict   = flow_result.get('verdict', '❓ UNKNOWN')
+    _status    = flow_result.get('http_status', '?')
+    _gw        = flow_result.get('gateway_name', 'unknown')
+    _tok_type  = flow_result.get('token_type', 'direct')
+    _tok       = flow_result.get('stripe_token', '')
+    _pm_id     = flow_result.get('stripe_pm_id', '')
+    _pk        = flow_result.get('stripe_pk_used', '')
+    _card      = flow_result.get('stripe_card_info') or {}
+    _cvv_chk   = flow_result.get('stripe_cvv_check')
+    _avs_chk   = flow_result.get('stripe_avs_check')
+    _3ds_sup   = flow_result.get('stripe_3ds_supported')
+    _3ds_trig  = flow_result.get('3ds_triggered', False)
+    _3ds_sigs  = flow_result.get('3ds_signals', [])
+    _mc_res    = flow_result.get('multi_card_results', [])
+    _succ      = flow_result.get('success_signals', [])
+    _decl      = flow_result.get('decline_signals', [])
+    _rcodes    = flow_result.get('response_codes', [])
+    _scodes    = flow_result.get('stripe_codes', [])
+    _rtoks     = flow_result.get('resolved_tokens_used', {})
+    _rbody     = flow_result.get('response_body', '')
+    _rjson     = flow_result.get('response_json_keys', {})
+    _redir     = flow_result.get('redirect_url', '')
+    _err       = flow_result.get('error', '')
+    _bt_found  = flow_result.get('braintree_token_found', False)
 
     lines = [
         f"🔀 *PayFlow — `{escape_md(domain)}`*",
@@ -35728,31 +36292,84 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text('\n'.join(lines), parse_mode='Markdown')
         return
 
-    # Step summary
+    # ── Step Summary ──────────────────────────────────────────────
     lines.append("*── Step Summary ──────────────────*")
-    lines.append(
-        f"1️⃣ Session   `{len(_rtoks)}` token(s) resolved"
-    )
-    if _tok:
+
+    # Step 1
+    lines.append(f"1️⃣ Session   `{len(_rtoks)}` token(s) resolved")
+
+    # Step 2 — gateway + token type
+    _gw_badge = escape_md(_gw)
+    if _pm_id:
         lines.append(
-            f"2️⃣ Stripe    `{escape_md(_tok[:16])}…`  "
+            f"2️⃣ `{_gw_badge}`  pm\\_: `{escape_md(_pm_id[:18])}…`  "
             + (f"brand:`{escape_md(_card.get('brand','?'))}`  "
                f"last4:`{escape_md(_card.get('last4','?'))}`"
                if _card else '')
         )
+    elif _tok:
+        lines.append(
+            f"2️⃣ `{_gw_badge}`  tok\\_: `{escape_md(_tok[:16])}…`  "
+            + (f"brand:`{escape_md(_card.get('brand','?'))}`  "
+               f"last4:`{escape_md(_card.get('last4','?'))}`"
+               if _card else '')
+        )
+    elif _bt_found:
+        lines.append(f"2️⃣ `{_gw_badge}`  Braintree client token ✅")
     else:
-        lines.append("2️⃣ Stripe    — skipped or failed")
+        lines.append(f"2️⃣ `{_gw_badge}`  direct field inject (no tokenization)")
 
+    # CVV / AVS / 3DS from Stripe
+    if _cvv_chk or _avs_chk or _3ds_sup is not None:
+        _cvv_em = '✅' if _cvv_chk == 'pass' else ('❌' if _cvv_chk == 'fail' else '❓')
+        _avs_em = '✅' if _avs_chk == 'pass' else ('❌' if _avs_chk == 'fail' else '❓')
+        _3s_em  = '✅' if _3ds_sup else '➖'
+        lines.append(
+            f"   CVV:{_cvv_em}`{escape_md(str(_cvv_chk or '?'))}` "
+            f"AVS:{_avs_em}`{escape_md(str(_avs_chk or '?'))}` "
+            f"3DS:{_3s_em}`{escape_md(str(_3ds_sup) if _3ds_sup is not None else '?')}`"
+        )
+
+    # Step 3
     lines.append(
         f"3️⃣ Submit    HTTP `{_status}`"
         + (f"  → `{escape_md(_redir[:50])}`" if _redir else '')
     )
+
+    # Step 4
     lines.append(
         f"4️⃣ Classify  pattern=`{escape_md(flow_result.get('pattern_verdict','?'))}`  "
         f"http=`{escape_md(flow_result.get('http_verdict','?'))}`"
     )
 
-    # Signals
+    # ── 3DS Alert ────────────────────────────────────────────────
+    if _3ds_trig:
+        lines.append(f"\n🔐 *3DS Triggered:*")
+        for _sig in _3ds_sigs[:3]:
+            lines.append(f"  • {escape_md(_sig)}")
+
+    # ── Multi-Card Results ────────────────────────────────────────
+    if _mc_res:
+        lines.append(f"\n🃏 *Multi-Card Probe ({len(_mc_res)} cards):*")
+        for _mc in _mc_res:
+            _mc_cvv = _mc.get('cvv_check', '')
+            _mc_avs = _mc.get('avs_check', '')
+            _mc_3ds = _mc.get('3ds', '')
+            _mc_detail = ''
+            if _mc_cvv or _mc_avs:
+                _mc_detail = (
+                    f"  cvv:`{escape_md(str(_mc_cvv))}`"
+                    f" avs:`{escape_md(str(_mc_avs))}`"
+                    + (f" 3ds:`{escape_md(str(_mc_3ds))}`" if _mc_3ds != '' else '')
+                )
+            lines.append(
+                f"  {escape_md(_mc.get('label','')[:14])}"
+                f" `{escape_md(_mc.get('brand','')[:8])}`"
+                f" — {escape_md(_mc.get('status','')[:30])}"
+                + _mc_detail
+            )
+
+    # ── Signals ───────────────────────────────────────────────────
     if _succ:
         lines.append(f"\n✅ *Success signals* ({len(_succ)}):")
         for s in _succ[:4]:
@@ -35775,7 +36392,13 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"— {escape_md(rc_item.get('verdict',''))}"
             )
 
-    # Resolved tokens used
+    # ── JSON Response Keys ────────────────────────────────────────
+    if _rjson:
+        lines.append(f"\n📦 *Response JSON ({len(_rjson)} key(s)):*")
+        for _jk, _jv in list(_rjson.items())[:6]:
+            lines.append(f"  `{escape_md(_jk)}`: `{escape_md(_jv[:60])}`")
+
+    # ── Resolved Tokens Injected ──────────────────────────────────
     if _rtoks:
         lines.append(f"\n🔑 *Tokens injected* ({len(_rtoks)}):")
         for tname, tval in list(_rtoks.items())[:4]:
@@ -35783,8 +36406,8 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  `{raw_code(tname, 24)}` = `{raw_code(tval, 24)}`"
             )
 
-    # Response snippet
-    if _rbody:
+    # ── Response Snippet ──────────────────────────────────────────
+    if _rbody and not _rjson:
         _snippet = _rbody[:200].replace('\n', ' ').strip()
         lines.append(f"\n📄 *Response snippet:*")
         lines.append(f"`{escape_md(_snippet)}`")
