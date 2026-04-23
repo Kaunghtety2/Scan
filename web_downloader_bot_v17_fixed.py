@@ -33421,8 +33421,8 @@ def _run_payload_flow_sync(
     # ── STEP 1: Session Initialization ───────────────────────────────────
     all_entries = data.get('forms', []) + data.get('requests', [])
     pay_entry   = next(
-        (e for e in all_entries if e.get('is_payment') and e.get('action')),
-        next((e for e in all_entries if e.get('action')), None)
+        (e for e in all_entries if e.get('is_payment') and (e.get('action') or e.get('endpoint'))),
+        next((e for e in all_entries if (e.get('action') or e.get('endpoint'))), None)
     )
     if not pay_entry:
         return {'error': 'No payment endpoint found', 'step': 0}
@@ -36217,8 +36217,8 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Guard: must have a payment endpoint ──────────────────────
     _all_e = data.get('forms', []) + data.get('requests', [])
     _pay_e = next(
-        (e for e in _all_e if e.get('is_payment') and e.get('action')),
-        next((e for e in _all_e if e.get('action')), None)
+        (e for e in _all_e if e.get('is_payment') and (e.get('action') or e.get('endpoint'))),
+        next((e for e in _all_e if (e.get('action') or e.get('endpoint'))), None)
     )
     if not _pay_e:
         loop.call_soon_threadsafe(progress_queue.put_nowait, None)
