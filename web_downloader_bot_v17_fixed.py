@@ -27295,6 +27295,221 @@ _STRIPE_DECLINE_CODES: dict[str, str] = {
 }
 
 
+# ── CardPointe / CardConnect Error Code Dictionary ─────────────────────────
+# Sources: CardPointe REST API docs, CardConnect developer portal,
+#          First Data / Fiserv ISO-8583 extensions, live response captures.
+# Format: code → (short_reason, detail, severity)
+#   severity: 'hard' = do not retry | 'soft' = retry permitted | 'info' = informational
+_CARDPOINTE_CODES: dict[str, tuple[str, str, str]] = {
+    # ── respstat values ────────────────────────────────────────────────────
+    'A':    ('Approved',          'Transaction approved by issuer.',                                'info'),
+    'B':    ('Retry',             'Soft decline — retry the transaction.',                          'soft'),
+    'C':    ('Declined',          'Hard decline — do not retry without new card details.',          'hard'),
+
+    # ── respcode: ISO 8583 two-digit codes ─────────────────────────────────
+    '00':   ('Approved',          'Transaction approved.',                                          'info'),
+    '01':   ('Refer to Issuer',   'Contact cardholder\'s bank before retrying.',                   'soft'),
+    '02':   ('Refer Special',     'Special conditions — contact issuer.',                           'soft'),
+    '03':   ('Invalid Merchant',  'Merchant ID not configured for this card type.',                 'hard'),
+    '04':   ('Pick Up Card',      'Card reported — do not retry, collect card if present.',         'hard'),
+    '05':   ('Do Not Honor',      'Generic issuer decline. Card may be blocked, frozen, or over limit.', 'hard'),
+    '06':   ('Error',             'General error from issuer — retry once.',                        'soft'),
+    '07':   ('Pick Up — Fraud',   'Card declined due to fraud — do not retry.',                    'hard'),
+    '08':   ('Honor w/ ID',       'Approved but ID verification required.',                         'info'),
+    '09':   ('In Progress',       'Request in progress — wait and check status.',                   'soft'),
+    '10':   ('Partial Approval',  'Only part of requested amount approved.',                        'info'),
+    '11':   ('VIP Approved',      'VIP approval — accepted.',                                       'info'),
+    '12':   ('Invalid Txn',       'Transaction type invalid for this card/account.',                'hard'),
+    '13':   ('Invalid Amount',    'Amount is zero, negative, or exceeds issuer limit.',             'hard'),
+    '14':   ('Invalid Card #',    'Card number does not pass Luhn check or is unknown.',            'hard'),
+    '15':   ('No Such Issuer',    'Card BIN not recognized — wrong number or unsupported issuer.',  'hard'),
+    '17':   ('Customer Cancel',   'Cardholder cancelled the transaction.',                          'info'),
+    '19':   ('Re-enter Txn',      'Issuer requests transaction be re-entered.',                     'soft'),
+    '21':   ('No Action Taken',   'Issuer system unable to process — retry later.',                 'soft'),
+    '22':   ('Suspected Malfunction', 'Issuer system suspected malfunction.',                       'soft'),
+    '25':   ('Record Not Found',  'Original transaction record not found.',                         'hard'),
+    '28':   ('File Locked',       'File temporarily locked — retry.',                               'soft'),
+    '30':   ('Format Error',      'Message format error — check request fields.',                   'hard'),
+    '31':   ('Unsupported Bank',  'Issuer bank not supported.',                                     'hard'),
+    '33':   ('Expired Card',      'Card is past its expiry date.',                                  'hard'),
+    '34':   ('Fraud — Pick Up',   'Suspected fraud — card should be picked up.',                   'hard'),
+    '36':   ('Restricted Card',   'Card restricted (travel block, category block, etc.).',          'hard'),
+    '37':   ('Call Acquirer',     'Contact acquiring bank security.',                               'hard'),
+    '38':   ('PIN Tries Exceeded','Too many incorrect PIN attempts — card locked.',                 'hard'),
+    '39':   ('No Credit Account', 'No credit account associated with this card.',                   'hard'),
+    '40':   ('Function Not Supported', 'Requested function not supported by issuer.',               'hard'),
+    '41':   ('Lost Card',         'Card reported lost — do not retry.',                            'hard'),
+    '43':   ('Stolen Card',       'Card reported stolen — do not retry.',                          'hard'),
+    '44':   ('No Investment Account', 'No investment account for this card.',                       'hard'),
+    '51':   ('Insufficient Funds','Account balance insufficient for transaction amount.',            'hard'),
+    '52':   ('No Checking Acct',  'No checking account linked to this card.',                       'hard'),
+    '53':   ('No Savings Acct',   'No savings account linked to this card.',                        'hard'),
+    '54':   ('Expired Card',      'Card has passed its expiry date.',                               'hard'),
+    '55':   ('Wrong PIN',         'PIN entered is incorrect.',                                      'soft'),
+    '57':   ('Txn Not Allowed',   'Transaction type not permitted for this card/account.',          'hard'),
+    '58':   ('Txn Not Allowed — Term', 'Transaction not permitted at this terminal.',              'hard'),
+    '59':   ('Suspected Fraud',   'Issuer suspects fraud — contact cardholder.',                    'hard'),
+    '61':   ('Exceeds Limit',     'Transaction exceeds daily/weekly card limit.',                   'hard'),
+    '62':   ('Restricted Card',   'Restricted card — invalid in this region or merchant category.','hard'),
+    '63':   ('Security Violation','Security violation detected by issuer.',                         'hard'),
+    '65':   ('Velocity Exceeded', 'Too many transactions in time window — retry later.',            'soft'),
+    '66':   ('Call Acquirer Security', 'Contact acquirer security department.',                     'hard'),
+    '67':   ('Hard Capture',      'Card must be captured/retained.',                               'hard'),
+    '68':   ('Response Late',     'Issuer response received too late — verify status.',             'soft'),
+    '75':   ('PIN Tries Exceeded','PIN attempt limit exceeded — card temporarily locked.',          'hard'),
+    '76':   ('Ineligible Account','Wrong account type selected.',                                   'hard'),
+    '77':   ('Inconsistent Data', 'Reversals data inconsistent with original transaction.',         'soft'),
+    '78':   ('No Account',        'Account not on file or not active.',                             'hard'),
+    '80':   ('Network Error',     'Network unavailable — retry.',                                   'soft'),
+    '81':   ('Crypto Error',      'PIN or cryptographic error in message.',                         'hard'),
+    '82':   ('CVV Failure',       'Card CVV/CVC validation failed.',                                'hard'),
+    '83':   ('Cannot Verify PIN', 'PIN cannot be verified — contact issuer.',                       'hard'),
+    '85':   ('No Reason to Decline', 'Issuer approved with no decline reason (balance inquiry).',  'info'),
+    '86':   ('Cannot Verify PIN', 'PIN cannot be verified online.',                                'hard'),
+    '87':   ('Purchase Only',     'This card can only be used for purchases, not this transaction.','hard'),
+    '88':   ('Cryptographic Error', 'Message authentication failure.',                              'hard'),
+    '89':   ('Unacceptable PIN',  'PIN format not acceptable.',                                     'hard'),
+    '91':   ('Issuer Unavailable','Issuer or switch unavailable — retry later.',                    'soft'),
+    '92':   ('Destination Not Found', 'Routing destination not found.',                            'soft'),
+    '93':   ('Cannot Complete',   'Transaction cannot be completed due to violation.',              'hard'),
+    '94':   ('Duplicate Txn',     'Duplicate of a recently submitted transaction.',                 'hard'),
+    '96':   ('System Malfunction','System malfunction — retry later.',                              'soft'),
+    'N3':   ('Cash Not Available','Cash service not available at this location.',                   'hard'),
+    'N4':   ('Exceeds Cash Limit','Exceeds cash limit set by issuer.',                              'hard'),
+    'N7':   ('CVV2 Mismatch',     'CVV2/CVC2 value does not match issuer records.',                'hard'),
+
+    # ── CardPointe / CardConnect proprietary codes ────────────────────────
+    'NU':   ('CVV Not Processed', 'CVV was not processed — not certified for CVV.',                'info'),
+    'NX':   ('No CVV',            'CVV not present on card — CVV required by merchant.',           'hard'),
+    'P':    ('Partial Auth',      'Partial authorization — amount may be less than requested.',    'info'),
+    'S_ERR_01': ('AVS Mismatch',  'Address Verification failed — billing address does not match issuer record.', 'soft'),
+    'S_ERR_02': ('CVV Mismatch',  'CVV2/CVC2 does not match — recheck security code.',            'hard'),
+    'S_ERR_03': ('Duplicate Txn', 'Duplicate transaction detected within velocity window.',        'soft'),
+    'S_ERR_04': ('Over Limit',    'Transaction amount exceeds card limit.',                        'hard'),
+    'S_ERR_05': ('Invalid Account', 'Account number invalid or not found.',                        'hard'),
+    'S_ERR_06': ('Expired Card',  'Card expiry date has passed.',                                  'hard'),
+    'S_ERR_07': ('Stolen/Lost',   'Card reported stolen or lost by issuer.',                       'hard'),
+    'S_ERR_08': ('Fraud Block',   'Transaction blocked by fraud screening.',                       'hard'),
+    'S_ERR_09': ('Velocity Block','Too many authorization attempts — cooling-off period required.','soft'),
+    'S_ERR_10': ('Network Timeout','CardPointe network timeout — retry.',                          'soft'),
+    'INVLD':    ('Invalid Request','Request data invalid — check card number, expiry, and CVV.',   'hard'),
+    'CALL':     ('Call Voice Auth','Voice authorization required — call number on back of card.',  'soft'),
+    'PICKUP':   ('Pick Up Card',  'Card must be physically retrieved.',                            'hard'),
+    'HOLD':     ('Hold Card',     'Card on hold — contact issuer.',                               'hard'),
+
+    # ── CardConnect respproc (processor) codes ────────────────────────────
+    'FNOR':  ('First Data — No Response', 'Upstream processor did not respond.',                   'soft'),
+    'FDUPL': ('First Data — Duplicate',   'Duplicate transaction at processor level.',             'soft'),
+    'FAUT':  ('First Data — Auth Error',  'Authorization message error at processor.',             'hard'),
+    'PNSP':  ('TSYS — Not Supported',     'Transaction type not supported by TSYS.',              'hard'),
+    'PDUP':  ('TSYS — Duplicate',         'Duplicate at TSYS processor.',                         'soft'),
+    'VNR':   ('VNAS — No Response',       'VNAS processor timeout.',                               'soft'),
+
+    # ── resptext pattern matches (substring → explanation) ────────────────
+    # These are matched against the resptext field as substrings, not exact.
+    'INVALID CARD':      ('Invalid Card Number',   'Card number failed validation.',               'hard'),
+    'INVALID AMOUNT':    ('Invalid Amount',        'Amount is zero, out-of-range, or malformed.',  'hard'),
+    'INVALID EXPIRY':    ('Invalid Expiry',        'Expiration date is invalid or in the past.',   'hard'),
+    'INVALID CVV':       ('Invalid CVV',           'CVV length or format invalid.',                'hard'),
+    'AVS MISMATCH':      ('AVS Failed',            'Billing address/ZIP does not match bank records.', 'soft'),
+    'CVV MISMATCH':      ('CVV Failed',            'CVV2 does not match card record.',             'hard'),
+    'DECLINED':          ('Generic Decline',       'Issuer declined — no specific reason provided.','hard'),
+    'CAPTURE ERROR':     ('Capture Error',         'Error during capture phase — verify transaction status.', 'soft'),
+    'TIMEOUT':           ('Gateway Timeout',       'CardPointe gateway timed out — retry.',        'soft'),
+    'ACCOUNT NOT FOUND': ('Account Not Found',     'Cardholder account not found at issuer.',      'hard'),
+    'INSUFFICIENT FUNDS':('Insufficient Funds',    'Account balance too low for this amount.',      'hard'),
+    'EXPIRED':           ('Expired Card',          'Card has expired.',                             'hard'),
+    'STOLEN':            ('Stolen Card',           'Card flagged as stolen.',                       'hard'),
+    'LOST':              ('Lost Card',             'Card flagged as lost.',                         'hard'),
+    'DO NOT HONOR':      ('Do Not Honor',          'Issuer generic decline — card blocked or restricted.','hard'),
+    'NOT PERMITTED':     ('Not Permitted',         'Transaction type not allowed for this card.',   'hard'),
+    'RESTRICTED':        ('Restricted Card',       'Card restricted by issuer policy.',             'hard'),
+    'FRAUD':             ('Fraud Block',           'Transaction flagged by fraud detection.',       'hard'),
+    'VELOCITY':          ('Velocity Exceeded',     'Too many transactions — cooling period needed.','soft'),
+    'RETRY':             ('Retry Needed',          'Soft decline — safe to retry.',                 'soft'),
+    'SYSTEM ERROR':      ('System Error',          'CardPointe internal error — retry later.',      'soft'),
+    'BLOCKED':           ('Card Blocked',          'Card blocked by issuer or merchant.',           'hard'),
+    'SECURITY VIOLATION':('Security Violation',    'Security check failed at issuer.',              'hard'),
+    'STOP PAYMENT':      ('Stop Payment',          'Stop payment order placed on this card.',       'hard'),
+    'NO CREDIT':         ('No Credit Account',     'No credit account linked to card number.',      'hard'),
+}
+
+# Severity badge mapping
+_CP_SEVERITY_BADGE = {'hard': '🔴', 'soft': '🟡', 'info': '✅'}
+
+
+def _lookup_cardpointe_code(
+    respcode: str = '',
+    respstat: str = '',
+    resptext: str = '',
+) -> dict | None:
+    """
+    Look up CardPointe decline reason from any combination of
+    respcode, respstat, and resptext fields.
+
+    Returns dict with keys: code, reason, detail, severity, badge
+    or None if no match found.
+    """
+    # 1. Exact respcode match
+    key = (respcode or '').strip().upper()
+    if key and key in _CARDPOINTE_CODES:
+        reason, detail, sev = _CARDPOINTE_CODES[key]
+        return {
+            'code':     key,
+            'reason':   reason,
+            'detail':   detail,
+            'severity': sev,
+            'badge':    _CP_SEVERITY_BADGE.get(sev, '❓'),
+            'source':   'respcode',
+        }
+
+    # 2. respstat lookup (A/B/C)
+    stat = (respstat or '').strip().upper()
+    if stat and stat in _CARDPOINTE_CODES:
+        reason, detail, sev = _CARDPOINTE_CODES[stat]
+        return {
+            'code':     stat,
+            'reason':   reason,
+            'detail':   detail,
+            'severity': sev,
+            'badge':    _CP_SEVERITY_BADGE.get(sev, '❓'),
+            'source':   'respstat',
+        }
+
+    # 3. resptext substring match (case-insensitive, longest match wins)
+    rtext = (resptext or '').strip().upper()
+    if rtext:
+        best_key, best_len = None, 0
+        for pattern in _CARDPOINTE_CODES:
+            if len(pattern) > 5 and pattern in rtext and len(pattern) > best_len:
+                best_key, best_len = pattern, len(pattern)
+        if best_key:
+            reason, detail, sev = _CARDPOINTE_CODES[best_key]
+            return {
+                'code':     best_key,
+                'reason':   reason,
+                'detail':   detail,
+                'severity': sev,
+                'badge':    _CP_SEVERITY_BADGE.get(sev, '❓'),
+                'source':   'resptext',
+            }
+
+    # 4. Numeric code fallback via _RESPONSE_CODE_MAP (ISO 8583)
+    if key in _RESPONSE_CODE_MAP:
+        meaning, verdict = _RESPONSE_CODE_MAP[key]
+        sev = 'soft' if verdict in ('decline_soft', 'retry') else 'hard'
+        return {
+            'code':     key,
+            'reason':   meaning,
+            'detail':   f'ISO 8583 code — {verdict}',
+            'severity': sev,
+            'badge':    _CP_SEVERITY_BADGE.get(sev, '❓'),
+            'source':   'iso8583_fallback',
+        }
+
+    return None
+
+
 def _scan_response_patterns(
     html: str,
     js_text: str,
@@ -34281,13 +34496,18 @@ def _run_payload_flow_sync(
         init_html    = init_resp.text
         init_cookies = engine.cookies
 
-        fresh_token_sources = _find_token_sources(init_html, '')
+        # FIX: extract inline JS from init_html so token sources catch pk_ keys
+        _inline_js_blocks = re.findall(
+            r'<script[^>]*>(.+?)</script>', init_html, re.S | re.I)
+        init_js_text = '\n'.join(_inline_js_blocks)
+
+        fresh_token_sources = _find_token_sources(init_html, init_js_text)
         fresh_resolved = _resolve_dynamic_tokens(
             url           = page_url,
             token_sources = fresh_token_sources,
             engine        = engine,
             html          = init_html,
-            js_text       = '',
+            js_text       = init_js_text,
             progress_cb   = progress_cb,
         )
         resolved = {**data.get('resolved_tokens', {}), **fresh_resolved}
@@ -34318,21 +34538,99 @@ def _run_payload_flow_sync(
     stripe_3ds_supported  = None
     stripe_error_code     = None
 
-    # ── Find Stripe publishable key ──────────────────────────────────────
+    # ── Find Stripe publishable key — 7-source waterfall ────────────────
+    _PK_RE = re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,120})\b')
+
+    def _first_pk(text: str) -> str | None:
+        m = _PK_RE.search(text or '')
+        return m.group(1) if m else None
+
+    # Source 1: resolved tokens (live/static values)
     for _tname, _rt in resolved.items():
-        if re.search(r'\bpk_(live|test)_', _rt.get('value', '')):
-            stripe_pk = _rt['value']
+        _pk_hit = _first_pk(_rt.get('value', ''))
+        if _pk_hit:
+            stripe_pk = _pk_hit
             break
+
+    # Source 2: token_sources — check value, value_preview, raw_snippet
     if not stripe_pk:
         for ts in data.get('token_sources', []):
-            if re.search(r'\bpk_(live|test)_', ts.get('value_preview', '')):
-                stripe_pk = ts['value_preview']
+            _pk_hit = (
+                _first_pk(ts.get('value', '')) or
+                _first_pk(ts.get('value_preview', '')) or
+                _first_pk(ts.get('raw_snippet', ''))
+            )
+            if _pk_hit:
+                stripe_pk = _pk_hit
                 break
+
+    # Source 3: live_findings — check value, raw_value, snippet fields
     if not stripe_pk:
         for lf in data.get('live_findings', []):
-            if re.search(r'\bpk_(live|test)_', lf.get('value', '')):
-                stripe_pk = lf['value']
+            _pk_hit = (
+                _first_pk(lf.get('value', '')) or
+                _first_pk(lf.get('raw_value', '')) or
+                _first_pk(lf.get('snippet', ''))
+            )
+            if _pk_hit:
+                stripe_pk = _pk_hit
                 break
+
+    # Source 4: direct regex scan on fresh init_html + inline JS (Step 1 fetch)
+    if not stripe_pk:
+        stripe_pk = _first_pk(init_html) or _first_pk(init_js_text)
+
+    # Source 5: scan linked external JS files (src=".js") up to 5 files
+    if not stripe_pk:
+        _js_srcs = re.findall(
+            r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']',
+            init_html, re.I
+        )
+        for _js_src in _js_srcs[:5]:
+            try:
+                if _js_src.startswith('//'):
+                    _js_src = 'https:' + _js_src
+                elif _js_src.startswith('/'):
+                    _parsed = urlparse(page_url)
+                    _js_src = f"{_parsed.scheme}://{_parsed.netloc}{_js_src}"
+                _js_r = requests.get(
+                    _js_src, headers=_get_headers(),
+                    timeout=6, verify=False)
+                stripe_pk = _first_pk(_js_r.text)
+                if stripe_pk:
+                    if progress_cb:
+                        progress_cb(f"🔑 pk_ found in external JS: {_js_src[-50:]}")
+                    break
+            except Exception:
+                continue
+
+    # Source 6: gateways[] — client_token_prefix (may contain full pk_ value)
+    if not stripe_pk:
+        for gw in data.get('gateways', []):
+            _pk_hit = _first_pk(gw.get('client_token_prefix', '') or '')
+            if _pk_hit:
+                stripe_pk = _pk_hit
+                break
+
+    # Source 7: payment_sdks[] version strings sometimes embed the key context
+    if not stripe_pk:
+        for sdk in data.get('payment_sdks', []):
+            _pk_hit = _first_pk(sdk.get('version', '') or '')
+            if _pk_hit:
+                stripe_pk = _pk_hit
+                break
+
+    if progress_cb:
+        if stripe_pk:
+            _env = 'LIVE 🔴' if 'pk_live_' in stripe_pk else 'TEST 🟡'
+            progress_cb(
+                f"🔑 Stripe pk_ found [{_env}]: {stripe_pk[:16]}…{stripe_pk[-4:]}"
+            )
+        elif 'Stripe' in gateway_name:
+            progress_cb(
+                "⚠️ Step 2: Stripe pk_ key not found in any source "
+                "(HTML, JS, tokens, live intercept, external scripts)"
+            )
 
     # ── Stripe tokenization ──────────────────────────────────────────────
     if gateway_name == 'Stripe' and stripe_pk:
@@ -34800,6 +35098,9 @@ def _run_payload_flow_sync(
                     'status', 'message', 'error', 'code', 'success',
                     'declined', 'transaction_id', 'order_id', 'result',
                     'response_code', 'auth_code', 'description',
+                    # CardPointe-specific fields
+                    'respstat', 'respcode', 'resptext', 'respproc',
+                    'setlstat', 'retref', 'amount', 'currency',
                 ):
                     _rv = _resp_json.get(_rk)
                     if _rv is not None:
@@ -34833,6 +35134,37 @@ def _run_payload_flow_sync(
         url         = submit_url,
         live_bodies = [submit_body],
     )
+
+    # ── CardPointe / CardConnect decline reason lookup ────────────────────
+    _cp_decline: dict | None = None
+    if _resp_json:
+        _cp_decline = _lookup_cardpointe_code(
+            respcode = str(_resp_json.get('respcode') or ''),
+            respstat = str(_resp_json.get('respstat') or ''),
+            resptext = str(_resp_json.get('resptext') or ''),
+        )
+    if not _cp_decline:
+        # Also try plain JSON keys used by some CardPointe integrations
+        _cp_decline = _lookup_cardpointe_code(
+            respcode = str((_resp_json or {}).get('response_code') or
+                           (_resp_json or {}).get('code') or ''),
+            respstat = '',
+            resptext = str((_resp_json or {}).get('message') or
+                           (_resp_json or {}).get('error') or
+                           (_resp_json or {}).get('description') or ''),
+        )
+    if not _cp_decline:
+        # Last resort: scan raw response body text for known patterns
+        _cp_decline = _lookup_cardpointe_code(
+            respcode = '',
+            respstat = '',
+            resptext = submit_body[:500],
+        )
+    if _cp_decline and progress_cb:
+        progress_cb(
+            f"{_cp_decline['badge']} CardPointe: [{_cp_decline['code']}] "
+            f"{_cp_decline['reason']} — {_cp_decline['detail'][:60]}"
+        )
 
     # ── 3DS challenge detection ───────────────────────────────────────────
     _3ds_triggered = False
@@ -34948,6 +35280,7 @@ def _run_payload_flow_sync(
         'authnet_client_key': resolved.get('_authnet_client_key', {}).get('value', '') or None,
         'authnet_opaque_value': resolved.get('_authnet_opaque_value', {}).get('value', '') or None,
         'authnet_opaque_desc':  resolved.get('_authnet_opaque_desc', {}).get('value', '') or None,
+        'cardpointe_decline':   _cp_decline,
     }
 
 
@@ -35454,12 +35787,16 @@ def _build_payment_flow_json(data: dict) -> str:
                             'paid':          False,
                             'responseCode':  ['05', '51', '54', '57', '61'],
                         },
-                        'stripe_decline_codes': _stripe_codes or [
-                            {'code': 'insufficient_funds',    'description': 'Not enough funds'},
-                            {'code': 'do_not_honor',          'description': 'Generic decline'},
-                            {'code': 'incorrect_cvc',         'description': 'CVV mismatch'},
-                            {'code': 'expired_card',          'description': 'Card expired'},
-                            {'code': 'card_velocity_exceeded','description': 'Too many attempts'},
+                        # Live-detected codes first; full reference dict as fallback
+                        'stripe_decline_codes': _stripe_codes if _stripe_codes else [
+                            {'code': k, 'description': v}
+                            for k, v in _STRIPE_DECLINE_CODES.items()
+                        ],
+                        'cardpointe_decline_codes': [
+                            {'code': k, 'description': f"{r} — {d}",
+                             'severity': s}
+                            for k, (r, d, s) in _CARDPOINTE_CODES.items()
+                            if s in ('hard', 'soft')   # exclude info-only entries
                         ],
                         'iso_8583_codes': _iso_codes or [],
                     },
@@ -36241,9 +36578,20 @@ def _build_json_export(data: dict) -> str:
             ]
         if rp.get('stripe_codes'):
             rp_out['stripe_decline_codes'] = [
-                {'code': s['code'], 'description': s['description'], 'source': s['source']}
+                {'code': s['code'], 'description': s['description']}
                 for s in rp['stripe_codes']
             ]
+        else:
+            # Full reference table when no live codes detected
+            rp_out['stripe_decline_codes'] = [
+                {'code': k, 'description': v}
+                for k, v in _STRIPE_DECLINE_CODES.items()
+            ]
+        rp_out['cardpointe_decline_codes'] = [
+            {'code': k, 'description': f"{r} — {d}", 'severity': s}
+            for k, (r, d, s) in _CARDPOINTE_CODES.items()
+            if s in ('hard', 'soft')
+        ]
         out['response_patterns'] = rp_out
 
     # ── ENH1: form_action_issues ─────────────────────────────
@@ -38505,6 +38853,7 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _succ      = flow_result.get('success_signals', [])
     _decl      = flow_result.get('decline_signals', [])
     _rcodes    = flow_result.get('response_codes', [])
+    _cp_decl   = flow_result.get('cardpointe_decline')   # CardPointe lookup result
     _scodes    = flow_result.get('stripe_codes', [])
     _rtoks     = flow_result.get('resolved_tokens_used', {})
     _rbody     = flow_result.get('response_body', '')
@@ -38639,6 +38988,19 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{escape_md(rc_item.get('meaning',''))} "
                 f"— {escape_md(rc_item.get('verdict',''))}"
             )
+
+    # ── CardPointe Decline Reason ─────────────────────────────────
+    if _cp_decl:
+        _badge  = _cp_decl.get('badge', '🔴')
+        _cp_code    = escape_md(_cp_decl.get('code', '?'))
+        _cp_reason  = escape_md(_cp_decl.get('reason', ''))
+        _cp_detail  = escape_md(_cp_decl.get('detail', '')[:100])
+        _cp_sev     = escape_md(_cp_decl.get('severity', '').upper())
+        _cp_src     = escape_md(_cp_decl.get('source', ''))
+        lines.append(f"\n{_badge} *CardPointe Decline Reason:*")
+        lines.append(f"  Code: `{_cp_code}`  Severity: `{_cp_sev}`  _(via {_cp_src})_")
+        lines.append(f"  *{_cp_reason}*")
+        lines.append(f"  _{_cp_detail}_")
 
     # ── JSON Response Keys ────────────────────────────────────────
     if _rjson:
