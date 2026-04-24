@@ -5503,10 +5503,28 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'AwsWafCaptcha\.renderCaptcha', re.I),
         re.compile(r'awswaf-captcha-api-key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,})["\']', re.I),
     ],
-    # ★ NEW: GoBotBlocker / Altcha (newer open-source)
+    # ★ NEW: Altcha (newer open-source)
     "Altcha": [
         re.compile(r'altcha-widget|<altcha-widget', re.I),
         re.compile(r'altcha\.org/api/v1/challenge', re.I),
+    ],
+    # ── Authorize.Net Accept.js (clientKey = public tokenization key) ─────────
+    "Authorize.Net Accept.js": [
+        # AcceptUI data attributes on button / form element
+        re.compile(r'data-clientkey=["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'data-apiLoginID=["\']([A-Za-z0-9]{4,20})["\']', re.I),
+        # JS variable assignment patterns
+        re.compile(r'clientKey\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'publicClientKey\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'public.?client.?key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'"clientKey"\s*:\s*"([A-Za-z0-9+/=]{20,200})"', re.I),
+        # merchantAuthentication.clientKey (Accept.js API payload)
+        re.compile(r'merchantAuthentication\s*[=:{][^}]{0,200}clientKey["\']?\s*:\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        # WooCommerce / plugin config objects
+        re.compile(r'loginId\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\'](?=[^}]{0,200}clientKey)', re.I),
+        # apiLoginID patterns (secondary — captured as separate field in deep scanner)
+        re.compile(r'apiLoginID\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']', re.I),
+        re.compile(r'api.?login.?id\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']', re.I),
     ],
 }
 
@@ -5554,6 +5572,14 @@ _KEY_VALIDATORS = {
     # ── mCaptcha (20-60 alphanum) ────────────────────────────────────────────
     "mCaptcha":             lambda k: (
         20 <= len(k) <= 60 and bool(re.match(r'^[A-Za-z0-9_]+$', k))
+    ),
+    # ── Authorize.Net clientKey (20-200 base64-like) OR apiLoginID (4-20 alphanum) ──
+    "Authorize.Net Accept.js": lambda k: (
+        # clientKey: 20+ chars, base64-safe alphabet
+        (20 <= len(k) <= 200 and bool(re.match(r'^[A-Za-z0-9+/=]+$', k)))
+        or
+        # apiLoginID: 4-20 alphanumeric
+        (4 <= len(k) <= 20 and bool(re.match(r'^[A-Za-z0-9]+$', k)))
     ),
 }
 
@@ -5688,6 +5714,7 @@ _CAPTCHA_SCAN_ORDER = [
     "PerimeterX/HUMAN",
     "AWS WAF Captcha",
     "Altcha",
+    "Authorize.Net Accept.js",   # last — payment key, not bot protection
 ]
 
 # Script src signatures for fallback detection
@@ -5707,6 +5734,14 @@ _CAPTCHA_SCRIPT_SIGS = {
     "PerimeterX/HUMAN":     ["px-cloud.net", "perimeterx.net"],
     "AWS WAF Captcha":      ["captcha.us-east-1.amazonaws.com"],
     "Altcha":               ["altcha.org", "altcha-widget"],
+    "Authorize.Net Accept.js": [
+        "js.authorize.net/v1/Accept.js",
+        "jstest.authorize.net/v1/Accept.js",
+        "js.authorize.net/v3/AcceptUI.js",
+        "jstest.authorize.net/v3/AcceptUI.js",
+        "js.authorize.net/",
+        "jstest.authorize.net/",
+    ],
 }
 
 
@@ -5733,6 +5768,213 @@ _S_PARAM_PATTERNS = [
     re.compile(r'data-s=["\']([A-Za-z0-9+/=_\-]{20,})["\']', re.I),
     re.compile(r'["\']s["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']', re.I),
 ]
+
+
+def _find_authorizenet_keys(
+    html: str,
+    js_sources,          # dict {url: text} or str (raw JS text)
+    page_url: str = "",
+) -> list:
+    """
+    Deep Authorize.Net Accept.js / AcceptUI scanner.
+
+    Finds:
+      - clientKey / apiLoginID from AcceptUI data-* attributes
+      - clientKey / apiLoginID from inline JS / Accept.js variable assignments
+      - <script src="https://js.authorize.net/..."> — script detection
+      - AcceptUI form + hidden field detection
+      - Environment: production (js.authorize.net) vs sandbox (jstest.authorize.net)
+
+    Returns list of finding dicts compatible with captcha finding schema.
+    Each finding has:
+      type         = "Authorize.Net Accept.js"
+      site_key     = clientKey (preferred) or apiLoginID (if clientKey absent)
+      login_id     = apiLoginID (extra field)
+      client_key   = clientKey (extra field, full value)
+      environment  = "sandbox" | "production" | "unknown"
+      method       = "AcceptUI" | "Accept.js" | "unknown"
+      source       = human-readable origin
+    """
+    findings  = []
+    seen_keys = set()
+
+    # ── Normalize js_sources to dict ─────────────────────────────────────────
+    if isinstance(js_sources, str):
+        js_dict = {"inline": js_sources}
+    elif isinstance(js_sources, dict):
+        js_dict = js_sources
+    else:
+        js_dict = {}
+
+    combined_js = "\n".join(js_dict.values())
+    combined    = html + "\n" + combined_js
+
+    # ── Environment detection ─────────────────────────────────────────────────
+    _ENV_SANDBOX_PAT = re.compile(r'jstest\.authorize\.net', re.I)
+    _ENV_PROD_PAT    = re.compile(r'(?<!jstest\.)(?:^|[^a-z])js\.authorize\.net', re.I)
+
+    def _detect_env(text: str) -> str:
+        if _ENV_SANDBOX_PAT.search(text):
+            return "sandbox"
+        if _ENV_PROD_PAT.search(text):
+            return "production"
+        return "unknown"
+
+    env = _detect_env(combined)
+
+    # ── Accept.js endpoint ────────────────────────────────────────────────────
+    def _an_endpoint(environment: str) -> str:
+        return (
+            "https://jstest.authorize.net/v1/request"
+            if environment == "sandbox"
+            else "https://js.authorize.net/v1/request"
+        )
+
+    # ── apiLoginID patterns ───────────────────────────────────────────────────
+    _LOGIN_PATS = [
+        re.compile(r'data-apiLoginID=["\']([A-Za-z0-9]{4,20})["\']',             re.I),
+        re.compile(r'data-api-login-id=["\']([A-Za-z0-9]{4,20})["\']',           re.I),
+        re.compile(r'apiLoginID\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',         re.I),
+        re.compile(r'api.?login.?id\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',    re.I),
+        re.compile(r'merchantLoginId\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',   re.I),
+        re.compile(r'"name"\s*:\s*"([A-Za-z0-9]{4,20})"\s*,\s*"clientKey"',     re.I),
+        re.compile(r'loginId\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',           re.I),
+        re.compile(r'AUTHNET_LOGIN\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',     re.I),
+        re.compile(r'authorize_net_login\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']', re.I),
+    ]
+
+    # ── clientKey patterns ────────────────────────────────────────────────────
+    _CKEY_PATS = [
+        re.compile(r'data-clientkey=["\']([A-Za-z0-9+/=]{20,200})["\']',           re.I),
+        re.compile(r'data-client-key=["\']([A-Za-z0-9+/=]{20,200})["\']',          re.I),
+        re.compile(r'clientKey\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']',       re.I),
+        re.compile(r'publicClientKey\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'public.?client.?key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'"clientKey"\s*:\s*"([A-Za-z0-9+/=]{20,200})"',                re.I),
+        re.compile(r'AUTHNET_KEY\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']',    re.I),
+        re.compile(r'authorize_net_key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+    ]
+
+    def _extract_pair(text: str, source: str):
+        login = ""
+        ckey  = ""
+        for pat in _LOGIN_PATS:
+            m = pat.search(text)
+            if m:
+                login = m.group(1)
+                break
+        for pat in _CKEY_PATS:
+            m = pat.search(text)
+            if m:
+                ckey = m.group(1)
+                break
+        return login, ckey
+
+    def _add_finding(login: str, ckey: str, source: str, method: str, env_override: str = ""):
+        environment = env_override or env
+        # primary site_key = clientKey (preferred) else apiLoginID
+        site_key = ckey if ckey else login
+        if not site_key:
+            return
+        dedup = site_key.lower()[:40]
+        if dedup in seen_keys:
+            return
+        seen_keys.add(dedup)
+        findings.append({
+            "type":        "Authorize.Net Accept.js",
+            "site_key":    site_key,
+            "page_url":    page_url,
+            "action":      "",
+            "source":      source,
+            "login_id":    login,
+            "client_key":  ckey,
+            "environment": environment,
+            "endpoint":    _an_endpoint(environment),
+            "method":      method,
+            "theme":       "",
+            "size":        "",
+            "invisible":   False,
+            "badge":       "",
+            "min_score":   "",
+            "enterprise":  False,
+            "s_param":     "",
+            "hl":          "",
+            "co":          "",
+            "callback":    "",
+            "user_agent":  "",
+        })
+
+    # ── 1. HTML inline scan (AcceptUI data-* attributes) ─────────────────────
+    from bs4 import BeautifulSoup as _BS
+    try:
+        soup = _BS(html, 'html.parser')
+
+        # AcceptUI button: <button class="AcceptUI" data-apiLoginID="..." data-clientkey="...">
+        for el in soup.find_all(attrs={"data-clientkey": True}):
+            _login = el.get("data-apiloginid") or el.get("data-apiLoginID") or ""
+            _ckey  = el.get("data-clientkey", "")
+            if _ckey:
+                _env_local = "sandbox" if "test" in _ckey.lower() else env
+                _add_finding(_login, _ckey, f"AcceptUI {el.name} data-clientkey", "AcceptUI", _env_local)
+
+        for el in soup.find_all(attrs={"data-apiloginid": True}):
+            _login = el.get("data-apiloginid") or el.get("data-apiLoginID") or ""
+            _ckey  = el.get("data-clientkey", "")
+            if _login and not _ckey:
+                _add_finding(_login, "", f"AcceptUI {el.name} data-apiLoginID only", "AcceptUI")
+
+        # Accept.js hidden form fields: <input name="dataValue" />, <input name="dataDescriptor" />
+        _dv_field = soup.find("input", {"name": re.compile(r'dataValue|data_value', re.I)})
+        _dd_field = soup.find("input", {"name": re.compile(r'dataDescriptor|data_descriptor', re.I)})
+        if _dv_field or _dd_field:
+            # Look for associated login/key in same form
+            _form = (_dv_field or _dd_field).find_parent("form")
+            if _form:
+                _flg, _fck = _extract_pair(str(_form), "Accept.js form HTML")
+                if _flg or _fck:
+                    _add_finding(_flg, _fck, "Accept.js form with dataValue/dataDescriptor fields", "Accept.js")
+                else:
+                    # Record that Accept.js form fields exist even without keys
+                    _add_finding("", "", "Accept.js form fields detected (keys in JS)", "Accept.js")
+
+    except Exception:
+        pass
+
+    # ── 2. Script-src detection + env refinement ──────────────────────────────
+    _script_src_env = "unknown"
+    _script_method  = "unknown"
+    _an_script_sigs = _CAPTCHA_SCRIPT_SIGS.get("Authorize.Net Accept.js", [])
+    try:
+        soup2 = _BS(html, 'html.parser')
+        for tag in soup2.find_all("script", src=True):
+            src = tag.get("src", "")
+            if any(sig in src for sig in _an_script_sigs):
+                _script_src_env = "sandbox" if "jstest" in src else "production"
+                _script_method = "AcceptUI" if "AcceptUI" in src else "Accept.js"
+                break
+    except Exception:
+        pass
+
+    # ── 3. Inline HTML + JS text scan ─────────────────────────────────────────
+    for label, text in [("HTML", html)] + list(js_dict.items()):
+        _login, _ckey = _extract_pair(text, label)
+        if _login or _ckey:
+            _m  = _script_method if _script_method != "unknown" else "Accept.js"
+            _ev = _script_src_env if _script_src_env != "unknown" else env
+            _add_finding(_login, _ckey, f"JS variable scan: {str(label)[:60]}", _m, _ev)
+
+    # ── 4. Context-window pair extraction (merchantAuthentication block) ───────
+    _MERCH_AUTH_PAT = re.compile(
+        r'merchantAuthentication\s*[=:{][^}]{0,400}',
+        re.I | re.S,
+    )
+    for m in _MERCH_AUTH_PAT.finditer(combined):
+        block = m.group(0)
+        _login, _ckey = _extract_pair(block, "merchantAuthentication block")
+        if _login or _ckey:
+            _add_finding(_login, _ckey, "merchantAuthentication block", "Accept.js")
+
+    return findings
 
 
 def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> list:
@@ -5865,6 +6107,14 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                 "source":   f"Script include: {src[:80]}",
             })
 
+    # ── 5. Authorize.Net deep scan ────────────────────────────────────────────
+    _an_findings = _find_authorizenet_keys(html, js_sources or {}, page_url)
+    _an_seen     = {f["site_key"] for f in findings if "Authorize.Net" in f.get("type", "")}
+    for _anf in _an_findings:
+        if _anf["site_key"] not in _an_seen:
+            findings.append(_anf)
+            _an_seen.add(_anf["site_key"])
+
     return findings
 
 
@@ -5986,6 +6236,11 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         # PerimeterX: px.js or collector endpoint
         (re.compile(r'(?:client\.px-cloud\.net|px-cdn\.net|sactechrisk\.com)/[A-Za-z0-9]+/main\.min\.js', re.I), "PerimeterX"),
         (re.compile(r'(?:collector(?:-[a-z]+)?\.px-cdn\.net|sactechrisk\.com)/[^"\']*appId=([A-Za-z0-9_\-]{8,40})', re.I), "PerimeterX"),
+        # ── Authorize.Net Accept.js / AcceptUI script load ────────────────────
+        (re.compile(r'(?:js|jstest)\.authorize\.net/v\d/(?:Accept|AcceptUI)\.js', re.I), "Authorize.Net Accept.js"),
+        (re.compile(r'(?:js|jstest)\.authorize\.net/[^"\'?#]*[?&]clientKey=([A-Za-z0-9+/=]{20,200})', re.I), "Authorize.Net Accept.js"),
+        # Authorize.Net tokenize endpoint (Accept.js API call)
+        (re.compile(r'(?:js|jstest)\.authorize\.net/v1/request', re.I), "Authorize.Net Accept.js"),
     ]
 
     _BODY_PATTERNS = [
@@ -6739,6 +6994,27 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         const tok = el.getAttribute('data-aws-waf-token') || el.textContent;
                         if (tok && tok.length > 10) add(tok.substring(0,120), '[data-aws-waf-token]', 'AWS WAF Captcha', {});
                     });
+                    // ── Authorize.Net AcceptUI button / form element ──────────────
+                    root.querySelectorAll('[data-clientkey]').forEach(el => {
+                        const ck    = el.getAttribute('data-clientkey') || '';
+                        const lid   = el.getAttribute('data-apiloginid') || el.getAttribute('data-apiLoginID') || '';
+                        const src   = el.getAttribute('src') || '';
+                        const isSbx = src.includes('jstest.authorize.net');
+                        if (ck) add(ck, 'AcceptUI ' + el.tagName + ' data-clientkey', 'Authorize.Net Accept.js', {
+                            login_id:    lid,
+                            environment: isSbx ? 'sandbox' : 'production',
+                            method:      'AcceptUI',
+                        });
+                    });
+                    root.querySelectorAll('.AcceptUI,[data-apiloginid]').forEach(el => {
+                        const lid = el.getAttribute('data-apiloginid') || el.getAttribute('data-apiLoginID') || '';
+                        const ck  = el.getAttribute('data-clientkey') || '';
+                        if (lid || ck) add(ck || lid, '.AcceptUI element', 'Authorize.Net Accept.js', {
+                            login_id:   lid,
+                            client_key: ck,
+                            method:     'AcceptUI',
+                        });
+                    });
                     // Shadow DOM
                     root.querySelectorAll('*').forEach(el => {
                         if (el.shadowRoot) scanDOM(el.shadowRoot);
@@ -6970,6 +7246,21 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
     for f in findings:
         if not f.get("user_agent"):
             f["user_agent"] = ua
+
+    # ── Authorize.Net deep scan on captured page HTML ──────────────────────
+    # Run _find_authorizenet_keys on all JS text captured via network intercept
+    _an_js_dict = {}
+    for _nreq in network_log:
+        _nu = _nreq if isinstance(_nreq, str) else _nreq.get("url", "")
+        _nt = _nreq.get("body", "") if isinstance(_nreq, dict) else ""
+        if _nt and ("authorize" in _nu.lower() or "accept" in _nu.lower()):
+            _an_js_dict[_nu[:80]] = _nt[:60000]
+    _an_extra = _find_authorizenet_keys("", _an_js_dict, page_url_ref[0])
+    _an_seen_pw = {f["site_key"] for f in findings if "Authorize.Net" in f.get("type", "")}
+    for _af in _an_extra:
+        if _af["site_key"] not in _an_seen_pw:
+            findings.append(_af)
+            _an_seen_pw.add(_af["site_key"])
 
     # FIX Bug5: include network_log (URL list) in return value so
     # _confidence_crossref can match captcha sitekeys found in iframe URLs
@@ -31984,6 +32275,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'gw_completeness':     _gw_completeness,       # ENH7 — gateway field completeness
         'api_versioning':      api_versioning,          # NEW — API version enumeration
         'well_known':          well_known,              # NEW — well-known path recon
+        'authnet_keys':        _find_authnet_keys(      # NEW — Authorize.Net key finder
+                                   static_html + js_html,
+                                   base_url,
+                               ),
     }
 
 
@@ -32389,6 +32684,33 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             _sk_key   = _sk.get('site_key', '')
             _sk_act   = _sk.get('action', '')
             _sk_inv   = _sk.get('invisible', False)
+
+    # ── AUTHORIZE.NET KEYS ───────────────────────────────────────
+    _an_keys = data.get('authnet_keys')
+    if _an_keys and isinstance(_an_keys, tuple) and any(_an_keys):
+        _an_login_r, _an_ckey_r = _an_keys
+        lines.append(_sec("Authorize.Net Accept.js Keys", "🏦"))
+        if _an_login_r:
+            lines.append(f"  🔑 `apiLoginID`  `{raw_code(_an_login_r)}`")
+        else:
+            lines.append("  ⚠️ `apiLoginID`  _not found_")
+        if _an_ckey_r:
+            # show first 32 chars + length hint
+            _ck_preview = _an_ckey_r[:32] + ('…' if len(_an_ckey_r) > 32 else '')
+            lines.append(
+                f"  🔑 `clientKey`   `{raw_code(_ck_preview)}`  "
+                f"_{len(_an_ckey_r)} chars_"
+            )
+        else:
+            lines.append("  ⚠️ `clientKey`   _not found_")
+        if _an_login_r and _an_ckey_r:
+            _an_env_url = (
+                'https://jstest.authorize.net/v1/request'
+                if 'test' in _an_login_r.lower() or len(_an_login_r) < 8
+                else 'https://js.authorize.net/v1/request'
+            )
+            lines.append(f"  🌐 endpoint: `{raw_code(_an_env_url)}`")
+            lines.append("  ✅ _Both keys found — Accept.js tokenization available_")
             _sk_score = _sk.get('min_score', '')
             _sk_ent   = _sk.get('enterprise', False)
             _sk_cb    = _sk.get('callback', '')
@@ -33403,6 +33725,519 @@ def _sanitize_for_json(obj, _seen=None):
         return "__unserializable__"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  XHR / Fetch Sequence Profiler
+#  Playwright ဖြင့် page load ကာလ network requests တစ်ခုချင်းစီ intercept
+#  လုပ်ကာ Timeline + Dependency Graph ထုတ်ပေးသည်
+#
+#  _xhr_sequence_profiler_sync(url, progress_cb, capture_sec)
+#    → { timeline, critical_path, payment_sequence,
+#        total_requests, total_duration_ms, error }
+#
+#  _classify_initiator(resource_type, url) → str
+#  _make_seq_label(method, url, resource_type) → str
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PROF_TOKENIZATION_RE = re.compile(
+    r'stripe\.com/v\d|braintreepayments\.com|paypal\.com/v\d'
+    r'|adyen\.com|checkout\.com|squareup\.com/v\d'
+    r'|cybersource|authorize\.net|payeezy|worldpay|recurly',
+    re.I
+)
+
+_PROF_PAYMENT_RE = re.compile(
+    r'/(?:checkout|payment|order|cart|purchase|pay|billing|charge|confirm|subscribe)',
+    re.I
+)
+
+# Token patterns to extract from response bodies for dependency detection
+_PROF_TOKEN_RE = re.compile(
+    r'(?:csrf[_\-]?token|_token|authenticity_token|nonce|xsrf[_\-]?token'
+    r'|__requestverificationtoken|form_key|wp_nonce)'
+    r'["\'\s:=]+([A-Za-z0-9_\-/+=]{16,128})',
+    re.I
+)
+
+
+def _classify_initiator(resource_type: str, url: str) -> str:
+    """Request ဘာကြောင့် fire သလဲ classify လုပ်သည်"""
+    rt = (resource_type or "").lower()
+    if rt == "document":
+        return "navigation"
+    if rt == "script":
+        return "script_load"
+    if rt == "stylesheet":
+        return "css_load"
+    if rt == "image":
+        return "image_load"
+    if rt == "font":
+        return "font_load"
+    if rt in ("fetch", "xhr"):
+        if _PROF_TOKENIZATION_RE.search(url):
+            return "tokenization_api"
+        if _PROF_PAYMENT_RE.search(url):
+            return "payment_api"
+        return "xhr_fetch"
+    if rt == "websocket":
+        return "websocket"
+    if rt == "media":
+        return "media_load"
+    if rt == "eventsource":
+        return "sse_stream"
+    return rt or "other"
+
+
+def _make_seq_label(method: str, url: str, resource_type: str) -> str:
+    """Timeline row ရဲ့ human-readable short label ထုတ်ပေးသည်"""
+    parsed = urlparse(url)
+    path   = parsed.path.rstrip("/") or "/"
+    parts  = [p for p in path.split("/") if p]
+    short  = "/".join(parts[-2:]) or path          # last 2 path segments
+    host   = (parsed.hostname or "").replace("www.", "")
+    if _PROF_TOKENIZATION_RE.search(url):
+        return f"💳 {method} {host}/{short}"
+    if _PROF_PAYMENT_RE.search(url):
+        return f"💰 {method} {short}"
+    if resource_type == "document":
+        return f"📄 {method} {host or path}"
+    if resource_type == "script":
+        return f"📜 JS {parts[-1][:30] if parts else short}"
+    if resource_type in ("fetch", "xhr"):
+        return f"🔗 {method} {short[:40]}"
+    if resource_type == "stylesheet":
+        return f"🎨 CSS {parts[-1][:25] if parts else short}"
+    return f"{method} {short[:40]}"
+
+
+def _xhr_sequence_profiler_sync(
+    url: str,
+    progress_cb=None,
+    capture_sec: int = 14,
+) -> dict:
+    """
+    XHR / Fetch Sequence Profiler
+
+    Playwright ဖြင့် page load ကာလ network requests တစ်ခုချင်းစီ intercept
+    လုပ်ကာ request order, timing, dependency ကို profile လုပ်သည်။
+
+    Dependency detection logic:
+      - Response body ထဲက token/nonce တန်ဖိုးများ ထုတ်သိမ်းသည်
+      - နောက် request တစ်ခု URL / POST body မှာ ထို token ပါလျှင်
+        dependency link ချိတ်ဆက်သည်  →  "request B depends on request A"
+      - ထို dependency ရှိသော requests = critical path
+
+    Args:
+        url:         scan မည့် page URL
+        progress_cb: optional progress callback (str → None)
+        capture_sec: page load + extra idle window (default 14s)
+
+    Returns:
+        {
+          "timeline":          list[dict]  — request entries (t_start_ms sort)
+          "critical_path":     list[int]   — must-run-in-order seq numbers
+          "payment_sequence":  list[int]   — payment / tokenization seq numbers
+          "total_requests":    int
+          "total_duration_ms": float
+          "error":             str | None
+        }
+
+    Each timeline entry:
+        seq             int    — 1-based order
+        t_start_ms      float  — ms after page-load-start
+        t_end_ms        float  — ms after page-load-start (None if timed out)
+        duration_ms     float  — round-trip time in ms
+        method          str    — GET / POST / PUT …
+        url             str    — full request URL
+        resource_type   str    — document / script / xhr / fetch / image …
+        status          int    — HTTP status code (None if no response captured)
+        initiator       str    — classified trigger (navigation / xhr_fetch / …)
+        dependencies    list   — seq numbers this request depends on
+        tokens_injected list   — tokens from earlier responses used in this req
+        tokens_extracted list  — token values found in THIS response body
+        is_payment      bool   — matched payment URL pattern
+        is_tokenization bool   — matched gateway tokenization URL pattern
+        label           str    — human-readable short description
+    """
+    if not PLAYWRIGHT_OK:
+        return {
+            "error": "playwright_not_installed",
+            "timeline": [], "critical_path": [],
+            "payment_sequence": [], "total_requests": 0,
+            "total_duration_ms": 0.0,
+        }
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {
+            "error": "playwright_not_installed",
+            "timeline": [], "critical_path": [],
+            "payment_sequence": [], "total_requests": 0,
+            "total_duration_ms": 0.0,
+        }
+
+    if progress_cb:
+        progress_cb("🕐 XHR Profiler — launching Playwright browser...")
+
+    import time as _t
+
+    # ── Shared mutable state (accessed from sync Playwright callbacks) ─
+    _entries: dict[str, dict] = {}         # key → entry dict
+    _seq_ctr    = [0]                      # [0] trick for closure mutation
+    _t0_ms      = [None]                   # page-load epoch (monotonic ms)
+    _resp_toks: list[tuple] = []           # [(tok_value, from_seq), …]
+
+    # ── Helper: monotonic ms relative to page load ─────────────────────
+    def _rel_ms() -> float:
+        now = _t.monotonic() * 1000.0
+        if _t0_ms[0] is None:
+            _t0_ms[0] = now
+        return round(now - _t0_ms[0], 2)
+
+    # ── Request callback ───────────────────────────────────────────────
+    def _on_req(req):
+        t_start = _rel_ms()
+        _seq_ctr[0] += 1
+        seq = _seq_ctr[0]
+        key = f"{seq}:{req.url[:200]}"
+
+        # Detect token injection: check if any captured token appears here
+        injected = []
+        try:
+            post_data = (req.post_data or "").lower()
+        except Exception:
+            post_data = ""
+        combined = req.url.lower() + post_data
+        for (tok_val, tok_seq) in _resp_toks:
+            if len(tok_val) >= 12 and tok_val.lower()[:32] in combined:
+                injected.append({
+                    "value_prefix": tok_val[:20] + "…",
+                    "from_seq":     tok_seq,
+                })
+
+        rt  = req.resource_type
+        _entries[key] = {
+            "seq":              seq,
+            "_key":             key,
+            "t_start_ms":       t_start,
+            "t_end_ms":         None,
+            "duration_ms":      None,
+            "method":           req.method,
+            "url":              req.url,
+            "resource_type":    rt,
+            "status":           None,
+            "initiator":        _classify_initiator(rt, req.url),
+            "dependencies":     [i["from_seq"] for i in injected],
+            "tokens_injected":  injected,
+            "tokens_extracted": [],
+            "is_payment":       bool(_PROF_PAYMENT_RE.search(req.url)),
+            "is_tokenization":  bool(_PROF_TOKENIZATION_RE.search(req.url)),
+            "label":            _make_seq_label(req.method, req.url, rt),
+        }
+
+    # ── RequestFinished callback — record timing + extract tokens ──────
+    def _on_req_finished(req):
+        t_end = _rel_ms()
+        # Match by URL + unfinished status (take earliest unfinished)
+        matched_key = None
+        for k, e in _entries.items():
+            if e.get("url") == req.url and e["t_end_ms"] is None:
+                matched_key = k
+                break
+        if not matched_key:
+            return
+
+        entry = _entries[matched_key]
+        entry["t_end_ms"]    = t_end
+        entry["duration_ms"] = round(t_end - entry["t_start_ms"], 2)
+
+        try:
+            resp = req.response()
+            if resp:
+                entry["status"] = resp.status
+                # Extract tokens from text-like responses
+                try:
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if any(x in ct for x in ("json", "html", "javascript",
+                                              "text", "xml")):
+                        cl = int(resp.headers.get("content-length") or 0)
+                        if cl <= 300_000 or cl == 0:
+                            body_bytes = resp.body()
+                            body_text  = body_bytes.decode("utf-8",
+                                                           errors="replace")[:5000]
+                            found_toks = _PROF_TOKEN_RE.findall(body_text)
+                            unique_toks = list(dict.fromkeys(found_toks))   # dedup
+                            for tv in unique_toks[:6]:
+                                entry["tokens_extracted"].append(
+                                    tv[:24] + ("…" if len(tv) > 24 else "")
+                                )
+                                # Register for downstream dependency detection
+                                _resp_toks.append((tv, entry["seq"]))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        with sync_playwright() as pw:
+            # ── Proxy setup (reuse bot's proxy_manager) ────────────────
+            _pw_proxy = None
+            try:
+                _px = proxy_manager.get_proxy()
+                if _px:
+                    from urllib.parse import urlparse as _up_prof
+                    _pp = _up_prof(_px.get("http") or _px.get("https", ""))
+                    _pw_proxy = {
+                        "server": f"{_pp.scheme}://{_pp.hostname}:{_pp.port}"
+                    }
+                    if _pp.username:
+                        _pw_proxy["username"] = _pp.username
+                        _pw_proxy["password"] = _pp.password or ""
+            except Exception:
+                pass
+
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-gpu",
+                ],
+                proxy=_pw_proxy,
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 900},
+                ignore_https_errors=True,
+                java_script_enabled=True,
+            )
+            # Stealth: hide webdriver flag
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            page = ctx.new_page()
+
+            page.on("request",         _on_req)
+            page.on("requestfinished", _on_req_finished)
+
+            # ── Load page ──────────────────────────────────────────────
+            if progress_cb:
+                _host = urlparse(url).hostname or url
+                progress_cb(f"🕐 XHR Profiler — loading {_host}…")
+
+            try:
+                page.goto(url, wait_until="load", timeout=25_000)
+            except PWTimeout:
+                pass   # partial load still yields useful data
+            except Exception as _ge:
+                browser.close()
+                return {
+                    "error": str(_ge)[:120],
+                    "timeline": [], "critical_path": [],
+                    "payment_sequence": [], "total_requests": 0,
+                    "total_duration_ms": 0.0,
+                }
+
+            # Wait for network to settle
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+
+            # Scroll to trigger lazy-load XHR calls
+            for _pct in [0.25, 0.5, 0.75, 1.0]:
+                try:
+                    page.evaluate(
+                        f"window.scrollTo(0, "
+                        f"document.body.scrollHeight * {_pct})"
+                    )
+                    page.wait_for_timeout(350)
+                except Exception:
+                    pass
+
+            # Focus payment fields to trigger tokenization SDK init calls
+            _PAY_FIELDS = [
+                "input[name*='card'], input[autocomplete*='cc-number']",
+                "input[name*='cvv'], input[name*='cvc']",
+                "input[name*='csrf'], input[name*='token']",
+            ]
+            for _fsel in _PAY_FIELDS:
+                try:
+                    _fel = page.query_selector(_fsel)
+                    if _fel and _fel.is_visible():
+                        _fel.focus()
+                        page.wait_for_timeout(250)
+                        _fel.blur()
+                except Exception:
+                    pass
+
+            # Extra capture window for async requests
+            _extra_ms = max(0, (capture_sec - 8)) * 1000
+            if _extra_ms > 0:
+                page.wait_for_timeout(int(_extra_ms))
+
+            browser.close()
+
+    except Exception as _pe:
+        return {
+            "error": str(_pe)[:120],
+            "timeline": [], "critical_path": [],
+            "payment_sequence": [], "total_requests": 0,
+            "total_duration_ms": 0.0,
+        }
+
+    # ── Post-process: sort by t_start_ms ──────────────────────────────
+    timeline = sorted(
+        (e for e in _entries.values()),
+        key=lambda x: x["t_start_ms"]
+    )
+
+    # Remove internal helper keys
+    for _e in timeline:
+        _e.pop("_key", None)
+
+    if not timeline:
+        return {
+            "error": None, "timeline": [], "critical_path": [],
+            "payment_sequence": [], "total_requests": 0,
+            "total_duration_ms": 0.0,
+        }
+
+    total_ms = max(
+        (e["t_end_ms"] or e["t_start_ms"] for e in timeline),
+        default=0.0,
+    )
+
+    # ── Build critical path ────────────────────────────────────────────
+    # Critical = has upstream dependency OR is payment/tokenization request
+    # Always prepend the first (navigation) request
+    _crit_set: set[int] = set()
+
+    # First request = page navigation (always required)
+    _crit_set.add(timeline[0]["seq"])
+
+    for _e in timeline:
+        if _e["dependencies"]:
+            _crit_set.add(_e["seq"])
+            # Also include the upstream requests it depends on
+            for _dep_seq in _e["dependencies"]:
+                _crit_set.add(_dep_seq)
+        if _e["is_payment"] or _e["is_tokenization"]:
+            _crit_set.add(_e["seq"])
+
+    # Sort critical path in seq order
+    critical_seqs   = sorted(_crit_set)
+    payment_seqs    = sorted(
+        e["seq"] for e in timeline
+        if e["is_payment"] or e["is_tokenization"]
+    )
+
+    if progress_cb:
+        progress_cb(
+            f"✅ XHR Profiler done — {len(timeline)} requests  "
+            f"critical:{len(critical_seqs)}  "
+            f"payment:{len(payment_seqs)}  "
+            f"total:{round(total_ms)}ms"
+        )
+
+    return {
+        "error":             None,
+        "timeline":          timeline,
+        "critical_path":     critical_seqs,
+        "payment_sequence":  payment_seqs,
+        "total_requests":    len(timeline),
+        "total_duration_ms": round(total_ms, 2),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _find_authnet_keys(
+    html: str,
+    origin: str,
+    progress_cb=None,
+) -> tuple:
+    """
+    Locate Authorize.Net apiLoginID + clientKey from:
+      1. Inline HTML / JS variables (most common)
+      2. Loaded Accept.js script bodies fetched from origin
+      3. Live intercept data in page JS
+
+    Returns (apiLoginID, clientKey) or ('', '') if not found.
+    """
+    combined = html
+
+    # ── Fetch Accept.js scripts from origin for deeper scan ──────────────
+    if origin:
+        _AUTHNET_SCRIPT_PATS = [
+            r'accept\.authorize\.net[^"\']*\.js',
+            r'js\.authorize\.net[^"\']*\.js',
+            r'accept(?:js)?[^"\']*\.js',
+        ]
+        _script_urls = re.findall(
+            r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I
+        )
+        for _su in _script_urls:
+            for _sp in _AUTHNET_SCRIPT_PATS:
+                if re.search(_sp, _su, re.I):
+                    _full = _su if _su.startswith('http') else origin.rstrip('/') + '/' + _su.lstrip('/')
+                    try:
+                        _sr = requests.get(_full, timeout=6, verify=False,
+                                           headers=_get_headers())
+                        if _sr.status_code == 200:
+                            combined += '\n' + _sr.text[:60000]
+                            if progress_cb:
+                                progress_cb(f"📥 Authnet: fetched script {_su[-50:]}")
+                    except Exception:
+                        pass
+                    break
+
+    # ── Pattern bank ─────────────────────────────────────────────────────
+    # apiLoginID patterns
+    _LOGIN_PATS = [
+        re.compile(r'apiLoginID\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',     re.I),
+        re.compile(r'api.?login.?id\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']', re.I),
+        re.compile(r'merchantLoginId\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',re.I),
+        re.compile(r'"name"\s*:\s*"([A-Za-z0-9]{4,20})"\s*,\s*"clientKey"',  re.I),
+        re.compile(r'AUTHNET_LOGIN\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',  re.I),
+        re.compile(r'authorize_net_login\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']', re.I),
+        # WooCommerce / plugin config objects
+        re.compile(r'loginId\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',        re.I),
+    ]
+    # clientKey / publicClientKey patterns
+    _KEY_PATS = [
+        re.compile(r'clientKey\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']',     re.I),
+        re.compile(r'public.?client.?key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'publicClientKey\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        re.compile(r'AUTHNET_KEY\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']',   re.I),
+        re.compile(r'authorize_net_key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,200})["\']', re.I),
+        # JSON object context: "clientKey": "..."
+        re.compile(r'"clientKey"\s*:\s*"([A-Za-z0-9+/=]{20,200})"',              re.I),
+    ]
+
+    login_id   = ''
+    client_key = ''
+
+    for pat in _LOGIN_PATS:
+        m = pat.search(combined)
+        if m:
+            login_id = m.group(1)
+            break
+
+    for pat in _KEY_PATS:
+        m = pat.search(combined)
+        if m:
+            client_key = m.group(1)
+            break
+
+    return login_id, client_key
+
+
 def _run_payload_flow_sync(
     data: dict,
     progress_cb=None,
@@ -33639,6 +34474,105 @@ def _run_payload_flow_sync(
                 "⚠️ Step 2: Stripe detected but pk_ key missing — "
                 "skipping tokenization"
             )
+
+    elif 'Authorize' in gateway_name or 'Authorize.Net' in gateway_name:
+        # ── Authorize.Net Accept.js tokenization ──────────────────────
+        if progress_cb:
+            progress_cb("💳 Step 2: Authorize.Net — locating apiLoginID + clientKey...")
+
+        _an_login, _an_key = _find_authnet_keys(
+            init_html,
+            data.get('base_url', ''),
+            progress_cb,
+        )
+
+        if _an_login and _an_key:
+            if progress_cb:
+                progress_cb(
+                    f"🔑 Authorize.Net — apiLoginID:`{_an_login[:12]}…`  "
+                    f"clientKey:`{_an_key[:16]}…`"
+                )
+            # Store for later use in body injection + report
+            resolved['_authnet_login_id'] = {'value': _an_login, 'confidence': 'live'}
+            resolved['_authnet_client_key'] = {'value': _an_key, 'confidence': 'live'}
+
+            # Call Accept.js tokenize endpoint
+            _an_env = (
+                'https://jstest.authorize.net/v1/request'
+                if 'test' in _an_login.lower() or len(_an_login) < 8
+                else 'https://js.authorize.net/v1/request'
+            )
+            try:
+                if progress_cb:
+                    progress_cb("🔄 Authorize.Net — calling Accept.js tokenize endpoint...")
+                _an_resp = requests.post(
+                    _an_env,
+                    json={
+                        'securePaymentContainerRequest': {
+                            'merchantAuthentication': {
+                                'name':           _an_login,
+                                'clientKey':      _an_key,
+                            },
+                            'data': {
+                                'type':     'TOKEN',
+                                'id':       'payflow-probe',
+                                'token': {
+                                    'cardNumber':     '4111111111111111',
+                                    'expirationDate': '1229',
+                                    'cardCode':       '123',
+                                },
+                            },
+                        }
+                    },
+                    headers={
+                        'Content-Type': 'application/json',
+                        'Accept':       'application/json',
+                    },
+                    timeout=15,
+                    verify=True,
+                )
+                _an_body = _an_resp.json()
+                _an_msgs = _an_body.get('messages', {})
+                _an_result_code = _an_msgs.get('resultCode', '')
+                if _an_result_code == 'Ok':
+                    _an_opaque = _an_body.get('opaqueData', {})
+                    _an_data_value = _an_opaque.get('dataValue', '')
+                    _an_data_desc  = _an_opaque.get('dataDescriptor', '')
+                    token_type = 'authnet_opaque'
+                    # Store opaque token as best token for body injection
+                    resolved['_authnet_opaque_value'] = {
+                        'value': _an_data_value, 'confidence': 'live',
+                    }
+                    resolved['_authnet_opaque_desc'] = {
+                        'value': _an_data_desc, 'confidence': 'live',
+                    }
+                    if progress_cb:
+                        progress_cb(
+                            f"✅ Step 2 Authorize.Net opaqueData: "
+                            f"`{_an_data_value[:20]}…`  "
+                            f"desc:`{_an_data_desc}`"
+                        )
+                else:
+                    _an_err_msgs = _an_msgs.get('message', [{}])
+                    _an_err_text = _an_err_msgs[0].get('text', '?') if _an_err_msgs else '?'
+                    token_type = 'direct'
+                    if progress_cb:
+                        progress_cb(
+                            f"⚠️ Step 2 Authorize.Net tokenize failed: "
+                            f"{_an_err_text[:80]}"
+                        )
+            except Exception as _ane:
+                token_type = 'direct'
+                if progress_cb:
+                    progress_cb(f"⚠️ Step 2 Authorize.Net error: {str(_ane)[:60]}")
+        else:
+            token_type = 'direct'
+            if progress_cb:
+                progress_cb(
+                    "⚠️ Step 2 Authorize.Net — apiLoginID/clientKey not found; "
+                    "direct field inject"
+                )
+
     else:
         if progress_cb:
             progress_cb(
@@ -33756,6 +34690,23 @@ def _run_payload_flow_sync(
         ):
             post_body[nm] = _best_token
             continue
+
+        # Priority 2b: Authorize.Net opaqueData injection
+        if token_type == 'authnet_opaque':
+            _an_ov = resolved.get('_authnet_opaque_value', {}).get('value', '')
+            _an_od = resolved.get('_authnet_opaque_desc', {}).get('value', '')
+            if _an_ov and re.search(
+                r'datavalue|opaque.?data|acceptjs.?key|opaque.?value',
+                nm, re.I
+            ):
+                post_body[nm] = _an_ov
+                continue
+            if _an_od and re.search(
+                r'datadescriptor|opaque.?desc',
+                nm, re.I
+            ):
+                post_body[nm] = _an_od
+                continue
 
         # Priority 3: reCAPTCHA — leave empty
         if re.search(r'g-recaptcha-response|recaptcha', nm, re.I):
@@ -33989,11 +34940,128 @@ def _run_payload_flow_sync(
         'response_codes':         live_patterns.get('response_codes', []),
         'stripe_codes':           live_patterns.get('stripe_codes', []),
         'resolved_tokens_used': {
-            k: (v.get('value', '')[:20] + '…')
+            k: {'value': (v.get('value', '')[:60] + ('…' if len(v.get('value','')) > 60 else ''))}
             for k, v in resolved.items()
             if v.get('value')
         },
+        'authnet_login_id':  resolved.get('_authnet_login_id', {}).get('value', '') or None,
+        'authnet_client_key': resolved.get('_authnet_client_key', {}).get('value', '') or None,
+        'authnet_opaque_value': resolved.get('_authnet_opaque_value', {}).get('value', '') or None,
+        'authnet_opaque_desc':  resolved.get('_authnet_opaque_desc', {}).get('value', '') or None,
     }
+
+
+def _build_flow_graph_section(data: dict) -> dict:
+    """
+    `flow_graph` section for the exported JSON.
+
+    Pulls `payflow_timeline` + `xhr_profile` from the data dict and
+    serialises them into a clean, human-readable structure.
+
+    Keys:
+        total_nodes        int
+        total_duration_ms  float | None
+        critical_path      list[int]     — step numbers
+        payment_sequence   list[int]     — step numbers
+        nodes              list[dict]    — full timeline (step/url/method/role/…)
+        role_summary       dict          — role → count
+        dependency_edges   list[dict]    — {from_step, to_step, reason}
+        profiler_stats     dict | None   — XHR profiler summary
+    """
+    tl     = data.get('payflow_timeline') or []
+    prof   = data.get('xhr_profile') or {}
+
+    if not tl:
+        return {
+            'total_nodes':       0,
+            'note': (
+                'Flow graph not available — run /payflow with Playwright enabled '
+                'to populate XHR profiler (Phase 0.5) and role graph (Phase 0.6).'
+            ),
+        }
+
+    # Role summary
+    role_summary: dict[str, int] = {}
+    for _e in tl:
+        role_summary[_e['role']] = role_summary.get(_e['role'], 0) + 1
+
+    # Flatten dependency edges for easy reading
+    dep_edges: list[dict] = []
+    _step_to_role = {_e['step']: _e['role'] for _e in tl}
+    for _e in tl:
+        for _dep_step in _e.get('depends_on', []):
+            dep_edges.append({
+                'from_step':  _dep_step,
+                'from_role':  _step_to_role.get(_dep_step, '?'),
+                'to_step':    _e['step'],
+                'to_role':    _e['role'],
+                'reason':     _dep_edge_reason(
+                    _step_to_role.get(_dep_step, '?'), _e['role']
+                ),
+            })
+
+    # Critical path + payment sequence from profiler (if present)
+    prof_crit  = prof.get('critical_path', [])
+    prof_pay   = prof.get('payment_sequence', [])
+
+    # Derive from timeline if profiler didn't run
+    tl_crit = sorted(
+        _e['step'] for _e in tl
+        if _e.get('depends_on') or _e.get('must_precede')
+    )
+    tl_pay  = sorted(
+        _e['step'] for _e in tl
+        if _e['role'] in _TOKENIZE_ROLES or _e['role'] == 'payment_submit'
+    )
+
+    # Profiler stats summary
+    prof_stats = None
+    if prof and not prof.get('error'):
+        prof_stats = {
+            'total_requests':    prof.get('total_requests', 0),
+            'total_duration_ms': prof.get('total_duration_ms'),
+            'profiler_critical': prof_crit,
+            'profiler_payment':  prof_pay,
+        }
+
+    return {
+        'total_nodes':        len(tl),
+        'total_duration_ms':  prof.get('total_duration_ms'),
+        'critical_path':      tl_crit or prof_crit,
+        'payment_sequence':   tl_pay  or prof_pay,
+        'role_summary':       role_summary,
+        'dependency_edges':   dep_edges,
+        'nodes':              tl,    # full timeline entries
+        'profiler_stats':     prof_stats,
+    }
+
+
+def _dep_edge_reason(from_role: str, to_role: str) -> str:
+    """Human-readable reason for a dependency edge."""
+    _reasons = {
+        ("session_init",     "token_fetch"):       "session cookies required for CSRF fetch",
+        ("session_init",     "stripe_tokenize"):   "session required before tokenization",
+        ("session_init",     "fraud_check"):       "session required for fraud SDK init",
+        ("session_init",     "device_fingerprint"):"session required for fingerprint SDK",
+        ("session_init",     "cart_update"):       "session required for cart mutation",
+        ("session_init",     "payment_submit"):    "session cookies required in POST",
+        ("token_fetch",      "stripe_tokenize"):   "CSRF token injected into Stripe request",
+        ("token_fetch",      "payment_submit"):    "CSRF/nonce token required in POST body",
+        ("stripe_tokenize",  "payment_submit"):    "Stripe pm_/tok_ token injected into POST body",
+        ("braintree_tokenize","payment_submit"):   "Braintree nonce injected into POST body",
+        ("paypal_tokenize",  "payment_submit"):    "PayPal token injected into POST body",
+        ("adyen_tokenize",   "payment_submit"):    "Adyen encrypted card injected into POST body",
+        ("generic_tokenize", "payment_submit"):    "gateway token injected into POST body",
+        ("cart_update",      "payment_submit"):    "cart must be finalised before checkout POST",
+        ("fraud_check",      "payment_submit"):    "fraud score / session ID required in POST",
+        ("device_fingerprint","payment_submit"):   "device fingerprint ID required in POST",
+        ("payment_submit",   "confirmation"):      "confirmation page only reachable after submit",
+        ("payment_submit",   "3ds_challenge"):     "3DS challenge triggered by submit response",
+        ("3ds_challenge",    "payment_submit"):    "second submit attempt after 3DS completion",
+        ("payment_submit",   "webhook_notify"):    "webhook fires after successful transaction",
+    }
+    key = (from_role, to_role)
+    return _reasons.get(key, f"{from_role} output consumed by {to_role}")
 
 
 def _build_payment_flow_json(data: dict) -> str:
@@ -34420,7 +35488,12 @@ def _build_payment_flow_json(data: dict) -> str:
                 'confidence':     'HIGH' if rp.get('verdict') in ('success','decline') else 'LOW',
             },
 
-        ]
+        ],
+
+        # ── Flow Graph — role-classified request dependency tree ──────────
+        # Populated by _build_payflow_timeline() during /payflow execution.
+        # Present only when Phase 0.5 (XHR profiler) + Phase 0.6 (graph) ran.
+        'flow_graph': _build_flow_graph_section(data),
     }
 
     # Strip None values recursively before serialising
@@ -35251,6 +36324,21 @@ def _build_json_export(data: dict) -> str:
             })
         if _embed_exp_out:
             out['embedded_platforms'] = _embed_exp_out
+
+    # ── [14] authnet_keys ────────────────────────────────────────
+    _an_k = data.get('authnet_keys')
+    if _an_k and isinstance(_an_k, tuple) and any(_an_k):
+        _an_l, _an_c = _an_k
+        out['authnet_keys'] = {k: v for k, v in {
+            'apiLoginID': _an_l or None,
+            'clientKey':  _an_c or None,
+            'endpoint': (
+                'https://jstest.authorize.net/v1/request'
+                if _an_l and ('test' in _an_l.lower() or len(_an_l) < 8)
+                else 'https://js.authorize.net/v1/request'
+            ) if _an_l else None,
+            'both_found': bool(_an_l and _an_c),
+        }.items() if v is not None}
 
     safe = _sanitize_for_json(out)
     return json.dumps(safe, indent=2, ensure_ascii=False)
@@ -36121,6 +37209,1046 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
         on_request_cb(f"❌ Playwright error: `{escape_md(str(e))}`")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Request Role Classifier  +  Dependency Graph Builder
+#  ─────────────────────────────────────────────────────────────────────────
+#  _ROLE_RULES         — URL / method / body pattern → role mapping
+#  _classify_request_role(url, method, body) → role str
+#  _build_payflow_timeline(data)             → list[TimelineEntry dict]
+#
+#  TimelineEntry keys:
+#    step         int    — 1-based execution order
+#    url          str
+#    method       str    — GET / POST / PUT …
+#    role         str    — session_init | token_fetch | stripe_tokenize | …
+#    depends_on   list   — step numbers this entry depends on
+#    must_precede list   — step numbers that depend on this entry
+#    timing_ms    int    — round-trip ms (from xhr_profile; None if unknown)
+#    status       int    — HTTP status (None if unknown)
+#    source       str    — "profiler" | "payload" | "live"
+#    label        str    — human-readable one-liner
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Role classification rules ─────────────────────────────────────────────
+# Each entry: (role_name, [(url_re, method_re, body_re), ...])
+# First match wins.  method_re / body_re may be None (= don't-care).
+# Ordered from most-specific (payment gateway) → least-specific (analytics).
+_ROLE_RULES: list[tuple[str, list[tuple]]] = [
+
+    # ── Gateway tokenization ─────────────────────────────────────────
+    ("stripe_tokenize", [
+        (r'api\.stripe\.com/v1/(?:payment_methods|tokens|sources|setup_intents)',
+         r'POST', None),
+    ]),
+    ("braintree_tokenize", [
+        (r'(?:braintreegateway|braintreepayments)\.com',        r'POST', None),
+        (r'payments\.braintree-api\.com',                       r'POST', None),
+    ]),
+    ("paypal_tokenize", [
+        (r'paypal\.com/v[12]/(?:vault|payment-tokens|checkout)',  r'POST', None),
+        (r'paypalobjects\.com',                                   None,    None),
+    ]),
+    ("adyen_tokenize", [
+        (r'adyen\.com/v\d+/(?:paymentMethods|payments|originKeys|clientKey)',
+         r'POST', None),
+        (r'checkoutshopper-live\.adyen\.com',                    None,    None),
+    ]),
+    ("generic_tokenize", [
+        (r'checkout\.com/tokens',                                r'POST', None),
+        (r'squareup\.com/v\d+/(?:cards|payments)',               r'POST', None),
+        (r'cybersource\.com',                                    r'POST', None),
+        (r'authorize\.net/xml/v1',                               r'POST', None),
+        (r'recurly\.com/js/v1',                                  r'POST', None),
+        (r'payeezy',                                             r'POST', None),
+        (r'worldpay\.com',                                       r'POST', None),
+    ]),
+
+    # ── 3DS challenge ────────────────────────────────────────────────
+    ("3ds_challenge", [
+        (r'3ds(?:ecure)?|acs\.(?:3dsecure|visa|mastercard)|'
+         r'creq=|cres=|pareq=|pares=|ThreeDSMethod',             None, None),
+        (r'stripe\.com.*next_action|requires_action',             None, None),
+    ]),
+
+    # ── Fraud / risk checks ──────────────────────────────────────────
+    ("fraud_check", [
+        (r'kount\.(?:com|net)',                          None,    None),
+        (r'siftscience\.com|sift\.com',                  None,    None),
+        (r'signifyd\.com',                               None,    None),
+        (r'forter\.com',                                 None,    None),
+        (r'maxmind\.com',                                None,    None),
+        (r'riskified\.com',                              None,    None),
+        (r'ns8\.com',                                    None,    None),
+        (r'accertify\.com',                              None,    None),
+        (r'cybersource\.com.*risk',                      None,    None),
+        (r'fraud(?:net|score|check|protect)',            None,    None),
+        (r'/risk(?:[-_/]|$)',                            None,    None),
+    ]),
+
+    # ── Device fingerprinting ────────────────────────────────────────
+    ("device_fingerprint", [
+        (r'threatmetrix\.com|h\.online-metrix\.net',    None,    None),
+        (r'iovation\.com',                              None,    None),
+        (r'sardine(?:ai)?\.ai',                         None,    None),
+        (r'fingerprintjs\.com|fp\.io',                  None,    None),
+        (r'datadome\.co',                               None,    None),
+        (r'px-cdn\.net|perimeterx\.net',                None,    None),
+        (r'device[-_]?fingerprint|dfp[-_]?token',       None,    None),
+        (r'iovation|deviceprint|deviceid',              None,    None),
+    ]),
+
+    # ── Address / postal validation ──────────────────────────────────
+    ("address_validate", [
+        (r'address(?:[-_/]?validate|[-_/]?verify|[-_/]?lookup)',  None, None),
+        (r'usps\.com|smartystreets\.com|lob\.com/v1/us',          None, None),
+        (r'postcode(?:anywhere|lookup)|zipcode.*valid',            None, None),
+        (r'/api/(?:address|postal|zip)',                           r'GET|POST', None),
+    ]),
+
+    # ── Cart operations ──────────────────────────────────────────────
+    ("cart_update", [
+        (r'/(?:cart|basket|bag)(?:/|$)',                r'POST|PUT|PATCH|DELETE', None),
+        (r'add(?:[-_]?to)?[-_]?cart|update[-_]?cart',  r'POST|PUT',              None),
+        (r'/(?:checkout/)?(?:add|remove|update)',       r'POST|PUT|DELETE',       None),
+    ]),
+
+    # ── Session init / CSRF token fetch ─────────────────────────────
+    ("token_fetch", [
+        (r'/(?:csrf|xsrf|nonce|form[-_]?token)',         r'GET|POST',  None),
+        (r'(?:csrf|xsrf)[_-]?token',                     r'GET',       None),
+        (r'/api/(?:session|auth/token|user/token)',       r'GET|POST',  None),
+        (r'_token|authenticity_token|wp-nonce',          None,         None),
+        # Response body hint — POST that returns a token
+        (r'token|nonce|csrf',                            r'POST',      r'"token"\s*:'),
+    ]),
+
+    # ── Payment submit (merchant's own endpoint) ─────────────────────
+    ("payment_submit", [
+        (r'/(?:checkout|pay(?:ment)?|order|purchase|charge|subscribe'
+         r'|billing|process[-_]?payment|submit[-_]?order)',
+         r'POST', None),
+        (r'(?:checkout|pay(?:ment)?|order)/(?:create|submit|complete|confirm|process)',
+         r'POST', None),
+    ]),
+
+    # ── Confirmation / success page ──────────────────────────────────
+    ("confirmation", [
+        (r'/(?:thank(?:[-_]?you)?|success|confirm(?:ation)?'
+         r'|complete|approved|receipt|order[-_]?(?:complete|confirm))',
+         r'GET|POST', None),
+    ]),
+
+    # ── Webhook outbound ─────────────────────────────────────────────
+    ("webhook_notify", [
+        (r'/webhook(?:s)?(?:/|$)|/notify(?:/|$)|/callback(?:/|$)'
+         r'|/ipn(?:/|$)',
+         r'POST', None),
+    ]),
+
+    # ── Analytics / tracking (lowest priority) ──────────────────────
+    ("analytics", [
+        (r'google(?:tagmanager|analytics|syndication)\.com'
+         r'|gtag|ga\.js|analytics\.js|gtm\.js',          None, None),
+        (r'facebook\.com/tr|fbq|fbevents\.js|connect\.facebook',  None, None),
+        (r'segment\.(?:com|io)|analytics\.segment',       None, None),
+        (r'mixpanel\.com',                                 None, None),
+        (r'hotjar\.com|mouseflow\.com|fullstory\.com',     None, None),
+        (r'doubleclick\.net|adsense|googlesyndication',    None, None),
+        (r'/(?:analytics|telemetry|metrics|events|tracking|beacon)',
+         None, None),
+    ]),
+
+    # ── CDN assets (static, lowest priority) ────────────────────────
+    ("cdn_asset", [
+        (r'\.(?:js|css|woff2?|ttf|eot|svg|png|jpg|gif|ico|webp|mp4)(?:\?|$)',
+         r'GET', None),
+        (r'cdn\.|static\.|assets\.|fonts\.googleapis',    r'GET', None),
+    ]),
+]
+
+# Role display metadata  →  (emoji, human label, execution_tier)
+# tier:  1=must-first  2=pre-payment  3=tokenization  4=submit  5=post  6=async
+_ROLE_META: dict[str, tuple[str, str, int]] = {
+    "session_init":     ("🔑", "Session init",         1),
+    "token_fetch":      ("🎟️", "CSRF / token fetch",   2),
+    "fraud_check":      ("🛡️", "Fraud check",          2),
+    "device_fingerprint":("🖥️","Device fingerprint",   2),
+    "cart_update":      ("🛒", "Cart update",           2),
+    "address_validate": ("📮", "Address validation",    2),
+    "stripe_tokenize":  ("💳", "Stripe tokenize",       3),
+    "braintree_tokenize":("💳","Braintree tokenize",    3),
+    "paypal_tokenize":  ("💳", "PayPal tokenize",       3),
+    "adyen_tokenize":   ("💳", "Adyen tokenize",        3),
+    "generic_tokenize": ("💳", "Gateway tokenize",      3),
+    "payment_submit":   ("💰", "Payment submit",        4),
+    "3ds_challenge":    ("🔐", "3DS challenge",         4),
+    "confirmation":     ("✅", "Confirmation",          5),
+    "webhook_notify":   ("📣", "Webhook notify",        5),
+    "analytics":        ("📊", "Analytics",             6),
+    "cdn_asset":        ("📦", "CDN asset",             6),
+    "other":            ("❓", "Other",                 6),
+}
+
+# Role-based dependency rules:
+# {role: [roles that must run before it]}
+_ROLE_DEP_RULES: dict[str, list[str]] = {
+    "token_fetch":       ["session_init"],
+    "fraud_check":       ["session_init"],
+    "device_fingerprint":["session_init"],
+    "cart_update":       ["session_init"],
+    "address_validate":  ["session_init"],
+    "stripe_tokenize":   ["session_init", "token_fetch"],
+    "braintree_tokenize":["session_init", "token_fetch"],
+    "paypal_tokenize":   ["session_init", "token_fetch"],
+    "adyen_tokenize":    ["session_init", "token_fetch"],
+    "generic_tokenize":  ["session_init", "token_fetch"],
+    "payment_submit":    ["session_init", "token_fetch",
+                          "cart_update", "fraud_check"],
+    "3ds_challenge":     ["payment_submit"],
+    "confirmation":      ["payment_submit"],
+    "webhook_notify":    ["payment_submit"],
+}
+
+_TOKENIZE_ROLES = frozenset({
+    "stripe_tokenize", "braintree_tokenize", "paypal_tokenize",
+    "adyen_tokenize",  "generic_tokenize",
+})
+
+
+def _classify_request_role(
+    url: str,
+    method: str,
+    body: str = "",
+    resource_type: str = "",
+) -> str:
+    """
+    URL + method + (optional) body を見て request の role を返す。
+
+    Args:
+        url:           full request URL
+        method:        HTTP method (GET, POST, …)
+        body:          request / response body snippet (optional)
+        resource_type: Playwright resource_type (optional)
+
+    Returns:
+        role string — one of the keys in _ROLE_META
+    """
+    url_l    = (url   or "").lower()
+    method_u = (method or "GET").upper()
+    body_l   = (body  or "").lower()[:2000]
+
+    # URL-pattern rules run first — even for document resource_type.
+    # This ensures /thank-you → confirmation and /checkout/pay → payment_submit
+    # even when they are full page navigations.
+    for role, patterns in _ROLE_RULES:
+        # Skip cdn_asset and analytics in URL-first pass for documents
+        # (a page load to gtm.js domain should still be session_init)
+        if resource_type == "document" and role in ("cdn_asset", "analytics", "other"):
+            continue
+        for url_pat, method_pat, body_pat in patterns:
+            if url_pat and not re.search(url_pat, url_l, re.I):
+                continue
+            if method_pat and not re.search(method_pat, method_u, re.I):
+                continue
+            if body_pat and not re.search(body_pat, body_l, re.I):
+                continue
+            return role
+
+    # Fallback: any document (page load) that didn't match a specific role
+    # is treated as session initialisation.
+    if resource_type == "document":
+        return "session_init"
+
+    return "other"
+
+
+def _build_payflow_timeline(data: dict) -> list[dict]:
+    """
+    data dict (from _payload_sync + xhr_profile + flow_result) ထဲက
+    requests အားလုံးကို ပေါင်းစပ်ပြီး:
+
+      1. Role classify (session_init, stripe_tokenize, payment_submit …)
+      2. Dependency graph တည်ဆောက်သည် —
+           a) profiler timeline ၏ token-based deps
+           b) role-ordering rules  (_ROLE_DEP_RULES)
+      3. Topological sort → step numbers assign
+      4. must_precede list compute (inverse of depends_on)
+
+    Returns:
+        Ordered list of TimelineEntry dicts.
+        Returns [] if no requests found.
+    """
+
+    # ─────────────────────────────────────────────────────────────────
+    # 1. Collect raw requests from all sources
+    # ─────────────────────────────────────────────────────────────────
+    _raw: list[dict] = []   # {url, method, role, timing_ms, status, source, body, res_type, prof_deps}
+
+    # Source A — xhr_profile timeline (highest fidelity: has timing + token deps)
+    _prof = data.get("xhr_profile", {})
+    _prof_tl = _prof.get("timeline", []) if isinstance(_prof, dict) else []
+    for _pe in _prof_tl:
+        _raw.append({
+            "url":        _pe.get("url", ""),
+            "method":     _pe.get("method", "GET"),
+            "timing_ms":  _pe.get("duration_ms"),
+            "status":     _pe.get("status"),
+            "source":     "profiler",
+            "body":       "",
+            "res_type":   _pe.get("resource_type", ""),
+            "prof_deps":  _pe.get("dependencies", []),   # token-dep seq numbers (profiler)
+            "prof_seq":   _pe.get("seq"),
+            "is_payment": _pe.get("is_payment", False),
+            "is_tokenize":_pe.get("is_tokenization", False),
+        })
+
+    # Source B — data['requests'] from _payload_sync (Playwright intercept)
+    _seen_urls: set[str] = {r["url"] for r in _raw}
+    for _req in (data.get("requests") or []):
+        _u = _req.get("url") or _req.get("endpoint") or ""
+        if not _u or _u in _seen_urls:
+            continue
+        _seen_urls.add(_u)
+        _raw.append({
+            "url":        _u,
+            "method":     (_req.get("method") or "GET").upper(),
+            "timing_ms":  None,
+            "status":     _req.get("status"),
+            "source":     "payload",
+            "body":       str(_req.get("body") or _req.get("post_data") or "")[:500],
+            "res_type":   _req.get("resource_type", ""),
+            "prof_deps":  [],
+            "prof_seq":   None,
+            "is_payment": bool(_req.get("is_payment")),
+            "is_tokenize":False,
+        })
+
+    # Source C — data['live_result']['live_requests']
+    _live = data.get("live_result", {})
+    if isinstance(_live, dict):
+        for _lr in (_live.get("live_requests") or []):
+            _u = _lr.get("url") or _lr.get("endpoint") or ""
+            if not _u or _u in _seen_urls:
+                continue
+            _seen_urls.add(_u)
+            _raw.append({
+                "url":        _u,
+                "method":     (_lr.get("method") or "POST").upper(),
+                "timing_ms":  None,
+                "status":     _lr.get("status"),
+                "source":     "live",
+                "body":       str(_lr.get("body") or _lr.get("request_body") or "")[:500],
+                "res_type":   "",
+                "prof_deps":  [],
+                "prof_seq":   None,
+                "is_payment": bool(_lr.get("is_payment")),
+                "is_tokenize":False,
+            })
+
+    # Source D — forms (action URLs as synthetic POST entries)
+    for _form in (data.get("forms") or []):
+        _u = _form.get("action") or _form.get("endpoint") or ""
+        if not _u or _u in _seen_urls:
+            continue
+        _seen_urls.add(_u)
+        _raw.append({
+            "url":        _u,
+            "method":     (_form.get("method") or "POST").upper(),
+            "timing_ms":  None,
+            "status":     None,
+            "source":     "form",
+            "body":       "",
+            "res_type":   "",
+            "prof_deps":  [],
+            "prof_seq":   None,
+            "is_payment": bool(_form.get("is_payment")),
+            "is_tokenize":False,
+        })
+
+    if not _raw:
+        return []
+
+    # ─────────────────────────────────────────────────────────────────
+    # 2. Classify roles
+    # ─────────────────────────────────────────────────────────────────
+    for _r in _raw:
+        # Fast-path: profiler already flagged tokenization / payment
+        if _r["is_tokenize"]:
+            _r["role"] = _classify_request_role(
+                _r["url"], _r["method"], _r["body"], _r["res_type"])
+            if _r["role"] == "other":
+                _r["role"] = "generic_tokenize"
+        elif _r["is_payment"]:
+            _r["role"] = _classify_request_role(
+                _r["url"], _r["method"], _r["body"], _r["res_type"])
+            if _r["role"] == "other":
+                _r["role"] = "payment_submit"
+        else:
+            _r["role"] = _classify_request_role(
+                _r["url"], _r["method"], _r["body"], _r["res_type"])
+
+    # ─────────────────────────────────────────────────────────────────
+    # 3. Assign internal IDs + build role-bucket lookup
+    # ─────────────────────────────────────────────────────────────────
+    for _i, _r in enumerate(_raw):
+        _r["_id"] = _i    # 0-based internal ID
+
+    # role → list of _ids
+    _role_bucket: dict[str, list[int]] = {}
+    for _r in _raw:
+        _role_bucket.setdefault(_r["role"], []).append(_r["_id"])
+
+    # ─────────────────────────────────────────────────────────────────
+    # 4. Build dependency graph
+    # ─────────────────────────────────────────────────────────────────
+    # adj[id] = set of _ids it depends on
+    _adj: dict[int, set[int]] = {_r["_id"]: set() for _r in _raw}
+
+    # 4a — profiler token-based deps (prof_seq → _id mapping)
+    _prof_seq_to_id: dict[int, int] = {
+        _r["prof_seq"]: _r["_id"]
+        for _r in _raw if _r["prof_seq"] is not None
+    }
+    for _r in _raw:
+        for _dep_prof_seq in _r["prof_deps"]:
+            _dep_id = _prof_seq_to_id.get(_dep_prof_seq)
+            if _dep_id is not None and _dep_id != _r["_id"]:
+                _adj[_r["_id"]].add(_dep_id)
+
+    # 4b — role ordering rules
+    for _r in _raw:
+        _role = _r["role"]
+        _prereq_roles = _ROLE_DEP_RULES.get(_role, [])
+        for _prereq_role in _prereq_roles:
+            for _prereq_id in _role_bucket.get(_prereq_role, []):
+                if _prereq_id != _r["_id"]:
+                    _adj[_r["_id"]].add(_prereq_id)
+
+        # Extra rule: payment_submit depends on whichever tokenization role is present
+        if _role == "payment_submit":
+            for _tok_role in _TOKENIZE_ROLES:
+                for _tok_id in _role_bucket.get(_tok_role, []):
+                    _adj[_r["_id"]].add(_tok_id)
+
+    # ─────────────────────────────────────────────────────────────────
+    # 5. Topological sort (Kahn's algorithm) to get execution order
+    #    Falls back to tier-sort if cycle detected
+    # ─────────────────────────────────────────────────────────────────
+    _in_degree = {_id: 0 for _id in _adj}
+    for _id, _deps in _adj.items():
+        for _d in _deps:
+            _in_degree[_id] += 1
+
+    # Kahn
+    from collections import deque as _deque
+    _queue = _deque(
+        sorted(
+            [_id for _id, _deg in _in_degree.items() if _deg == 0],
+            key=lambda _id: _ROLE_META.get(_raw[_id]["role"], ("", "", 6))[2]
+        )
+    )
+    _topo_order: list[int] = []
+    _visited: set[int] = set()
+
+    while _queue:
+        _cur = _queue.popleft()
+        if _cur in _visited:
+            continue
+        _visited.add(_cur)
+        _topo_order.append(_cur)
+        # Find nodes that depended on _cur
+        _next_candidates = [
+            _r["_id"] for _r in _raw
+            if _cur in _adj[_r["_id"]] and _r["_id"] not in _visited
+        ]
+        for _nc in _next_candidates:
+            _in_degree[_nc] -= 1
+            if _in_degree[_nc] == 0:
+                _queue.append(_nc)
+
+    # Any remaining nodes (cycle) — append by tier
+    _remaining = [
+        _r["_id"] for _r in _raw if _r["_id"] not in _visited
+    ]
+    _remaining.sort(
+        key=lambda _id: _ROLE_META.get(_raw[_id]["role"], ("", "", 6))[2]
+    )
+    _topo_order.extend(_remaining)
+
+    # ─────────────────────────────────────────────────────────────────
+    # 6. Build final timeline + compute must_precede
+    # ─────────────────────────────────────────────────────────────────
+    # _id → step number (1-based)
+    _id_to_step: dict[int, int] = {
+        _id: (_step_idx + 1)
+        for _step_idx, _id in enumerate(_topo_order)
+    }
+
+    timeline: list[dict] = []
+    for _step_idx, _id in enumerate(_topo_order):
+        _r     = _raw[_id]
+        _role  = _r["role"]
+        _meta  = _ROLE_META.get(_role, ("❓", _role, 6))
+        _emoji = _meta[0]
+        _label = _meta[1]
+
+        _dep_steps     = sorted(_id_to_step[_d] for _d in _adj[_id] if _d in _id_to_step)
+        _must_prec_steps = sorted(
+            _id_to_step[_r2["_id"]]
+            for _r2 in _raw
+            if _id in _adj[_r2["_id"]] and _r2["_id"] in _id_to_step
+        )
+
+        # Host shortener for display
+        _parsed_url = urlparse(_r["url"])
+        _short_host = (_parsed_url.hostname or "").replace("www.", "")
+        _short_path = (_parsed_url.path or "").rstrip("/")
+        _path_tail  = "/".join(
+            [p for p in _short_path.split("/") if p][-2:]
+        ) or "/"
+
+        timeline.append({
+            "step":         _step_idx + 1,
+            "url":          _r["url"],
+            "method":       _r["method"],
+            "role":         _role,
+            "depends_on":   _dep_steps,
+            "must_precede": _must_prec_steps,
+            "timing_ms":    int(_r["timing_ms"]) if _r["timing_ms"] is not None else None,
+            "status":       _r["status"],
+            "source":       _r["source"],
+            "label":        f"{_emoji} {_label} — {_r['method']} {_short_host}/{_path_tail}",
+        })
+
+    return timeline
+
+
+def _format_payflow_timeline(
+    timeline: list[dict],
+    max_rows: int = 20,
+) -> str:
+    """
+    _build_payflow_timeline() ရဲ့ output ကို Telegram MarkdownV1 string
+    အနေနဲ့ format လုပ်ပေးသည်。
+    """
+    if not timeline:
+        return "❌ No requests to profile."
+
+    lines = [f"📋 *Flow Timeline — {len(timeline)} requests*\n"]
+
+    # Group by tier for cleaner display
+    _tier_names = {
+        1: "① Session",
+        2: "② Pre-payment",
+        3: "③ Tokenization",
+        4: "④ Submit",
+        5: "⑤ Post-payment",
+        6: "⑥ Async/Static",
+    }
+    _current_tier = None
+
+    shown = 0
+    for _e in timeline:
+        if shown >= max_rows:
+            lines.append(f"  _…+ {len(timeline) - shown} more_")
+            break
+        _role   = _e["role"]
+        _tier   = _ROLE_META.get(_role, ("", "", 6))[2]
+
+        if _tier != _current_tier:
+            _current_tier = _tier
+            lines.append(f"\n*{_tier_names.get(_tier, f'Tier {_tier}')}*")
+
+        _dep_str  = (
+            "← `" + ", ".join(f"#{d}" for d in _e["depends_on"][:3]) + "`"
+        ) if _e["depends_on"] else ""
+        _prec_str = (
+            "→ `" + ", ".join(f"#{p}" for p in _e["must_precede"][:3]) + "`"
+        ) if _e["must_precede"] else ""
+        _timing   = f"`{_e['timing_ms']}ms`" if _e["timing_ms"] is not None else ""
+        _status   = f"`{_e['status']}`" if _e["status"] else ""
+        _src_icon = {"profiler":"🔬","payload":"📄","live":"🔴","form":"📝"}.get(
+            _e["source"], "❓")
+
+        lines.append(
+            f"  `#{_e['step']}` {escape_md(_e['label'][:48])} "
+            f"{_status} {_timing} {_dep_str} {_prec_str} {_src_icon}"
+        )
+        shown += 1
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /payflow — Phase 0.7: Realtime Live Intercept
+#  ─────────────────────────────────────────────────────────────────────────
+#  _payflow_live_intercept_sync(url, progress_cb)
+#
+#  _payloadlive_sync ထက် deeper:
+#    • response body ကိုပါ capture (token extraction)
+#    • requestfinished hook ဖြင့် round-trip timing record
+#    • CSRF / nonce / session token live extraction
+#    • 3DS signal detection (requires_action, ACS redirect)
+#    • gateway tokenization hit logging
+#    • request_sequence list (role-classified, ordered by t_ms)
+#
+#  Returns:
+#    {
+#      "live_requests":    list[dict]   — raw intercepted entries
+#      "live_findings":    list[dict]   — high-confidence secrets
+#      "csrf_tokens":      list[str]    — raw CSRF / nonce values captured
+#      "tokenization_hit": str | None   — gateway name if hit
+#      "threeds_triggered":bool
+#      "request_sequence": list[dict]   — role-classified ordered list
+#      "capture_duration_ms": float
+#      "total_captured":   int
+#      "error":            str | None
+#    }
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Patterns to detect 3DS signals in response bodies
+_LI_3DS_RE = re.compile(
+    r'requires_action|next_action|redirect_to_url'
+    r'|ChallengeShopper|creq=|threeDSMethodData'
+    r'|acs[-_]?url|pareq|authenticate.*3d',
+    re.I
+)
+
+# Live CSRF / nonce token extraction from response bodies
+_LI_CSRF_RE = re.compile(
+    # Matches JSON/form/header style:  "csrf_token": "VALUE"
+    # AND HTML meta style: <meta name="csrf-token" content="VALUE">
+    r'(?:csrf[_\-]?token|_token|authenticity_token|nonce|xsrf[_\-]?token'
+    r'|__requestverificationtoken|form_key|wp_nonce|anti[-_]?forgery)'
+    r'(?:["\'\s:=]+|[^>]*\bcontent=["\'])'    # JSON/header OR HTML content attr
+    r'([A-Za-z0-9_\-/+=]{20,128})',
+    re.I
+)
+
+# High-value secrets to scan in live response bodies
+_LI_SECRET_RE = re.compile(
+    r'(?P<stripe_pk>pk_(?:live|test)_[A-Za-z0-9]{24,})'
+    r'|(?P<stripe_sk>sk_(?:live|test)_[A-Za-z0-9]{24,})'
+    r'|(?P<stripe_tok>(?:tok|pm|pi|seti|cs)_[A-Za-z0-9_]{16,})'
+    r'|(?P<bt_nonce>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
+                  r'-[0-9a-f]{4}-[0-9a-f]{12})'      # Braintree nonce (UUID)
+    r'|(?P<jwt>ey[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}'
+             r'\.[A-Za-z0-9_\-]{8,})',                # JWT (header.payload.sig)
+    re.I
+)
+
+# Request types that matter for live capture (skip static)
+_LI_SKIP_RE = re.compile(
+    r'\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|mp4|webp|avif)(\?|$)',
+    re.I
+)
+
+# Minimum response body read for secret scan (bytes)
+_LI_MAX_BODY = 256_000
+
+
+def _payflow_live_intercept_sync(
+    url: str,
+    progress_cb=None,
+    capture_sec: int = 18,
+) -> dict:
+    """
+    Phase 0.7 — Realtime live intercept for /payflow.
+
+    Playwright ဖြင့် page load + user-interaction simulation ကာ
+    network traffic ကို deep capture လုပ်သည်:
+
+      • request + requestfinished hooks → timing, body, status
+      • response hook → CSRF/nonce extraction, secret scan, 3DS detect
+      • Card field focus → tokenization SDK init calls trigger
+      • CSRF form field capture → live token values
+      • Gateway tokenization URL hit detection + logging
+
+    Returns:
+        {
+          live_requests, live_findings, csrf_tokens, tokenization_hit,
+          threeds_triggered, request_sequence, capture_duration_ms,
+          total_captured, error
+        }
+    """
+    if not PLAYWRIGHT_OK:
+        return {
+            "error": "playwright_not_installed",
+            "live_requests": [], "live_findings": [], "csrf_tokens": [],
+            "tokenization_hit": None, "threeds_triggered": False,
+            "request_sequence": [], "capture_duration_ms": 0.0,
+            "total_captured": 0,
+        }
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {
+            "error": "playwright_not_installed",
+            "live_requests": [], "live_findings": [], "csrf_tokens": [],
+            "tokenization_hit": None, "threeds_triggered": False,
+            "request_sequence": [], "capture_duration_ms": 0.0,
+            "total_captured": 0,
+        }
+
+    import time as _t
+
+    if progress_cb:
+        progress_cb("🔴 Phase 0.7 — launching live intercept browser...")
+
+    # ── Shared state ───────────────────────────────────────────────────────
+    _live_requests: list[dict]  = []
+    _live_findings: list[dict]  = []
+    _csrf_tokens:   list[str]   = []
+    _threeds_hit    = [False]
+    _tok_hit        = [None]     # tokenization gateway name
+    _seq_ctr        = [0]
+    _t0             = [None]
+    _req_map: dict[str, dict]   = {}   # url+method → in-flight entry
+    _seen_secrets: set[str]     = set()
+    _seen_csrf:    set[str]     = set()
+
+    def _rel_ms() -> float:
+        now = _t.monotonic() * 1000.0
+        if _t0[0] is None:
+            _t0[0] = now
+        return round(now - _t0[0], 2)
+
+    # ── Request hook ───────────────────────────────────────────────────────
+    def _on_req(req):
+        if _LI_SKIP_RE.search(req.url) and req.method == "GET":
+            return
+        _seq_ctr[0] += 1
+        t = _rel_ms()
+        key = f"{req.method}:{req.url[:180]}"
+        entry = {
+            "seq":         _seq_ctr[0],
+            "t_start_ms":  t,
+            "method":      req.method,
+            "url":         req.url,
+            "resource_type": req.resource_type,
+            "post_data":   "",
+            "status":      None,
+            "duration_ms": None,
+            "role":        _classify_request_role(
+                               req.url, req.method, "", req.resource_type),
+        }
+        try:
+            entry["post_data"] = (req.post_data or "")[:1200]
+        except Exception:
+            pass
+
+        # Detect tokenization gateway
+        _tok = _detect_tokenization_url(req.url)
+        if _tok and req.method in ("POST", "PUT"):
+            entry["tokenization"] = _tok[0]
+            if not _tok_hit[0]:
+                _tok_hit[0] = _tok[0]
+                if progress_cb:
+                    progress_cb(
+                        f"💳 Phase 0.7 — {_tok[1]} tokenization call intercepted!"
+                    )
+
+        _req_map[key] = entry
+
+    # ── RequestFinished hook — timing + response body ──────────────────────
+    def _on_req_finished(req):
+        if _LI_SKIP_RE.search(req.url) and req.method == "GET":
+            return
+        t_end = _rel_ms()
+        key   = f"{req.method}:{req.url[:180]}"
+        entry = _req_map.get(key)
+        if not entry:
+            return
+
+        entry["t_end_ms"]    = t_end
+        entry["duration_ms"] = round(t_end - entry["t_start_ms"], 2)
+
+        try:
+            resp = req.response()
+            if resp:
+                entry["status"] = resp.status
+                entry["resp_headers"] = dict(list(resp.headers.items())[:12])
+
+                # Read response body for scanning
+                ct = (resp.headers.get("content-type") or "").lower()
+                if any(x in ct for x in ("json", "html", "javascript",
+                                          "text", "xml")):
+                    try:
+                        cl = int(resp.headers.get("content-length") or 0)
+                        if cl <= _LI_MAX_BODY or cl == 0:
+                            body_bytes = resp.body()
+                            body_text  = body_bytes.decode(
+                                "utf-8", errors="replace")[:8000]
+                            entry["resp_body_snippet"] = body_text[:400]
+
+                            # ── CSRF / nonce token extraction ──────────
+                            for _cm in _LI_CSRF_RE.finditer(body_text):
+                                _tv = _cm.group(1)
+                                if _tv not in _seen_csrf:
+                                    _seen_csrf.add(_tv)
+                                    _csrf_tokens.append(_tv)
+
+                            # ── 3DS signal detection ───────────────────
+                            if _LI_3DS_RE.search(body_text):
+                                _threeds_hit[0] = True
+                                if progress_cb:
+                                    progress_cb("🔐 Phase 0.7 — 3DS signal detected!")
+
+                            # ── Secret scan ────────────────────────────
+                            for _sm in _LI_SECRET_RE.finditer(body_text):
+                                for _gname, _gval in _sm.groupdict().items():
+                                    if not _gval:
+                                        continue
+                                    _dedup = _gval[:32]
+                                    if _dedup in _seen_secrets:
+                                        continue
+                                    _seen_secrets.add(_dedup)
+                                    _type_map = {
+                                        "stripe_pk":  "Stripe PK",
+                                        "stripe_sk":  "Stripe SK ⚠️",
+                                        "stripe_tok": "Stripe Token",
+                                        "bt_nonce":   "Braintree Nonce",
+                                        "jwt":        "JWT Token",
+                                    }
+                                    _live_findings.append({
+                                        "type":          _type_map.get(_gname, _gname),
+                                        "value_preview": _gval[:40] + "…",
+                                        "source_url":    req.url[:80],
+                                        "confidence":    "HIGH",
+                                        "phase":         "0.7_live_intercept",
+                                    })
+                                    if progress_cb:
+                                        progress_cb(
+                                            f"🚨 Phase 0.7 — {_type_map.get(_gname, _gname)} "
+                                            f"found in live traffic!"
+                                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        _live_requests.append(entry)
+
+    # ── Run Playwright ─────────────────────────────────────────────────────
+    _t_start_wall = _t.monotonic()
+
+    try:
+        with sync_playwright() as pw:
+            # Proxy
+            _pw_proxy = None
+            try:
+                _px = proxy_manager.get_proxy()
+                if _px:
+                    from urllib.parse import urlparse as _up_li
+                    _pp = _up_li(_px.get("http") or _px.get("https", ""))
+                    _pw_proxy = {
+                        "server": f"{_pp.scheme}://{_pp.hostname}:{_pp.port}"
+                    }
+                    if _pp.username:
+                        _pw_proxy["username"] = _pp.username
+                        _pw_proxy["password"] = _pp.password or ""
+            except Exception:
+                pass
+
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-gpu",
+                ],
+                proxy=_pw_proxy,
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 900},
+                ignore_https_errors=True,
+                java_script_enabled=True,
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+                    ),
+                },
+            )
+            # Stealth
+            ctx.add_init_script("""
+                Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+                Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+                Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+                Object.defineProperty(navigator,'platform',{get:()=>'Win32'});
+                Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>8});
+            """)
+
+            page = ctx.new_page()
+            page.on("request",          _on_req)
+            page.on("requestfinished",  _on_req_finished)
+
+            # ── Navigate ──────────────────────────────────────────
+            if progress_cb:
+                _h = urlparse(url).hostname or url
+                progress_cb(f"🔴 Phase 0.7 — navigating {_h}...")
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except PWTimeout:
+                pass
+            except Exception as _ge:
+                browser.close()
+                return {
+                    "error": str(_ge)[:100],
+                    "live_requests": [], "live_findings": [],
+                    "csrf_tokens": [], "tokenization_hit": None,
+                    "threeds_triggered": False, "request_sequence": [],
+                    "capture_duration_ms": 0.0, "total_captured": 0,
+                }
+
+            # Wait for network to settle
+            try:
+                page.wait_for_load_state("networkidle", timeout=6_000)
+            except Exception:
+                pass
+
+            # ── Interaction simulation ─────────────────────────────
+            # 1. Scroll to trigger lazy-load XHR
+            for _pct in [0.3, 0.6, 1.0]:
+                try:
+                    page.evaluate(
+                        f"window.scrollTo(0,"
+                        f"document.body.scrollHeight*{_pct})"
+                    )
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
+            # 2. Focus card / CSRF fields → trigger tokenization SDK init
+            _FIELD_SELECTORS = [
+                # Card number fields (iframe or direct)
+                "input[name*='card'], input[data-elements-stable-field-name*='cardNumber']",
+                "input[name*='number'][type!='hidden'], input[autocomplete*='cc-number']",
+                # CVV
+                "input[name*='cvv'], input[name*='cvc'], input[name*='security']",
+                # CSRF token fields (focus → SDK reads value from DOM)
+                "input[name*='csrf'], input[name*='_token'], input[name*='nonce']",
+                # Expiry
+                "input[name*='exp'], input[autocomplete*='cc-exp']",
+            ]
+            for _fsel in _FIELD_SELECTORS:
+                try:
+                    _fe = page.query_selector(_fsel)
+                    if _fe and _fe.is_visible():
+                        _fe.scroll_into_view_if_needed()
+                        _fe.focus()
+                        page.wait_for_timeout(200)
+                        _fe.blur()
+                except Exception:
+                    pass
+
+            # 3. Read live CSRF value directly from DOM
+            try:
+                _dom_tokens = page.evaluate("""
+                    () => {
+                        const sels = [
+                            'meta[name*="csrf"]', 'meta[name*="token"]',
+                            'input[name*="csrf"]', 'input[name*="_token"]',
+                            'input[name*="nonce"]', 'input[name="authenticity_token"]',
+                            'input[name*="xsrf"]'
+                        ];
+                        const vals = [];
+                        for (const sel of sels) {
+                            const el = document.querySelector(sel);
+                            if (el) {
+                                const v = el.getAttribute('content') || el.value || '';
+                                if (v && v.length >= 16) vals.push(v);
+                            }
+                        }
+                        return vals;
+                    }
+                """)
+                for _dv in (_dom_tokens or []):
+                    if _dv not in _seen_csrf:
+                        _seen_csrf.add(_dv)
+                        _csrf_tokens.append(_dv)
+            except Exception:
+                pass
+
+            # 4. Extra capture window for async calls
+            _extra_ms = max(0, (capture_sec - 10)) * 1000
+            if _extra_ms > 0:
+                page.wait_for_timeout(int(_extra_ms))
+
+            browser.close()
+
+    except Exception as _pe:
+        return {
+            "error": str(_pe)[:100],
+            "live_requests": _live_requests,
+            "live_findings": _live_findings,
+            "csrf_tokens":   _csrf_tokens,
+            "tokenization_hit":   _tok_hit[0],
+            "threeds_triggered":  _threeds_hit[0],
+            "request_sequence": [],
+            "capture_duration_ms": round(
+                (_t.monotonic() - _t_start_wall) * 1000, 1),
+            "total_captured": len(_live_requests),
+        }
+
+    _cap_ms = round((_t.monotonic() - _t_start_wall) * 1000, 1)
+
+    # ── Build request_sequence — role-classified, time-ordered ────────────
+    _live_requests.sort(key=lambda x: x.get("t_start_ms") or 0)
+    _request_sequence: list[dict] = []
+    for _lr in _live_requests:
+        _meta = _ROLE_META.get(_lr["role"], ("❓", "Other", 6))
+        _request_sequence.append({
+            "seq":         _lr["seq"],
+            "t_start_ms":  _lr["t_start_ms"],
+            "duration_ms": _lr.get("duration_ms"),
+            "method":      _lr["method"],
+            "url":         _lr["url"],
+            "status":      _lr.get("status"),
+            "role":        _lr["role"],
+            "role_label":  _meta[1],
+            "role_emoji":  _meta[0],
+            "tier":        _meta[2],
+            "tokenization":_lr.get("tokenization"),
+        })
+
+    if progress_cb:
+        progress_cb(
+            f"✅ Phase 0.7 complete — "
+            f"{len(_live_requests)} captured, "
+            f"{len(_live_findings)} findings, "
+            f"{len(_csrf_tokens)} CSRF tokens, "
+            f"{_cap_ms}ms"
+        )
+
+    return {
+        "error":              None,
+        "live_requests":      _live_requests,
+        "live_findings":      _live_findings,
+        "csrf_tokens":        _csrf_tokens,
+        "tokenization_hit":   _tok_hit[0],
+        "threeds_triggered":  _threeds_hit[0],
+        "request_sequence":   _request_sequence,
+        "capture_duration_ms":_cap_ms,
+        "total_captured":     len(_live_requests),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/payflow <url> — Run full 4-step payment flow simulation (GET→Stripe→POST→Classify)"""
     if not context.args:
@@ -36229,6 +38357,110 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
 
+    # ── Phase 0.5: XHR Sequence Profiler ─────────────────────────
+    # Playwright ဖြင့် page load ကာလ request timeline + dependency ထုတ်သည်
+    # Playwright မရှိ / error ဆိုရင် skip ပြီး flow ကို ဆက်လုပ်သည်
+    prof_result = {}
+    if PLAYWRIGHT_OK:
+        progress_cb("🕐 Phase 0.5: XHR sequence profiling...")
+        try:
+            prof_result = await run_scan(
+                uid, _xhr_sequence_profiler_sync, url, progress_cb)
+        except asyncio.CancelledError:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+            editor_task.cancel()
+            await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
+            return
+        except Exception as _prof_e:
+            logger.warning(f"payflow profiler error (non-fatal): {_prof_e}")
+            prof_result = {"error": str(_prof_e)[:80]}
+        # Attach to data for JSON export
+        data['xhr_profile'] = prof_result
+    else:
+        progress_cb("⚠️ Phase 0.5 skipped — Playwright not installed")
+
+    # ── Phase 0.6: Build request role + dependency graph ─────────
+    # Pure-Python, no network — runs on already-collected data
+    progress_cb("🗺️ Phase 0.6: Building role-dependency graph...")
+    try:
+        _payflow_timeline = _build_payflow_timeline(data)
+        data['payflow_timeline'] = _payflow_timeline
+        _tl_roles = [e['role'] for e in _payflow_timeline]
+        _tok_steps  = [e['step'] for e in _payflow_timeline
+                       if e['role'] in _TOKENIZE_ROLES]
+        _pay_steps  = [e['step'] for e in _payflow_timeline
+                       if e['role'] == 'payment_submit']
+        progress_cb(
+            f"✅ Phase 0.6 done — {len(_payflow_timeline)} nodes  "
+            f"tokenize:#{_tok_steps[0] if _tok_steps else '–'}  "
+            f"submit:#{_pay_steps[0] if _pay_steps else '–'}"
+        )
+    except Exception as _tl_e:
+        logger.warning(f"payflow timeline build error (non-fatal): {_tl_e}")
+        data['payflow_timeline'] = []
+
+    # ── Phase 0.7: Realtime Live Intercept ───────────────────────
+    # Playwright ဖြင့် page တင်ကာ POST/XHR requests live capture
+    # Phase 0.5 (profiler) ထက် deep — response body, CSRF token,
+    # 3DS signal, live gateway call ကို real-time stream ဖမ်းသည်
+    if PLAYWRIGHT_OK:
+        progress_cb("🔴 Phase 0.7: Realtime intercept scan starting...")
+        try:
+            _live_scan_result = await run_scan(
+                uid, _payflow_live_intercept_sync, url, progress_cb)
+        except asyncio.CancelledError:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, None)
+            editor_task.cancel()
+            await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
+            return
+        except Exception as _live_e:
+            logger.warning(f"payflow live intercept error (non-fatal): {_live_e}")
+            _live_scan_result = {"error": str(_live_e)[:80]}
+
+        # Merge into data — enriches payload_sync + profiler results
+        if isinstance(_live_scan_result, dict) and not _live_scan_result.get("error"):
+            # Append live-captured requests to data['requests']
+            _existing_urls = {
+                (r.get("url") or r.get("endpoint", ""))
+                for r in (data.get("requests") or [])
+            }
+            for _lr in _live_scan_result.get("live_requests", []):
+                _lu = _lr.get("url") or _lr.get("endpoint", "")
+                if _lu not in _existing_urls:
+                    _existing_urls.add(_lu)
+                    data.setdefault("requests", []).append(_lr)
+
+            # Merge live findings
+            data.setdefault("live_findings", []).extend(
+                _live_scan_result.get("live_findings", [])
+            )
+            # Store raw live scan result for JSON export
+            data["live_intercept"] = _live_scan_result
+
+            _li_reqs = len(_live_scan_result.get("live_requests", []))
+            _li_find = len(_live_scan_result.get("live_findings", []))
+            _li_3ds  = _live_scan_result.get("threeds_triggered", False)
+            _li_tok  = _live_scan_result.get("tokenization_hit")
+            progress_cb(
+                f"✅ Phase 0.7 done — "
+                f"live:{_li_reqs} reqs  findings:{_li_find}"
+                + (f"  💳 {_li_tok}" if _li_tok else "")
+                + ("  🔐 3DS!" if _li_3ds else "")
+            )
+
+            # Rebuild timeline with enriched data (includes live requests)
+            try:
+                data['payflow_timeline'] = _build_payflow_timeline(data)
+                progress_cb("🗺️ Timeline rebuilt with live intercept data")
+            except Exception:
+                pass
+        else:
+            _err_msg = _live_scan_result.get("error", "unknown") if isinstance(
+                _live_scan_result, dict) else "non-dict result"
+            progress_cb(f"⚠️ Phase 0.7 partial — {_err_msg[:50]}")
+    else:
+        progress_cb("⚠️ Phase 0.7 skipped — Playwright not installed")
+
     # ── Phase 1-4: Run flow ──────────────────────────────────────
     progress_cb("🚀 Starting 4-step flow...")
 
@@ -36280,6 +38512,11 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _redir     = flow_result.get('redirect_url', '')
     _err       = flow_result.get('error', '')
     _bt_found  = flow_result.get('braintree_token_found', False)
+    # Authorize.Net
+    _an_login   = flow_result.get('authnet_login_id', '')   or ''
+    _an_ckey    = flow_result.get('authnet_client_key', '') or ''
+    _an_opaque  = flow_result.get('authnet_opaque_value', '') or ''
+    _an_opdesc  = flow_result.get('authnet_opaque_desc', '')  or ''
 
     lines = [
         f"🔀 *PayFlow — `{escape_md(domain)}`*",
@@ -36316,6 +38553,17 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif _bt_found:
         lines.append(f"2️⃣ `{_gw_badge}`  Braintree client token ✅")
+    elif _tok_type == 'authnet_opaque' and _an_opaque:
+        lines.append(
+            f"2️⃣ `{_gw_badge}`  opaqueData: `{escape_md(_an_opaque[:20])}…`"
+        )
+        if _an_login:
+            lines.append(
+                f"   🔑 apiLoginID: `{escape_md(_an_login)}`  "
+                f"clientKey: `{escape_md(_an_ckey[:20]) if _an_ckey else '—'}…`"
+            )
+        if _an_opdesc:
+            lines.append(f"   descriptor: `{escape_md(_an_opdesc)}`")
     else:
         lines.append(f"2️⃣ `{_gw_badge}`  direct field inject (no tokenization)")
 
@@ -36412,6 +38660,172 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n📄 *Response snippet:*")
         lines.append(f"`{escape_md(_snippet)}`")
 
+    # ── Live Intercept Findings ───────────────────────────────────
+    _li = data.get('live_intercept', {})
+    if _li and not _li.get('error'):
+        _li_reqs  = _li.get('live_requests', [])
+        _li_finds = _li.get('live_findings', [])
+        _li_3ds   = _li.get('threeds_triggered', False)
+        _li_tok   = _li.get('tokenization_hit')
+        _li_csrf  = _li.get('csrf_tokens', [])
+        _li_seq   = _li.get('request_sequence', [])
+
+        lines.append(f"\n🔴 *Live Intercept — `{len(_li_reqs)}` requests*")
+
+        # Tokenization hit
+        if _li_tok:
+            lines.append(f"💳 *Gateway hit:* `{escape_md(_li_tok)}`")
+
+        # 3DS signal
+        if _li_3ds:
+            lines.append("🔐 *3DS challenge triggered*")
+
+        # CSRF / nonce tokens captured live
+        if _li_csrf:
+            _csrf_preview = " | ".join(
+                f"`{escape_md(t[:22])}…`" for t in _li_csrf[:3]
+            )
+            lines.append(f"🎟️ *Live CSRF tokens:* {_csrf_preview}")
+
+        # Request sequence — show method+role for each captured request
+        if _li_seq:
+            lines.append("*── Capture Sequence ──*")
+            for _lse in _li_seq[:10]:
+                _lse_role  = _ROLE_META.get(
+                    _lse.get('role', 'other'), ('❓', 'Other', 6))
+                _lse_icon  = _lse_role[0]
+                _lse_label = _lse_role[1]
+                _lse_ms    = (f" `{_lse['duration_ms']}ms`"
+                              if _lse.get('duration_ms') else "")
+                _lse_st    = (f" `{_lse['status']}`"
+                              if _lse.get('status') else "")
+                _host      = (urlparse(_lse.get('url', '')).hostname or '')
+                _host_s    = _host.replace('www.', '')[:28]
+                lines.append(
+                    f"  {_lse_icon} `{_lse.get('method','?')}` "
+                    f"{escape_md(_host_s)} — {escape_md(_lse_label)}"
+                    f"{_lse_st}{_lse_ms}"
+                )
+            if len(_li_seq) > 10:
+                lines.append(f"  _…+ {len(_li_seq)-10} more_")
+
+        # High-confidence live findings (secrets in traffic)
+        if _li_finds:
+            lines.append(f"🚨 *Live findings:* `{len(_li_finds)}`")
+            for _lf in _li_finds[:4]:
+                _lf_type = escape_md(str(_lf.get('type', ''))[:24])
+                _lf_val  = escape_md(str(_lf.get('value_preview',
+                                                   _lf.get('value',''))
+                                         )[:36])
+                lines.append(f"  • `{_lf_type}` → `{_lf_val}`")
+
+    # ── Role-Dependency Flow Graph ────────────────────────────────
+    _pft = data.get('payflow_timeline', [])
+    if _pft:
+        # Show critical tier-annotated view (tiers 1-5 only, skip static)
+        _critical_tl = [
+            e for e in _pft
+            if _ROLE_META.get(e['role'], ('','',6))[2] <= 5
+        ]
+        lines.append(f"\n🗺️ *Flow Graph — {len(_critical_tl)} critical steps*")
+
+        _prev_tier = None
+        _tier_names_short = {
+            1: "① Session", 2: "② Pre-pay",
+            3: "③ Tokenize", 4: "④ Submit", 5: "⑤ Post",
+        }
+        for _te in _critical_tl[:14]:
+            _te_tier = _ROLE_META.get(_te['role'], ('','',6))[2]
+            if _te_tier != _prev_tier:
+                _prev_tier = _te_tier
+                lines.append(
+                    f"*{_tier_names_short.get(_te_tier, f'Tier {_te_tier}')}*"
+                )
+            _dep_s = (
+                " ← `" + " ".join(f"#{d}" for d in _te['depends_on'][:2]) + "`"
+            ) if _te['depends_on'] else ""
+            _prec_s = (
+                " → `" + " ".join(f"#{p}" for p in _te['must_precede'][:2]) + "`"
+            ) if _te['must_precede'] else ""
+            _t_s = f" `{_te['timing_ms']}ms`" if _te['timing_ms'] is not None else ""
+            lines.append(
+                f"  `#{_te['step']}` {escape_md(_te['label'][:46])}"
+                f"{_t_s}{_dep_s}{_prec_s}"
+            )
+        if len(_critical_tl) > 14:
+            lines.append(f"  _…+ {len(_critical_tl) - 14} more_")
+
+        # Critical path summary
+        _crit_chain = [
+            f"#{e['step']}" for e in _pft
+            if e['depends_on'] or e['must_precede']
+        ]
+        if _crit_chain:
+            lines.append(
+                f"\n🔗 *Critical chain:* {escape_md(' → '.join(_crit_chain[:8]))}"
+            )
+
+    # ── XHR Sequence Timeline ─────────────────────────────────────
+    _prof = data.get('xhr_profile', {})
+    if _prof and not _prof.get('error') and _prof.get('timeline'):
+        _tl          = _prof['timeline']
+        _total_req   = _prof.get('total_requests', 0)
+        _total_ms    = _prof.get('total_duration_ms', 0.0)
+        _crit_seqs   = set(_prof.get('critical_path', []))
+        _pay_seqs    = set(_prof.get('payment_sequence', []))
+
+        lines.append(
+            f"\n🕐 *XHR Timeline* — `{_total_req}` reqs · "
+            f"`{round(_total_ms)}ms` total"
+        )
+
+        # Show critical path entries first (up to 8), then others (up to 3)
+        _crit_entries = [e for e in _tl if e['seq'] in _crit_seqs]
+        _other_entries = [e for e in _tl if e['seq'] not in _crit_seqs]
+
+        lines.append("*── Critical Path ──────────*")
+        for _te in _crit_entries[:8]:
+            _dur    = f"`{_te['duration_ms']}ms`" if _te['duration_ms'] is not None else "`?ms`"
+            _st     = f"`{_te['status']}`" if _te['status'] else "`…`"
+            _dep_str = ""
+            if _te['dependencies']:
+                _dep_str = f" ← `#{escape_md(str(_te['dependencies'][0]))}`"
+            _pay_flag = " 💳" if _te['seq'] in _pay_seqs else ""
+            lines.append(
+                f"  `#{_te['seq']}` {escape_md(_te['label'][:42])} "
+                f"{_st} {_dur}{_dep_str}{_pay_flag}"
+            )
+        if len(_crit_entries) > 8:
+            lines.append(
+                f"  _…and {len(_crit_entries) - 8} more critical requests_"
+            )
+
+        # Non-critical summary
+        if _other_entries:
+            lines.append(
+                f"  _+ {len(_other_entries)} background "
+                f"({'JS/CSS/img'}) requests_"
+            )
+
+        # Dependency summary
+        _dep_count = sum(1 for e in _tl if e['dependencies'])
+        if _dep_count:
+            lines.append(
+                f"🔗 *Token dependencies detected:* `{_dep_count}` request(s)"
+            )
+
+        # Payment sequence order
+        if _pay_seqs:
+            _pay_order = " → ".join(
+                f"`#{s}`" for s in sorted(_pay_seqs)[:6]
+            )
+            lines.append(f"💰 *Payment sequence:* {_pay_order}")
+
+    elif _prof.get('error') and _prof['error'] != 'playwright_not_installed':
+        lines.append(
+            f"\n🕐 *XHR Timeline:* ❌ `{escape_md(_prof['error'][:60])}`"
+        )
+
     lines.append("\n⚠️ _Authorized testing only\\._")
 
     report_text = '\n'.join(lines)
@@ -36423,7 +38837,7 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             report_text[:4000], parse_mode='Markdown')
 
-    # ── Flow JSON export ──────────────────────────────────────────
+    # ── Flow JSON export (4-step + flow_graph) ───────────────────
     try:
         # Attach flow_result to data for _build_payment_flow_json
         data['flow_result'] = flow_result
@@ -36433,6 +38847,13 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flow_tmp  = os.path.join(tempfile.gettempdir(), flow_name)
         with open(flow_tmp, 'w', encoding='utf-8') as f:
             f.write(flow_str)
+
+        # Count graph stats for caption
+        _pft_export = data.get('payflow_timeline', [])
+        _graph_note = (
+            f"  |  Graph: `{len(_pft_export)}` nodes"
+            if _pft_export else ""
+        )
         with open(flow_tmp, 'rb') as f:
             await update.effective_message.reply_document(
                 document=f,
@@ -36440,13 +38861,94 @@ async def cmd_payflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=(
                     f"🔀 *PayFlow JSON — `{escape_md(domain)}`*\n"
                     f"Verdict: `{escape_md(_verdict)}`  |  "
-                    f"HTTP: `{_status}`"
+                    f"HTTP: `{_status}`{_graph_note}"
                 ),
                 parse_mode='Markdown'
             )
         os.unlink(flow_tmp)
     except Exception as e:
         logger.warning(f"payflow JSON export error: {e}")
+
+    # ── Timeline JSON export (separate file) ─────────────────────
+    # Sends when Phase 0.6 produced a non-trivial graph (≥ 3 nodes)
+    _pft2 = data.get('payflow_timeline', [])
+    if len(_pft2) >= 3:
+        try:
+            _safe_dom3 = re.sub(r'[^\w\-]', '_', domain)[:36]
+            _tl_name   = f"timeline_{_safe_dom3}.json"
+            _tl_tmp    = os.path.join(tempfile.gettempdir(), _tl_name)
+
+            # Build standalone timeline JSON
+            _tl_export = {
+                'meta': {
+                    'target':         url,
+                    'domain':         domain,
+                    'scanned_at':     datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'total_nodes':    len(_pft2),
+                    'profiler_ran':   bool(data.get('xhr_profile', {}).get('timeline')),
+                },
+                'timeline': _pft2,
+                'critical_path': sorted(
+                    e['step'] for e in _pft2
+                    if e.get('depends_on') or e.get('must_precede')
+                ),
+                'payment_sequence': sorted(
+                    e['step'] for e in _pft2
+                    if e['role'] in _TOKENIZE_ROLES or e['role'] == 'payment_submit'
+                ),
+                'role_counts': {
+                    r: sum(1 for e in _pft2 if e['role'] == r)
+                    for r in dict.fromkeys(e['role'] for e in _pft2)
+                },
+                'dependency_edges': [
+                    {
+                        'from_step': d,
+                        'to_step':   e['step'],
+                        'from_role': next(
+                            (x['role'] for x in _pft2 if x['step'] == d), '?'),
+                        'to_role':   e['role'],
+                    }
+                    for e in _pft2
+                    for d in e.get('depends_on', [])
+                ],
+            }
+
+            with open(_tl_tmp, 'w', encoding='utf-8') as _f:
+                json.dump(_tl_export, _f, indent=2, ensure_ascii=False)
+
+            # Count dep edges
+            _n_edges = sum(len(e.get('depends_on', [])) for e in _pft2)
+            _pay_steps_str = ', '.join(
+                f"#{e['step']}" for e in _pft2
+                if e['role'] in _TOKENIZE_ROLES or e['role'] == 'payment_submit'
+            )
+
+            with open(_tl_tmp, 'rb') as _f:
+                await update.effective_message.reply_document(
+                    document=_f,
+                    filename=_tl_name,
+                    caption=(
+                        f"🗺️ *Flow Graph — `{escape_md(domain)}`*\n"
+                        f"`{len(_pft2)}` nodes  "
+                        f"`{_n_edges}` dep edges\n"
+                        + (f"💰 Payment path: {_pay_steps_str}" if _pay_steps_str else "")
+                    ),
+                    parse_mode='Markdown'
+                )
+            os.unlink(_tl_tmp)
+
+            # Send formatted timeline as message when graph is complex (≥ 6 nodes)
+            if len(_pft2) >= 6:
+                _tl_msg = _format_payflow_timeline(_pft2, max_rows=18)
+                if _tl_msg:
+                    try:
+                        await update.effective_message.reply_text(
+                            _tl_msg[:4000], parse_mode='Markdown')
+                    except Exception:
+                        pass
+
+        except Exception as _tl_e:
+            logger.warning(f"payflow timeline export error: {_tl_e}")
 
 
 async def cmd_payloadlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
