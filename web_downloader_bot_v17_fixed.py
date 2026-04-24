@@ -45184,7 +45184,28 @@ async def payload_action_callback(
         if py_text:
             out += f"```python\n{py_text}\n```"
         if out:
-            await query.message.reply_text(out, parse_mode='Markdown')
+            _CHUNK = 4000
+            if len(out) <= _CHUNK:
+                await query.message.reply_text(out, parse_mode='Markdown')
+            else:
+                # Split on double-newline between blocks to avoid cutting mid-code-fence
+                _parts = out.split('\n\n')
+                _buf = ''
+                for _part in _parts:
+                    if len(_buf) + len(_part) + 2 > _CHUNK:
+                        if _buf:
+                            try:
+                                await query.message.reply_text(_buf.strip(), parse_mode='Markdown')
+                            except Exception:
+                                await query.message.reply_text(_buf.strip())
+                        _buf = _part
+                    else:
+                        _buf = (_buf + '\n\n' + _part) if _buf else _part
+                if _buf:
+                    try:
+                        await query.message.reply_text(_buf.strip(), parse_mode='Markdown')
+                    except Exception:
+                        await query.message.reply_text(_buf.strip())
         else:
             await query.message.reply_text(
                 "_Snippet မရှိပါ_", parse_mode='Markdown')
@@ -45351,7 +45372,8 @@ async def payload_action_callback(
     elif action == 'flow':
         # ── 💳 Flow: show step-by-step payment flow from cached data ──
         domain = urlparse(url).hostname or url
-        flow_result = data.get('payment_flow') or data.get('flow_result') or {}
+        _fr_raw = data.get('payment_flow') or data.get('flow_result')
+        flow_result = _fr_raw if isinstance(_fr_raw, dict) else {}
         gateways    = data.get('gateways', [])
         gw_name     = gateways[0].get('name', 'Unknown') if gateways else 'Unknown'
         recaptcha   = data.get('recaptcha') or {}
