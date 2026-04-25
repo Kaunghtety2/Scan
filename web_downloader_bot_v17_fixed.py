@@ -6886,7 +6886,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         # ── Hook 3: Console messages ─────────────────
         def _on_console(msg):
             try:
-                console_log.append(msg.text)
+                console_log.append(msg.text or "")
             except Exception:
                 pass
 
@@ -9646,7 +9646,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
 
         page.on("request",  _on_request)
         page.on("response", _on_response)
-        page.on("console",  lambda m: console_log.append(m.text[:500]))
+        page.on("console",  lambda m: console_log.append((m.text or "")[:500]))
 
         # ── Phase 3 Fix 1: WebSocket frame capture ──
         _ws_frames = []
@@ -9756,7 +9756,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                 try:
                     r = ctx.request.get(murl, timeout=5000)
                     if r.ok and "json" in r.headers.get("content-type",""):
-                        body = r.text()
+                        body = r.text() or ""
                         _add_network(murl, "GET", "", body)
                         # Extract chunk URLs from manifest
                         import re as _re
@@ -9806,8 +9806,8 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                 if _bm_full not in _seen_urls:
                     _bmr = ctx.request.get(_bm_full, timeout=5000)
                     if _bmr.ok:
-                        _add_network(_bm_full, "GET", "", _bmr.text())
-                        for _nc in _re2.findall(r'"(/[^"]+\.js)"', _bmr.text()):
+                        _add_network(_bm_full, "GET", "", _bmr.text() or "")
+                        for _nc in _re2.findall(r'"(/[^"]+\.js)"', _bmr.text() or ""):
                             _ncu = _origin + _nc
                             if _ncu not in _seen_urls:
                                 js_urls_on_page.append(_ncu)
@@ -9829,7 +9829,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
             try:
                 r = ctx.request.get(js_url, timeout=10000)
                 if r.ok:
-                    body = r.text()
+                    body = r.text() or ""
                     _add_network(js_url, "GET", "", body[:524288])
                     fetched += 1
             except Exception:
@@ -10064,17 +10064,18 @@ def _gather_all_text(data: dict) -> list:
         texts.append((data["html"], "HTML source"))
     for entry in data.get("network_log", []):
         if entry.get("response_body"):
-            body = entry["response_body"]
+            body = entry["response_body"] or ""
+            if not isinstance(body, str): body = ""
             is_obf, obf_reason = _is_obfuscated(body)
             if is_obf:
                 logger.debug("gather_all_text: skip obfuscated JS %s (%s)",
                              entry['url'][:70], obf_reason)
             else:
                 texts.append((body, f"JS: {entry['url'][:70]}"))
-        if entry.get("post_data"):
+        if entry.get("post_data") and isinstance(entry.get("post_data"), str):
             texts.append((entry["post_data"], f"POST → {entry['url'][:60]}"))
     if data.get("console_log"):
-        texts.append(("\n".join(data["console_log"]), "Console logs"))
+        texts.append(("\n".join(s for s in data["console_log"] if s and isinstance(s, str)), "Console logs"))
     return texts
 
 
@@ -33615,7 +33616,16 @@ def _detect_and_replicate_encryption(data: dict, js_text: str) -> list:
 
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
-    if progress_cb: progress_cb("⬇️ Fetching HTML...")
+    import traceback as _tb_mod
+
+    def _safe_cb(msg: str):
+        if progress_cb:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
+    _safe_cb("⬇️ Fetching HTML...")
 
     static_html   = ''
     _resp_headers = {}
@@ -33625,8 +33635,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     # Picks up curl_cffi (JA3/JA4) if installed, else httpx (HTTP/2),
     # else falls back to plain requests — all transparent to the rest.
     _engine = _make_engine("chrome")
-    if progress_cb:
-        progress_cb(
+    _safe_cb(
             f"🌐 Request engine: {_engine.backend}"
             + (" (TLS impersonation)" if _engine.backend == "curl_cffi" else "")
         )
@@ -33644,8 +33653,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                 timeout=TIMEOUT, verify=False, allow_redirects=True)
             static_html   = _initial_resp.text or ''
             _resp_headers = dict(_initial_resp.headers)
-        except Exception:
-            pass
+        except Exception as _fe:
+            _safe_cb(f"⚠️ HTML fetch failed: {str(_fe)[:80]}")
 
     static_forms = _extract_forms_static(static_html, url) if static_html else []
     for _sf in static_forms:
@@ -33678,13 +33687,12 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                 f'raw card data never touches your server (tokenized)'
             ),
         })
-        if progress_cb:
-            progress_cb(
+        _safe_cb(
                 f"🖼️  Embedded platform: {_prov} "
                 f"({len(_ep['synthetic_fields'])} synthetic field(s))"
             )
 
-    if progress_cb: progress_cb(f"📋 {len(static_forms)} static form(s) — Playwright launching...")
+    _safe_cb(f"📋 {len(static_forms)} static form(s) — Playwright launching...")
 
     pw_requests = _extract_requests_playwright(url, progress_cb)
 
@@ -33800,7 +33808,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             progress_cb(f"✅ DOM merge: {tot} fields total (incl. iframes)")
 
     gateways = _detect_payment_gateway((static_html or '') + (js_html or ''), js_text or '')
-    if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
+    _safe_cb(f"💳 {len(gateways)} gateway(s) detected...")
 
     # ── A: Multi-page checkout step tracker ──────────────────────────────
     _checkout_steps = _detect_checkout_steps(
@@ -33907,7 +33915,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         r'<script[^>]+src=["\'\']([^"\']+)["\'\']', (static_html or "") + (js_html or ""), re.I)
 
     # ── Device Fingerprint SDK detection ─────────────────────────────
-    if progress_cb: progress_cb("🖐️ Scanning device fingerprint SDKs...")
+    _safe_cb("🖐️ Scanning device fingerprint SDKs...")
     _device_fps = _detect_device_fingerprints(
         html         = (static_html or "") + (js_html or ""),
         js_text      = js_text,
@@ -33920,7 +33928,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     subpage_sitekeys: list = []
 
     # ── Anti-Fraud Layer detection ────────────────────────────────────
-    if progress_cb: progress_cb("🛡️ Detecting anti-fraud middleware layers...")
+    _safe_cb("🛡️ Detecting anti-fraud middleware layers...")
     _all_forms_combined = static_forms + js_forms + subpage_forms
     _anti_fraud = _detect_anti_fraud_layers(
         html         = (static_html or "") + (js_html or ""),
@@ -33931,11 +33939,11 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     )
 
     # Phase 5: Header probing
-    if progress_cb: progress_cb("🔍 Probing header requirements...")
+    _safe_cb("🔍 Probing header requirements...")
     headers_result = _probe_header_requirement(url, progress_cb)
 
     # Phase 6: Token sources — locate
-    if progress_cb: progress_cb("🔎 Locating token sources...")
+    _safe_cb("🔎 Locating token sources...")
     # FIX 3d: Include GET response bodies in token source scan
     # Stripe pk_, CSRF meta tokens, session tokens appear in GET responses
     _resp_body_text = ' '.join(
@@ -33946,7 +33954,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     )
 
     # Phase 6b: Resolve live token values
-    if progress_cb: progress_cb("🔑 Resolving dynamic token values...")
+    _safe_cb("🔑 Resolving dynamic token values...")
     resolved_tokens = _resolve_dynamic_tokens(
         url           = url,
         token_sources = token_sources,
@@ -33979,7 +33987,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                 break
 
     # Phase 7: CAPTCHA sitekeys — full Playwright scan (action/invisible/score/theme)
-    if progress_cb: progress_cb("🤖 Running full Playwright CAPTCHA sitekey scan...")
+    _safe_cb("🤖 Running full Playwright CAPTCHA sitekey scan...")
     # Primary: full Playwright-powered scan (captures network requests, DOM, JS evals)
     _sk_full = {}
     _sk_findings = []
@@ -34036,7 +34044,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         _SUBPAGES,
         key=lambda u: (0 if _SUBPAGE_PRIORITY.search(u) else 1, u)
     )
-    if progress_cb: progress_cb("🔗 Scanning payment sub-pages...")
+    _safe_cb("🔗 Scanning payment sub-pages...")
     _parsed = urlparse(url)
     _origin = f"{_parsed.scheme}://{_parsed.netloc}"
     _existing_eps = {f.get('endpoint', '') for f in static_forms + js_forms}
@@ -34211,8 +34219,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             _spa_queue,
             key=lambda p: (0 if _SUBPAGE_PRIORITY.search(p) else 1, p),
         )
-        if progress_cb:
-            progress_cb(
+        _safe_cb(
                 f"⚛️  SPA detected — Playwright scan on "
                 f"{min(len(_spa_queue), _pw_cap)} checkout sub-page(s)..."
             )
@@ -34417,11 +34424,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         if progress_cb and _pw_done:
             progress_cb(f"⚛️  SPA Playwright scan done: {_pw_done} sub-page(s) rendered")
 
-    if progress_cb:
-        progress_cb(f"🔗 Sub-page scan complete: {len(subpage_forms)} extra form(s)")
+    _safe_cb(f"🔗 Sub-page scan complete: {len(subpage_forms)} extra form(s)")
 
     # ── ENH Phase 9: 3DS / SCA signal detection ───────────────────────────
-    if progress_cb: progress_cb("🔐 3DS / SCA signal detection...")
+    _safe_cb("🔐 3DS / SCA signal detection...")
     _combined_text = (static_html or "") + (js_html or "") + (js_text or "")
     _3DS_SIGS = [
         (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction'), "Stripe 3DS confirmPayment"),
@@ -34436,7 +34442,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     threeds_signals = [lbl for pat, lbl in _3DS_SIGS if pat.search(_combined_text)]
 
     # ── ENH Phase 10: Wallet / express pay detection ──────────────────────
-    if progress_cb: progress_cb("📱 Wallet / express pay detection...")
+    _safe_cb("📱 Wallet / express pay detection...")
     _WALLET_SIGS = [
         (re.compile(r'(?i)ApplePaySession|apple.?pay'),       "Apple Pay"),
         (re.compile(r'(?i)new\s+PaymentRequest|google.?pay'), "Google Pay / Payment Request API"),
@@ -34452,19 +34458,19 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     wallets = [lbl for pat, lbl in _WALLET_SIGS if pat.search(_combined_text)]
 
     # ── ENH: Rate limit headers (from initial response) ──────────────────
-    if progress_cb: progress_cb("📊 Checking rate limit headers...")
+    _safe_cb("📊 Checking rate limit headers...")
     rate_limit = _detect_rate_limit_headers(_resp_headers, endpoint=url)
 
     # ── ENH: Cookie security analysis ────────────────────────────────────
-    if progress_cb: progress_cb("🍪 Analyzing auth cookie security flags...")
+    _safe_cb("🍪 Analyzing auth cookie security flags...")
     auth_cookies = _analyze_auth_cookies(url, resp_headers=_resp_headers)
 
     # ── ENH: CSP header analysis ──────────────────────────────────────────
-    if progress_cb: progress_cb("🛡️ Parsing Content-Security-Policy...")
+    _safe_cb("🛡️ Parsing Content-Security-Policy...")
     csp_info = _analyze_csp(url, resp_headers=_resp_headers)
 
     # ── ENH: CORS analysis (on first payment form endpoint if found) ──────
-    if progress_cb: progress_cb("🌐 Testing CORS policy...")
+    _safe_cb("🌐 Testing CORS policy...")
     _cors_ep = next(
         (f.get('endpoint') for f in (static_forms + js_forms + subpage_forms)
          if f.get('is_payment') and f.get('endpoint')),
@@ -34477,15 +34483,15 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     base_url = f"{_p.scheme}://{_p.netloc}"
 
     # ── ENH: GraphQL detection ─────────────────────────────────────────────
-    if progress_cb: progress_cb("🔷 Probing GraphQL endpoint...")
+    _safe_cb("🔷 Probing GraphQL endpoint...")
     graphql_info = _detect_graphql(base_url)
 
     # ── ENH: API schema discovery ──────────────────────────────────────────
-    if progress_cb: progress_cb("📖 Checking OpenAPI/Swagger schema...")
+    _safe_cb("📖 Checking OpenAPI/Swagger schema...")
     api_schema = _check_api_schema(base_url)
 
     # ── ENH: API version enumeration ──────────────────────────────────────
-    if progress_cb: progress_cb("🔢 Enumerating API versions...")
+    _safe_cb("🔢 Enumerating API versions...")
     api_versioning = _detect_api_versioning(base_url)
     if progress_cb and api_versioning:
         _av_summary = ', '.join(
@@ -34495,22 +34501,22 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             progress_cb(f"🔢 API versions found: {_av_summary}")
 
     # ── ENH: Well-known path probing ───────────────────────────────────────
-    if progress_cb: progress_cb("📂 Probing well-known paths...")
+    _safe_cb("📂 Probing well-known paths...")
     well_known = _probe_well_known_paths(base_url)
     if progress_cb and well_known:
         _wk_keys = ', '.join(well_known.keys())
         progress_cb(f"📂 Well-known: {_wk_keys}")
 
     # ── ENH: Framework detection ───────────────────────────────────────────
-    if progress_cb: progress_cb("🔍 Detecting JS framework...")
+    _safe_cb("🔍 Detecting JS framework...")
     frameworks = _detect_frameworks((static_html or "") + (js_html or ""), js_text, script_urls=_script_srcs)
 
     # ── ENH: Multi-step form detection ────────────────────────────────────
-    if progress_cb: progress_cb("🪜 Checking for multi-step checkout...")
+    _safe_cb("🪜 Checking for multi-step checkout...")
     multistep = _detect_multistep((static_html or "") + (js_html or ""), js_text, url)
 
     # ── ENH: curl/Python snippet (first payment form or first form) ───────
-    if progress_cb: progress_cb("📋 Generating curl/python snippet...")
+    _safe_cb("📋 Generating curl/python snippet...")
     _snippet_form = next(
         (f for f in (static_forms + js_forms + subpage_forms + real_requests)
          if f.get('is_payment')),
@@ -34573,7 +34579,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     live_antifraud_hits   = []   # populated after _stream_intercept_sync
     live_fingerprint_hits = []   # populated after _stream_intercept_sync
     if PLAYWRIGHT_OK:
-        if progress_cb: progress_cb("🔴 Live intercept: capturing real network tokens...")
+        _safe_cb("🔴 Live intercept: capturing real network tokens...")
         try:
             live_result = _stream_intercept_sync(url, progress_cb,
                                                  extra_patterns=_PAYLOAD_LIVE_PATTERNS)
@@ -34660,7 +34666,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         except Exception as _live_err:
             logger.debug("payload live intercept error: %s", _live_err)
     else:
-        if progress_cb: progress_cb("⚠️ Live intercept skipped (Playwright not installed)")
+        _safe_cb("⚠️ Live intercept skipped (Playwright not installed)")
 
     # ── Section C2: Anti-Fraud + Fingerprint live signal matching ────────────
     _live_reqs = live_result.get('live_requests', [])
@@ -34689,7 +34695,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             }
 
     # ── ENH: Success / Decline pattern scan ───────────────────────────────
-    if progress_cb: progress_cb("🔎 Scanning success / decline response patterns...")
+    _safe_cb("🔎 Scanning success / decline response patterns...")
     _live_bodies = [
         r.get('body', '') or r.get('response_body', '')
         for r in live_result.get('live_requests', [])
@@ -34709,7 +34715,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         )
 
     # ── Velocity checks ───────────────────────────────────────────────
-    if progress_cb: progress_cb("⚡ Detecting velocity / rate-limit protection...")
+    _safe_cb("⚡ Detecting velocity / rate-limit protection...")
     _velocity = _detect_velocity_checks(
         html               = (static_html or "") + (js_html or ""),
         js_text            = js_text,
@@ -34726,7 +34732,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     _ct_mismatches = _detect_content_type_mismatch(_all_forms_out, real_requests)
 
     # ── ENH 1: Form Action Security Check ───────────────────────────────
-    if progress_cb: progress_cb("🔒 Checking form action security (HTTP/cross-domain)...")
+    _safe_cb("🔒 Checking form action security (HTTP/cross-domain)...")
     _form_action_issues = _check_form_action_security(
         _all_forms_out, url
     )
@@ -34735,7 +34741,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         progress_cb(f"🔒 Form action: {len(_form_action_issues)} issue(s) ({_fa_crit} CRITICAL)")
 
     # ── ENH 2: Luhn check on any card number found in live requests ───────
-    if progress_cb: progress_cb("🔢 Luhn-validating intercepted card patterns...")
+    _safe_cb("🔢 Luhn-validating intercepted card patterns...")
     _luhn_findings = []
     _CARD_NUM_RE = re.compile(r'(?:4[0-9]{12,15}|5[1-5][0-9]{14}|3[47][0-9]{13}|'
                                r'6(?:011|5[0-9]{2})[0-9]{12}|3(?:0[0-5]|[68][0-9])[0-9]{11})'
@@ -34756,32 +34762,32 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         progress_cb(f"🔢 Luhn: {len(_luhn_findings)} card pattern(s) found in live traffic")
 
     # ── ENH 3: Coupon / promo code field detection ────────────────────────
-    if progress_cb: progress_cb("🎟️ Scanning for coupon / promo code fields...")
+    _safe_cb("🎟️ Scanning for coupon / promo code fields...")
     _coupon_fields = _detect_coupon_fields(_all_forms_out)
     if progress_cb and _coupon_fields:
         _cp_names = ', '.join(f['field_name'] for f in _coupon_fields[:3])
         progress_cb(f"🎟️ Coupon fields found: {_cp_names}")
 
     # ── ENH 4: Post-payment redirect URL extraction ───────────────────────
-    if progress_cb: progress_cb("🔗 Extracting post-payment redirect URLs...")
+    _safe_cb("🔗 Extracting post-payment redirect URLs...")
     _redirect_urls = _extract_redirect_urls(_all_forms_out, real_requests)
     if progress_cb and _redirect_urls:
         progress_cb(f"🔗 Redirect URLs found: {len(_redirect_urls)}")
 
     # ── ENH 5: Idempotency key detection ──────────────────────────────────
-    if progress_cb: progress_cb("🔑 Checking idempotency key support...")
+    _safe_cb("🔑 Checking idempotency key support...")
     _idempotency = _detect_idempotency(_resp_headers, _all_forms_out, real_requests)
     if progress_cb and _idempotency:
         progress_cb(f"🔑 Idempotency: {_idempotency['signals'][0][:60]}")
 
     # ── ENH 6: WebAuthn / Passkey detection ───────────────────────────────
-    if progress_cb: progress_cb("🔐 Scanning WebAuthn / Passkey signals...")
+    _safe_cb("🔐 Scanning WebAuthn / Passkey signals...")
     _webauthn = _detect_webauthn_passkey((static_html or "") + (js_html or ""), js_text)
     if progress_cb and _webauthn:
         progress_cb(f"🔐 WebAuthn signals: {len(_webauthn)} found")
 
     # ── ENH 7: Gateway field completeness score ───────────────────────────
-    if progress_cb: progress_cb("📊 Scoring gateway field completeness...")
+    _safe_cb("📊 Scoring gateway field completeness...")
     _gw_completeness = _score_gateway_completeness(
         _all_forms_out, gateways, resolved_tokens
     )
@@ -34794,7 +34800,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             progress_cb(f"📊 Completeness: {_gc_summary}")
 
     # ── Payment flow sequence map ─────────────────────────────────────
-    if progress_cb: progress_cb("🗺️ Mapping payment flow sequence...")
+    _safe_cb("🗺️ Mapping payment flow sequence...")
     _flow_data = {
         'forms':              static_forms + js_forms + subpage_forms,
         'requests':           real_requests,
@@ -34851,13 +34857,13 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'payment_sdks':       _sdks,
     }
 
-    if progress_cb: progress_cb("🗺️ Building payment flow sequence...")
+    _safe_cb("🗺️ Building payment flow sequence...")
     _flow_sequence = _build_payment_flow_sequence(_pfa_data)
 
-    if progress_cb: progress_cb("🔗 Mapping request dependencies...")
+    _safe_cb("🔗 Mapping request dependencies...")
     _dependencies = _map_request_dependencies(_pfa_data)
 
-    if progress_cb: progress_cb("🔐 Detecting and replicating encryption logic...")
+    _safe_cb("🔐 Detecting and replicating encryption logic...")
     _encryption_info = _detect_and_replicate_encryption(_pfa_data, js_text)
 
     return {
@@ -40765,9 +40771,19 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🛑 Cancelled.", parse_mode='Markdown')
         return
     except Exception as e:
-        loop.call_soon_threadsafe(progress_queue.put_nowait, None)   # stop editor
+        import traceback as _tb
+        _tb_str = _tb.format_exc()
+        logger.error("cmd_payload error:\n%s", _tb_str)
+        loop.call_soon_threadsafe(progress_queue.put_nowait, None)
         editor_task.cancel()
-        await msg.edit_text(f"❌ Error: `{escape_md(str(e))}`", parse_mode='Markdown')
+        # Show last 3 lines of traceback to user for diagnosis
+        _tb_lines = [l for l in _tb_str.strip().splitlines() if l.strip()]
+        _tb_short  = '\n'.join(_tb_lines[-4:])[:500]
+        await msg.edit_text(
+            f"❌ *Error:* `{escape_md(str(e))}`\n\n"
+            f"```\n{escape_md(_tb_short)}\n```",
+            parse_mode='Markdown'
+        )
         return
 
     # Signal editor task to stop (normal flow only — exceptions handle their own sentinel above)
@@ -41519,7 +41535,7 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 if content_len > 500_000:   # skip > 500KB
                     return
                 try:
-                    body_text = response.text()
+                    body_text = response.text() or ""
                     if len(body_text) > 500_000:
                         body_text = body_text[:500_000]
                 except Exception:
