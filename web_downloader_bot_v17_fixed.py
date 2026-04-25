@@ -26748,10 +26748,11 @@ def _detect_waf_fingerprint(
                'ML bot detection — missing cookie triggers CAPTCHA or 403')
 
     # ── PerimeterX / HUMAN ────────────────────────────────────────────────
-    _px_sigs = []
+    _px_sigs  = []
+    _ck_str   = ' '.join(cookies.keys())   # join cookie names for regex scan
     if re.search(r'perimeterx|px\.js|pxScript|/_px/', combined, re.I):
         _px_sigs.append('PerimeterX JS reference')
-    if re.search(r'_pxhd|_pxvid|_px2|_px3', cookies, re.I) or \
+    if re.search(r'_pxhd|_pxvid|_px2|_px3', _ck_str, re.I) or \
        any(k.startswith('_px') for k in cookies):
         _px_sigs.append('_px* cookie')
     if 'x-px-client-uuid' in headers:
