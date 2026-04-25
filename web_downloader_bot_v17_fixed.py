@@ -2075,6 +2075,8 @@ class _RequestEngine:
 
     def _extract_tokens(self, text):
         """Scan response body for CSRF / nonce tokens and cache them."""
+        if not text or not isinstance(text, str):
+            return
         for pat in _RE_CSRF:
             m = pat.search(text)
             if m:
@@ -2133,7 +2135,7 @@ class _RequestEngine:
             "GET", url, headers=self._build_headers(headers), **kwargs
         )
         try:
-            self._extract_tokens(resp.text)
+            self._extract_tokens(resp.text or '')
         except Exception:
             pass
         return resp
@@ -2164,7 +2166,7 @@ class _RequestEngine:
             kw["data"] = data
         resp = self._do_request("POST", url, headers=h, **kw)
         try:
-            self._extract_tokens(resp.text)
+            self._extract_tokens(resp.text or '')
         except Exception:
             pass
         return resp
@@ -26308,7 +26310,7 @@ def _detect_checkout_steps(html: str, js_text: str, url: str) -> dict:
     Detect multi-step checkout flow: how many steps exist,
     which step is currently active, and step labels.
     """
-    combined = (html or '') + (js_text or '')
+    combined = html + js_text
     steps_found: list[dict] = []
     current_step: int | None = None
     total_steps: int | None = None
@@ -26402,7 +26404,7 @@ def _detect_sdk_versions(html: str, js_text: str) -> list:
     Detect loaded gateway SDK versions and variants.
     Returns list of {gateway, sdk, version, variant, note}
     """
-    combined = (html or '') + (js_text or '')
+    combined = html + js_text
     results: list[dict] = []
 
     # ── Stripe ────────────────────────────────────────────────────────────
@@ -26654,7 +26656,7 @@ def _detect_waf_fingerprint(
     cookies, HTML/JS content, and script URLs.
     Returns list of {vendor, confidence, signals, bypass_note}
     """
-    combined  = (html or '') + (js_text or '')
+    combined  = html + js_text
     headers   = {k.lower(): v for k, v in (headers or {}).items()}
     cookies   = {k.lower(): v for k, v in (cookies or {}).items()}
     results: list[dict] = []
@@ -26791,7 +26793,7 @@ def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
         'source':        'iframe_embed' | 'script_embed',
       }
     """
-    combined = (html or '') + (js_text or '')
+    combined = html + js_text
     detected = []
     seen_providers: set = set()
 
@@ -27205,7 +27207,8 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                                     'card_type':card_type})
                         except Exception: pass
                     elif 'multipart' in ct:
-                        for match in re.finditer(r'name="([^"]+)"', body):
+                        _mbody = body if isinstance(body, str) else (body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else '')
+                        for match in re.finditer(r'name="([^"]+)"', _mbody):
                             k = match.group(1)
                             label,icon,is_dyn,card_type = _classify_field(k,'')
                             fields.append({'name':k,'type':'multipart','value':'',
@@ -27900,7 +27903,7 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
     HTML + JS မှ reCAPTCHA / hCaptcha / Turnstile site key ဖမ်းသည်။
     Returns {site_key, page_url, base_url, captcha_type} or None
     """
-    combined = (html or '') + (js_text or '')
+    combined = html + js_text
 
     # Detect captcha type
     captcha_type = 'reCAPTCHA v2'
@@ -27978,7 +27981,7 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
         })
 
     # 3. JS variable tokens (inline scripts + external JS)
-    combined_js = (html or '') + (js_text or '')
+    combined_js = html + js_text
     for pat in _JS_VAR_PATTERNS:
         for m in pat.finditer(combined_js):
             name  = m.group(1)
@@ -29958,7 +29961,7 @@ def _check_api_schema(origin: str) -> dict | None:
 def _detect_frameworks(html: str, js_text: str, script_urls: list = None) -> list:
     """Detect JS frameworks — affects how form fields and requests work."""
     # ADD: include script_urls in combined
-    combined = (html or '') + (js_text or '') + ' '.join(script_urls or [])
+    combined = html + js_text + ' '.join(script_urls or [])
     _SIGS = [
         ('React',        re.compile(r'react\.(?:development|production)|__REACT_DEVTOOLS|_reactFiber|React\.createElement', re.I)),
         ('Next.js',      re.compile(r'__NEXT_DATA__|/_next/static|next/router', re.I)),
@@ -30507,7 +30510,7 @@ def _detect_rate_limit_headers(resp_headers: dict, endpoint: str = None,
 def _detect_multistep(html: str, js_text: str, url: str) -> dict | None:
     """Detect multi-step / wizard checkout forms."""
     from concurrent.futures import ThreadPoolExecutor
-    combined = (html or '') + (js_text or '')
+    combined = html + js_text
 
     _PAT_DATA_STEP  = re.compile(r'data-step=["\'](\d+)["\']', re.I)
     _PAT_STEP_CLASS = re.compile(r'step[_-](\d+)|checkout[_-]step[_-](\d+)', re.I)
@@ -32784,7 +32787,7 @@ def _detect_webauthn_passkey(html: str, js_text: str) -> list:
          'Hardware security key reference'),
     ]
 
-    combined = (html or '') + (js_text or '')
+    combined = html + js_text
     findings = []
     seen: set = set()
 
@@ -33770,8 +33773,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── A: Multi-page checkout step tracker ──────────────────────────────
     _checkout_steps = _detect_checkout_steps(
-        html    = (static_html or '') + (js_html or ''),
-        js_text = (js_text or ''),
+        html    = static_html + js_html,
+        js_text = js_text,
         url     = url,
     )
     if _checkout_steps['detected'] and progress_cb:
@@ -33783,8 +33786,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── B: Gateway SDK version detect ────────────────────────────────────
     _sdk_versions = _detect_sdk_versions(
-        html    = (static_html or '') + (js_html or ''),
-        js_text = (js_text or ''),
+        html    = static_html + js_html,
+        js_text = js_text,
     )
     if _sdk_versions and progress_cb:
         _sdks = ', '.join(f"{s['sdk']} {s['version']}" for s in _sdk_versions[:3])
@@ -33792,7 +33795,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── C: Hosted fields endpoint mapping ───────────────────────────────
     _hosted_ep = _detect_hosted_fields_endpoint(
-        html              = (static_html or '') + (js_html or ''),
+        html              = static_html + js_html,
         js_text           = js_text,
         gateways          = gateways,
         intercepted_requests = real_requests,
@@ -33805,8 +33808,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── C2: Dynamic pricing detect ───────────────────────────────────────
     _dynamic_pricing = _detect_dynamic_pricing(
-        html    = (static_html or '') + (js_html or ''),
-        js_text = (js_text or ''),
+        html    = static_html + js_html,
+        js_text = js_text,
     )
     if _dynamic_pricing['is_dynamic'] and progress_cb:
         _dp_sigs = ', '.join(s['signal'] for s in _dynamic_pricing['signals'][:2])
@@ -33814,8 +33817,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── D: WAF / bot-protection fingerprint ─────────────────────────────
     _waf_results = _detect_waf_fingerprint(
-        html    = (static_html or '') + (js_html or ''),
-        js_text = (js_text or ''),
+        html    = static_html + js_html,
+        js_text = js_text,
         headers = getattr(_engine, '_last_headers', {}),
         cookies = {c.name: c.value for c in getattr(_engine, 'cookies', [])},
     )
@@ -33825,7 +33828,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── C: Hosted fields endpoint mapping ───────────────────────────────
     _hosted_ep = _detect_hosted_fields_endpoint(
-        html              = (static_html or '') + (js_html or ''),
+        html              = static_html + js_html,
         js_text           = js_text,
         gateways          = gateways,
         intercepted_requests = real_requests,
@@ -33837,7 +33840,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         )
 
     # PATCHED: Braintree hosted fields detection
-    _bt = _detect_braintree_hosted_fields((static_html or '') + (js_html or ''), (js_text or ''))
+    _bt = _detect_braintree_hosted_fields(static_html + js_html, js_text)
     if _bt:
         _bt_forms_target = static_forms  # mutate in-place before further processing
         _bt_fields = [
@@ -33864,18 +33867,18 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             })
 
     # PATCHED: payment SDK detection
-    _sdks = _detect_payment_sdks((static_html or '') + (js_html or ''), (js_text or ''))
+    _sdks = _detect_payment_sdks(static_html + js_html, js_text)
     if _sdks:
         pass  # stored in return dict below
 
     # ── Extract script src URLs early (needed by fingerprint + anti-fraud) ─
     _script_srcs = re.findall(
-        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', (static_html or '') + (js_html or ''), re.I)
+        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', static_html + js_html, re.I)
 
     # ── Device Fingerprint SDK detection ─────────────────────────────
     if progress_cb: progress_cb("🖐️ Scanning device fingerprint SDKs...")
     _device_fps = _detect_device_fingerprints(
-        html         = (static_html or '') + (js_html or ''),
+        html         = static_html + js_html,
         js_text      = js_text,
         script_urls  = _script_srcs,
         resp_headers = _resp_headers,
@@ -33889,7 +33892,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🛡️ Detecting anti-fraud middleware layers...")
     _all_forms_combined = static_forms + js_forms + subpage_forms
     _anti_fraud = _detect_anti_fraud_layers(
-        html         = (static_html or '') + (js_html or ''),
+        html         = static_html + js_html,
         js_text      = js_text,
         script_urls  = _script_srcs,
         resp_headers = _resp_headers,
@@ -33908,7 +33911,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         v for v in _pw_resp_bodies.values() if v and isinstance(v, str)
     )[:500_000]
     token_sources = _find_token_sources(
-        (static_html or '') + (js_html or '') + _resp_body_text, (js_text or ''))
+        static_html + js_html + _resp_body_text, js_text
+    )
 
     # Phase 6b: Resolve live token values
     if progress_cb: progress_cb("🔑 Resolving dynamic token values...")
@@ -33916,7 +33920,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         url           = url,
         token_sources = token_sources,
         engine        = _engine,
-        html          = (static_html or '') + (js_html or ''),
+        html          = static_html + js_html,
         js_text       = js_text,
         progress_cb   = progress_cb,
     )
@@ -33975,7 +33979,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             logger.debug("sitekey_playwright error: %s", _sk_err)
     # Fallback: static parse if Playwright unavailable or found nothing
     if not _sk_full:
-        _sk_static = _extract_recaptcha_info((static_html or '') + (js_html or ''), (js_text or ''), url)
+        _sk_static = _extract_recaptcha_info(static_html + js_html, js_text, url)
         if _sk_static:
             _sk_full = _sk_static
             _sk_full['all_keys'] = [_sk_static] if _sk_static else []
@@ -34387,7 +34391,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH Phase 9: 3DS / SCA signal detection ───────────────────────────
     if progress_cb: progress_cb("🔐 3DS / SCA signal detection...")
-    _combined_text = (static_html or '') + (js_html or '') + (js_text or '')
+    _combined_text = static_html + js_html + js_text
     _3DS_SIGS = [
         (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction'), "Stripe 3DS confirmPayment"),
         (re.compile(r'(?i)stripe\.confirmCardPayment'),                       "Stripe confirmCardPayment"),
@@ -34468,11 +34472,11 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH: Framework detection ───────────────────────────────────────────
     if progress_cb: progress_cb("🔍 Detecting JS framework...")
-    frameworks = _detect_frameworks((static_html or '') + (js_html or ''), (js_text or ''), script_urls=_script_srcs)
+    frameworks = _detect_frameworks(static_html + js_html, js_text, script_urls=_script_srcs)
 
     # ── ENH: Multi-step form detection ────────────────────────────────────
     if progress_cb: progress_cb("🪜 Checking for multi-step checkout...")
-    multistep = _detect_multistep((static_html or '') + (js_html or ''), (js_text or ''), url)
+    multistep = _detect_multistep(static_html + js_html, js_text, url)
 
     # ── ENH: curl/Python snippet (first payment form or first form) ───────
     if progress_cb: progress_cb("📋 Generating curl/python snippet...")
@@ -34660,7 +34664,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         for r in live_result.get('live_requests', [])
     ]
     response_patterns = _scan_response_patterns(
-        html        = (static_html or '') + (js_html or ''),
+        html        = static_html + js_html,
         js_text     = js_text,
         url         = url,
         live_bodies = _live_bodies,
@@ -34676,7 +34680,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     # ── Velocity checks ───────────────────────────────────────────────
     if progress_cb: progress_cb("⚡ Detecting velocity / rate-limit protection...")
     _velocity = _detect_velocity_checks(
-        html               = (static_html or '') + (js_html or ''),
+        html               = static_html + js_html,
         js_text            = js_text,
         resp_headers       = _resp_headers,
         rate_limit_data    = rate_limit,
@@ -34741,7 +34745,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH 6: WebAuthn / Passkey detection ───────────────────────────────
     if progress_cb: progress_cb("🔐 Scanning WebAuthn / Passkey signals...")
-    _webauthn = _detect_webauthn_passkey((static_html or '') + (js_html or ''), (js_text or ''))
+    _webauthn = _detect_webauthn_passkey(static_html + js_html, js_text)
     if progress_cb and _webauthn:
         progress_cb(f"🔐 WebAuthn signals: {len(_webauthn)} found")
 
@@ -34773,7 +34777,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'threeds_signals':    threeds_signals,
         'cors_info':          cors_info,
         'response_patterns':  _scan_response_patterns(
-                                  (static_html or '') + (js_html or ''), (js_text or ''), url, []) \
+                                  static_html + js_html, js_text, url, []) \
                                if not locals().get('response_patterns') else response_patterns,
         'token_sources':      token_sources,
         'resolved_tokens':    resolved_tokens,
@@ -34823,7 +34827,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     _dependencies = _map_request_dependencies(_pfa_data)
 
     if progress_cb: progress_cb("🔐 Detecting and replicating encryption logic...")
-    _encryption_info = _detect_and_replicate_encryption(_pfa_data, (js_text or ''))
+    _encryption_info = _detect_and_replicate_encryption(_pfa_data, js_text)
 
     return {
         'url':               url,
@@ -34876,7 +34880,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'api_versioning':      api_versioning,
         'well_known':          well_known,
         'authnet_keys':        _find_authnet_keys(
-                                   (static_html or '') + (js_html or ''),
+                                   static_html + js_html,
                                    base_url,
                                ),
         'payment_flow_analysis': {
@@ -37663,7 +37667,7 @@ def _run_payload_flow_sync(
             )
 
         submit_status = submit_resp.status_code
-        submit_body   = submit_resp.text[:10_000]
+        submit_body   = (submit_resp.text or '')[:10_000]
 
         _redirect_loc = ''
         try:
@@ -41275,7 +41279,7 @@ def _fire_post_classify_sync(data: dict, progress_cb=None) -> dict:
             _sr = _engine.get(f"{submit_url}?{_qs}", headers=submit_headers)
 
         submit_status = _sr.status_code
-        submit_body   = _sr.text[:20_000]
+        submit_body   = (_sr.text or '')[:20_000]
         try:
             submit_ct    = _sr.headers.get('Content-Type', '')
             redirect_loc = _sr.headers.get('Location', '')
@@ -41607,7 +41611,8 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         except Exception:
                             pass
                     elif 'multipart' in ct:
-                        for match in re.finditer(r'name="([^"]+)"', body):
+                        _mbody = body if isinstance(body, str) else (body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else '')
+                        for match in re.finditer(r'name="([^"]+)"', _mbody):
                             k = match.group(1)
                             label, icon, is_dyn, card_type = _classify_field(k, '')
                             fields.append({
