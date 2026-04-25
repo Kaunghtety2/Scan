@@ -1199,7 +1199,7 @@ def fetch_sitemap(base_url: str) -> set:
             r = requests.get(url, headers=_get_headers(), timeout=15, verify=False, proxies=proxy_manager.get_proxy())
             if r.status_code != 200:
                 return
-            text = r.text or ""
+            text = r.text
             # Sitemap index → recurse
             if '<sitemapindex' in text:
                 for m in re.finditer(r'<loc>\s*(https?://[^<]+)\s*</loc>', text):
@@ -2075,8 +2075,6 @@ class _RequestEngine:
 
     def _extract_tokens(self, text):
         """Scan response body for CSRF / nonce tokens and cache them."""
-        if not text or not isinstance(text, str):
-            return
         for pat in _RE_CSRF:
             m = pat.search(text)
             if m:
@@ -2135,7 +2133,7 @@ class _RequestEngine:
             "GET", url, headers=self._build_headers(headers), **kwargs
         )
         try:
-            self._extract_tokens(resp.text or '')
+            self._extract_tokens(resp.text)
         except Exception:
             pass
         return resp
@@ -2166,7 +2164,7 @@ class _RequestEngine:
             kw["data"] = data
         resp = self._do_request("POST", url, headers=h, **kw)
         try:
-            self._extract_tokens(resp.text or '')
+            self._extract_tokens(resp.text)
         except Exception:
             pass
         return resp
@@ -3238,7 +3236,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Fetch main page
         resp = sess.get(url, timeout=TIMEOUT, verify=False,
                         proxies=proxy, allow_redirects=True)
-        html = resp.text or ""
+        html         = resp.text
         body_low     = html.lower()[:120000]
         hdrs         = dict(resp.headers)
         hdrs_str     = "\n".join(f"{k}: {v}" for k, v in hdrs.items()).lower()
@@ -3257,9 +3255,9 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 jr = sess.get(js_url, timeout=8, verify=False, proxies=proxy)
                 if jr.status_code == 200:
-                    is_obf, _ = _is_obfuscated(jr.text)
+                    is_obf, _ = _is_obfuscated(jr.text or "")
                     if not is_obf:
-                        js_corpus += jr.text[:50000].lower()
+                        js_corpus += (jr.text or "")[:50000].lower()
                     js_fetched += 1
             except Exception:
                 pass
@@ -3403,7 +3401,7 @@ async def monitor_loop():
                             timeout=TIMEOUT, verify=False,
                             proxies=proxy_manager.get_proxy()
                         )
-                        new_hash  = hashlib.sha256(resp.text.encode()).hexdigest()
+                        new_hash  = hashlib.sha256((resp.text or "").encode()).hexdigest()
                         old_hash  = entry.get("last_hash", "")
                         entry["last_check"] = now
 
@@ -3642,7 +3640,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 try:
                     jr = session.get(js_url, timeout=12, verify=False)
-                    if jr.status_code == 200 and jr.text.strip():
+                    if jr.status_code == 200 and (jr.text or "").strip():
                         # Make a safe filename from the URL path
                         raw_name = src.split('/')[-1].split('?')[0][:60] or f"script_{js_idx}.js"
                         # Ensure .js extension
@@ -3650,7 +3648,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             raw_name += '.js'
                         safe_name = re.sub(r'[^\w\.\-]', '_', raw_name)
                         fname     = f"js/{js_idx:03d}_{safe_name}"
-                        sources[fname]        = jr.text
+                        sources[fname]        = jr.text or ""
                         source_origins[fname] = js_url
                         js_idx += 1
                 except Exception:
@@ -4997,13 +4995,13 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     html = res["html"]
     method = res.get("method", "unknown")
-    html_size_kb = len(html.encode()) / 1024
+    html_size_kb = len((html or "").encode()) / 1024
 
     # Save and send as file
     import io
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d = re.sub(r'[^\w\-]', '_', domain)
-    html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
+    html_buf = io.BytesIO((html or '').encode('utf-8', errors='replace'))
 
     await msg.edit_text(
         f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
@@ -8955,7 +8953,7 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
     try:
         resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
         resp.raise_for_status()
-        html = resp.text or ""
+        html     = resp.text
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "page_url": url}
@@ -10031,7 +10029,7 @@ def _static_extract(url: str) -> dict:
         session.proxies.update(px)
     try:
         resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        html = resp.text or ""
+        html = resp.text
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "html": "", "network_log": [], "page_url": url}
@@ -11832,7 +11830,7 @@ def _deep_asset_fetch(url: str, existing_network_log: list,
     # ── Step 1: Fetch page HTML to find <script src> tags ───────────
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
-        html = resp.text or ""
+        html = resp.text
     except Exception:
         return []
 
@@ -13509,7 +13507,7 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
     try:
         proxy = proxy_manager.get_proxy()
         resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
-        html = resp.text or ""
+        html  = resp.text
         final_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "js_count": 0}
@@ -13726,7 +13724,7 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
         proxy = proxy_manager.get_proxy()
         resp  = requests.get(url, headers=HEADERS, proxies=proxy,
                              timeout=TIMEOUT, verify=False, allow_redirects=True)
-        html = resp.text or ""
+        html      = resp.text
         final_url = resp.url
         http_hdrs = dict(resp.headers)
     except Exception as e:
@@ -13769,7 +13767,7 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
             jr = requests.get(js_url, headers=HEADERS, proxies=proxy_manager.get_proxy(),
                               timeout=TIMEOUT, verify=False)
             if jr.status_code == 200:
-                body = jr.text
+                body = jr.text or ""
                 texts.append((body, js_url.split("/")[-1][:40]))
                 # deobfuscation pass
                 _deob = _deobfuscate_text(body)
@@ -14287,7 +14285,7 @@ def _deobfuscate_sync(url: str, progress_cb=None) -> dict:
     try:
         proxy = proxy_manager.get_proxy()
         resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
-        html = resp.text or ""
+        html  = resp.text
         final_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "js_count": 0}
@@ -15080,7 +15078,6 @@ def _scan_sourcemaps(base_url: str, html_text: str, progress_cb=None) -> list:
     sourceMappingURL=bundle.js.map  — often contains unminified source with secrets.
     Returns list of (text, label) tuples.
     """
-    html_text = html_text if isinstance(html_text, str) else ""
     results = []
     map_urls = set()
     # Find //# sourceMappingURL= references in HTML
@@ -15110,7 +15107,6 @@ def _scan_service_workers(base_url: str, html_text: str, progress_cb=None) -> li
     Find and scan Service Worker JS files (sw.js, service-worker.js, etc.).
     SWs often cache payment config inline.
     """
-    html_text = html_text if isinstance(html_text, str) else ""
     results = []
     sw_candidates = set()
     # Explicit registration: navigator.serviceWorker.register('sw.js')
@@ -16332,7 +16328,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         }
 
     # ── v19: extra scan passes ─────────────────────────────────────────────
-    html_text = (data.get("html") or "")
+    html_text = data.get("html", "")
 
     if progress_cb: progress_cb("🗺️ v19: Scanning source maps...")
     sourcemap_texts = _scan_sourcemaps(url, html_text, progress_cb)
@@ -16520,7 +16516,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         if sdk_pat.search(combined_for_sdk):
             sdk_hints.append(sdk_name)
     # Also scan raw HTML <script src> tags
-    _html_for_sdk = (data.get("html") or "")
+    _html_for_sdk = data.get("html", "")
     for sdk_name, sdk_pat in _PAY_SDK_LOAD_SIGNALS:
         if sdk_name not in sdk_hints and sdk_pat.search(_html_for_sdk):
             sdk_hints.append(sdk_name)
@@ -16539,7 +16535,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     # ── Sitekey extraction (Captcha API response capture) ─────────────────────
     if progress_cb: progress_cb("🔑 Extracting captcha sitekeys from API responses...")
     try:
-        _pk_html   = (data.get("html") or "")
+        _pk_html   = data.get("html", "")
         _pk_all_js = {
             e["url"]: e.get("response_body", "")
             for e in data.get("network_log", [])
@@ -19747,7 +19743,8 @@ def _scan_service_worker(url: str) -> list:
             )
             if r.status_code != 200 or len(r.text) < 100:
                 continue
-            text = r.text or ""
+            text = r.text
+
             # Standard token/CSRF pattern scan
             for key_type, pat in _CSRF_PATTERNS:
                 for m in pat.finditer(text):
@@ -19981,7 +19978,7 @@ def _fetch_next_routes(base_url: str) -> list:
             headers=_get_headers(), proxies=proxy_manager.get_proxy()
         )
         manifest_urls = re.findall(
-            r'/_next/static/[^"\']+/_buildManifest\.js', (r.text or "")
+            r'/_next/static/[^"\']+/_buildManifest\.js', r.text
         )
         for mu in manifest_urls[:2]:
             try:
@@ -19989,7 +19986,7 @@ def _fetch_next_routes(base_url: str) -> list:
                     origin + mu, timeout=6, verify=False,
                     headers=_get_headers(), proxies=proxy_manager.get_proxy()
                 )
-                found = re.findall(r'"(/[^"]+)"', mr.text or "")
+                found = re.findall(r'"(/[^"]+)"', mr.text)
                 routes.extend([f for f in found if f.startswith("/") and len(f) > 1])
             except Exception:
                 pass
@@ -23197,7 +23194,7 @@ def fetch_sitemap(base_url: str) -> set:
             r = requests.get(url, headers=_get_headers(), timeout=15, verify=False, proxies=proxy_manager.get_proxy())
             if r.status_code != 200:
                 return
-            text = r.text or ""
+            text = r.text
             # Sitemap index → recurse
             if '<sitemapindex' in text:
                 for m in re.finditer(r'<loc>\s*(https?://[^<]+)\s*</loc>', text):
@@ -24866,7 +24863,7 @@ async def monitor_loop():
                             timeout=TIMEOUT, verify=False,
                             proxies=proxy_manager.get_proxy()
                         )
-                        new_hash  = hashlib.sha256(resp.text.encode()).hexdigest()
+                        new_hash  = hashlib.sha256((resp.text or "").encode()).hexdigest()
                         old_hash  = entry.get("last_hash", "")
                         entry["last_check"] = now
 
@@ -25105,7 +25102,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 try:
                     jr = session.get(js_url, timeout=12, verify=False)
-                    if jr.status_code == 200 and jr.text.strip():
+                    if jr.status_code == 200 and (jr.text or "").strip():
                         # Make a safe filename from the URL path
                         raw_name = src.split('/')[-1].split('?')[0][:60] or f"script_{js_idx}.js"
                         # Ensure .js extension
@@ -25113,7 +25110,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             raw_name += '.js'
                         safe_name = re.sub(r'[^\w\.\-]', '_', raw_name)
                         fname     = f"js/{js_idx:03d}_{safe_name}"
-                        sources[fname]        = jr.text
+                        sources[fname]        = jr.text or ""
                         source_origins[fname] = js_url
                         js_idx += 1
                 except Exception:
@@ -26311,8 +26308,10 @@ def _detect_checkout_steps(html: str, js_text: str, url: str) -> dict:
     Detect multi-step checkout flow: how many steps exist,
     which step is currently active, and step labels.
     """
-    html    = html    or ''
-    js_text = js_text or ''
+    html    = html    or ""
+    js_text = js_text or ""
+    html    = html    or ""
+    js_text = js_text or ""
     combined = html + js_text
     steps_found: list[dict] = []
     current_step: int | None = None
@@ -26407,8 +26406,10 @@ def _detect_sdk_versions(html: str, js_text: str) -> list:
     Detect loaded gateway SDK versions and variants.
     Returns list of {gateway, sdk, version, variant, note}
     """
-    html     = html    or ''
-    js_text  = js_text or ''
+    html    = html    or ""
+    js_text = js_text or ""
+    html    = html    or ""
+    js_text = js_text or ""
     combined = html + js_text
     results: list[dict] = []
 
@@ -26538,8 +26539,6 @@ def _detect_dynamic_pricing(html: str, js_text: str) -> dict:
     (quantity selectors, tiered pricing, custom amount inputs,
     coupon/promo code discount application).
     """
-    html = html or ''
-    js_text = js_text or ''
     signals: list[dict] = []
     amount_fields: list[str] = []
     min_amount: str | None = None
@@ -26633,7 +26632,7 @@ def _detect_dynamic_pricing(html: str, js_text: str) -> dict:
         r'|(?:Intl\.NumberFormat|new Intl)\s*\(\s*["\']([a-z-]+)["\'][^)]*["\']([A-Z]{3})["\']',
         re.I
     )
-    _cm = _CURR_PAT.search(js_text + html)
+    _cm = _CURR_PAT.search((js_text or "") + (html or ""))
     if _cm:
         currency = _cm.group(1) or _cm.group(3)
 
@@ -26663,9 +26662,7 @@ def _detect_waf_fingerprint(
     cookies, HTML/JS content, and script URLs.
     Returns list of {vendor, confidence, signals, bypass_note}
     """
-    html = html or ''
-    js_text = js_text or ''
-    combined  = html + js_text
+    combined  = (html or '') + (js_text or '')
     headers   = {k.lower(): v for k, v in (headers or {}).items()}
     cookies   = {k.lower(): v for k, v in (cookies or {}).items()}
     results: list[dict] = []
@@ -26802,9 +26799,7 @@ def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
         'source':        'iframe_embed' | 'script_embed',
       }
     """
-    html    = html    if isinstance(html,    str) else ""
-    js_text = js_text if isinstance(js_text, str) else ""
-    combined = html + js_text
+    combined = (html or '') + (js_text or '')
     detected = []
     seen_providers: set = set()
 
@@ -26829,7 +26824,7 @@ def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
         # Check against collected URLs first
         for url_candidate in all_urls:
             for pat in patterns:
-                if re.search(pat, url_candidate or "", re.I):
+                if re.search(pat, url_candidate, re.I):
                     matched_src = url_candidate
                     matched_source = (
                         'iframe_embed' if url_candidate in iframe_srcs
@@ -27218,8 +27213,7 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                                     'card_type':card_type})
                         except Exception: pass
                     elif 'multipart' in ct:
-                        _mbody = body if isinstance(body, str) else (body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else '')
-                        for match in re.finditer(r'name="([^"]+)"', _mbody):
+                        for match in re.finditer(r'name="([^"]+)"', body):
                             k = match.group(1)
                             label,icon,is_dyn,card_type = _classify_field(k,'')
                             fields.append({'name':k,'type':'multipart','value':'',
@@ -27261,7 +27255,7 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                         return
                     if _KEY_RE.search(response.url):
                         return          # skip CDN/external JS
-                    body = (response.body().decode("utf-8", errors="replace") or "")[:12_000]
+                    body = response.body().decode("utf-8", errors="replace")[:12_000]
                     if _KEY_RE.search(body):
                         _resp_bodies[response.url] = body
                 except Exception:
@@ -27603,7 +27597,7 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                         _r = requests.get(_full, timeout=6, verify=False,
                                           headers=_get_headers())
                         if _r.status_code == 200:
-                            _chunk = (_r.text or "")[:500_000]   # FIX 7: was 50_000
+                            _chunk = _r.text[:500_000]   # FIX 7: was 50_000
                             js_text += _chunk
                             _js_budget += len(_chunk)
                     except Exception:
@@ -27678,8 +27672,10 @@ def _find_token_sources(html: str, js_text: str) -> list:
     Returns list of dicts:
       name, value_preview, source_type, location, label
     """
-    html    = html    or ''
-    js_text = js_text or ''
+    html    = html    or ""
+    js_text = js_text or ""
+    html    = html    or ""
+    js_text = js_text or ""
     results = []
     seen    = set()
 
@@ -27730,6 +27726,8 @@ def _find_token_sources(html: str, js_text: str) -> list:
         })
 
     # ── 3. JS text patterns ─────────────────────────────────────
+    html    = html    or ""
+    js_text = js_text or ""
     combined_js = html + '\n' + js_text
     for pat, src_type, location, label in _TOKEN_JS_PATTERNS:
         for m in pat.finditer(combined_js):
@@ -27916,8 +27914,10 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
     HTML + JS မှ reCAPTCHA / hCaptcha / Turnstile site key ဖမ်းသည်။
     Returns {site_key, page_url, base_url, captcha_type} or None
     """
-    html = html or ''
-    js_text = js_text or ''
+    html    = html    or ""
+    js_text = js_text or ""
+    html    = html    or ""
+    js_text = js_text or ""
     combined = html + js_text
 
     # Detect captcha type
@@ -29078,7 +29078,6 @@ def _extract_gateway_error_codes(
 
     Severity: 'hard' | 'soft' | 'info'
     """
-    html = html or ''
     sources = [(html or '', 'static_html'), (js_text or '', 'js_source')]
     for body in (live_bodies or []):
         if isinstance(body, str) and body:
@@ -29976,8 +29975,8 @@ def _check_api_schema(origin: str) -> dict | None:
 
 def _detect_frameworks(html: str, js_text: str, script_urls: list = None) -> list:
     """Detect JS frameworks — affects how form fields and requests work."""
-    html = html or ''
-    js_text = js_text or ''
+    html    = html    or ""
+    js_text = js_text or ""
     # ADD: include script_urls in combined
     combined = html + js_text + ' '.join(script_urls or [])
     _SIGS = [
@@ -30527,9 +30526,11 @@ def _detect_rate_limit_headers(resp_headers: dict, endpoint: str = None,
 
 def _detect_multistep(html: str, js_text: str, url: str) -> dict | None:
     """Detect multi-step / wizard checkout forms."""
-    html = html or ''
-    js_text = js_text or ''
     from concurrent.futures import ThreadPoolExecutor
+    html    = html    or ""
+    js_text = js_text or ""
+    html    = html    or ""
+    js_text = js_text or ""
     combined = html + js_text
 
     _PAT_DATA_STEP  = re.compile(r'data-step=["\'](\d+)["\']', re.I)
@@ -30679,9 +30680,6 @@ def _resolve_dynamic_tokens(
     js_text:       str = '',
     progress_cb=None,
 ) -> dict:
-    # Ensure inputs are always strings
-    html    = html    or ''
-    js_text = js_text or ''
     """
     Extract live values for each dynamic token found in token_sources.
 
@@ -30750,8 +30748,8 @@ def _resolve_dynamic_tokens(
             progress_cb('🔑 Fetching live page for fresh token values…')
         try:
             if engine is not None:
-                resp         = engine.get(url)
-                live_html    = resp.text or ''
+                resp     = engine.get(url)
+                live_html    = resp.text
                 live_cookies = dict(getattr(resp, 'cookies', {}) or {})
                 # also pull from engine session jar
                 if hasattr(engine, '_session'):
@@ -30763,15 +30761,15 @@ def _resolve_dynamic_tokens(
                     url, headers=_get_headers(),
                     timeout=TIMEOUT, verify=False, allow_redirects=True,
                 )
-                live_html    = resp.text or ''
+                live_html    = resp.text
                 live_cookies = dict(resp.cookies)
         except Exception as _e:
             if progress_cb:
                 progress_cb(f'⚠️ Live fetch failed: {str(_e)[:60]}')
             live_html = html   # fall back to cached
 
-    combined_html = (live_html or html or '')
-    combined_js   = combined_html + '\n' + (js_text or '')
+    combined_html = live_html or html
+    combined_js   = (combined_html or "") + '\n' + (js_text or "")
 
     # ── Step 2: hidden_input extraction ───────────────────────
     hidden_map: dict = {}
@@ -31023,8 +31021,6 @@ def _detect_anti_fraud_layers(html: str, js_text: str,
         risk_impact  – human-readable note on what breaks when absent
         confidence   – 'high' | 'medium' | 'low'
     """
-    html = html or ''
-    js_text = js_text or ''
     combined   = (html or '') + (js_text or '') + ' '.join(script_urls or [])
     resp_hdrs  = {k.lower(): v for k, v in (resp_headers or {}).items()}
     form_fields = {
@@ -31448,8 +31444,6 @@ def _detect_device_fingerprints(html: str, js_text: str,
         confidence    – 'high' | 'medium' | 'low'
         note          – human-readable payload impact note
     """
-    html = html or ''
-    js_text = js_text or ''
     combined    = (html or '') + (js_text or '') + ' '.join(script_urls or [])
     resp_hdrs   = {k.lower(): v for k, v in (resp_headers or {}).items()}
 
@@ -31690,8 +31684,6 @@ def _detect_payment_sdks(html: str, js_text: str) -> list:
     Detect payment SDK scripts and version from HTML script tags and JS.
     PATCHED
     """
-    html = html or ''
-    js_text = js_text or ''
     combined = (html or '') + (js_text or '')
     sdks = []
     _SDK_PATTERNS = [
@@ -31743,8 +31735,6 @@ def _detect_hosted_fields_endpoint(
     Stripe Elements / PaymentElement / Braintree / Adyen WebComponents
     all hide the real submit endpoint behind JS. This reconstructs it.
     """
-    html = html or ''
-    js_text = js_text or ''
     result = {
         'gateway':        None,
         'submit_endpoint': None,
@@ -31874,8 +31864,6 @@ def _detect_braintree_hosted_fields(html: str, js_text: str) -> dict | None:
     Detect Braintree hosted-fields pattern from iframe src and JS config.
     Returns detection dict or None.
     """
-    html = html or ''
-    js_text = js_text or ''
     # PATCHED
     _BT_IFRAME = re.compile(
         r'https://assets\.braintreegateway\.com/web/[^"\']+/html/'
@@ -32088,7 +32076,6 @@ def _detect_velocity_checks(
           'summary':  str,
         }
     """
-    html = html or ''
     combined    = (html or '') + (js_text or '')
     hdrs        = {k.lower(): v for k, v in (resp_headers or {}).items()}
     af_vendors  = {af['vendor'] for af in (anti_fraud_layers or [])}
@@ -32802,8 +32789,8 @@ def _detect_webauthn_passkey(html: str, js_text: str) -> list:
     Detect WebAuthn / Passkey / FIDO2 signals.
     Returns list of finding dicts.
     """
-    html = html or ''
-    js_text = js_text or ''
+    html    = html    or ""
+    js_text = js_text or ""
     _WA_PATTERNS = [
         (re.compile(r'navigator\.credentials\.(?:create|get)', re.I),
          'WebAuthn credentials API call'),
@@ -32823,6 +32810,10 @@ def _detect_webauthn_passkey(html: str, js_text: str) -> list:
          'Hardware security key reference'),
     ]
 
+    html    = html    or ""
+    js_text = js_text or ""
+    html    = html    or ""
+    js_text = js_text or ""
     combined = html + js_text
     findings = []
     seen: set = set()
@@ -33809,7 +33800,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── A: Multi-page checkout step tracker ──────────────────────────────
     _checkout_steps = _detect_checkout_steps(
-        html    = static_html + js_html,
+        html    = (static_html or "") + (js_html or ""),
         js_text = js_text,
         url     = url,
     )
@@ -33822,7 +33813,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── B: Gateway SDK version detect ────────────────────────────────────
     _sdk_versions = _detect_sdk_versions(
-        html    = static_html + js_html,
+        html    = (static_html or "") + (js_html or ""),
         js_text = js_text,
     )
     if _sdk_versions and progress_cb:
@@ -33831,7 +33822,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── C: Hosted fields endpoint mapping ───────────────────────────────
     _hosted_ep = _detect_hosted_fields_endpoint(
-        html              = static_html + js_html,
+        html              = (static_html or "") + (js_html or ""),
         js_text           = js_text,
         gateways          = gateways,
         intercepted_requests = real_requests,
@@ -33844,7 +33835,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── C2: Dynamic pricing detect ───────────────────────────────────────
     _dynamic_pricing = _detect_dynamic_pricing(
-        html    = static_html + js_html,
+        html    = (static_html or "") + (js_html or ""),
         js_text = js_text,
     )
     if _dynamic_pricing['is_dynamic'] and progress_cb:
@@ -33853,7 +33844,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── D: WAF / bot-protection fingerprint ─────────────────────────────
     _waf_results = _detect_waf_fingerprint(
-        html    = static_html + js_html,
+        html    = (static_html or "") + (js_html or ""),
         js_text = js_text,
         headers = getattr(_engine, '_last_headers', {}),
         cookies = {c.name: c.value for c in getattr(_engine, 'cookies', [])},
@@ -33864,7 +33855,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── C: Hosted fields endpoint mapping ───────────────────────────────
     _hosted_ep = _detect_hosted_fields_endpoint(
-        html              = static_html + js_html,
+        html              = (static_html or "") + (js_html or ""),
         js_text           = js_text,
         gateways          = gateways,
         intercepted_requests = real_requests,
@@ -33876,7 +33867,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         )
 
     # PATCHED: Braintree hosted fields detection
-    _bt = _detect_braintree_hosted_fields(static_html + js_html, js_text)
+    _bt = _detect_braintree_hosted_fields((static_html or "") + (js_html or ""), js_text)
     if _bt:
         _bt_forms_target = static_forms  # mutate in-place before further processing
         _bt_fields = [
@@ -33903,18 +33894,18 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             })
 
     # PATCHED: payment SDK detection
-    _sdks = _detect_payment_sdks(static_html + js_html, js_text)
+    _sdks = _detect_payment_sdks((static_html or "") + (js_html or ""), js_text)
     if _sdks:
         pass  # stored in return dict below
 
     # ── Extract script src URLs early (needed by fingerprint + anti-fraud) ─
     _script_srcs = re.findall(
-        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', static_html + js_html, re.I)
+        r'<script[^>]+src=["\'\']([^"\']+)["\'\']', (static_html or "") + (js_html or ""), re.I)
 
     # ── Device Fingerprint SDK detection ─────────────────────────────
     if progress_cb: progress_cb("🖐️ Scanning device fingerprint SDKs...")
     _device_fps = _detect_device_fingerprints(
-        html         = static_html + js_html,
+        html         = (static_html or "") + (js_html or ""),
         js_text      = js_text,
         script_urls  = _script_srcs,
         resp_headers = _resp_headers,
@@ -33928,7 +33919,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🛡️ Detecting anti-fraud middleware layers...")
     _all_forms_combined = static_forms + js_forms + subpage_forms
     _anti_fraud = _detect_anti_fraud_layers(
-        html         = static_html + js_html,
+        html         = (static_html or "") + (js_html or ""),
         js_text      = js_text,
         script_urls  = _script_srcs,
         resp_headers = _resp_headers,
@@ -33947,7 +33938,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         v for v in _pw_resp_bodies.values() if v and isinstance(v, str)
     )[:500_000]
     token_sources = _find_token_sources(
-        static_html + js_html + _resp_body_text, js_text
+        (static_html or "") + (js_html or "") + _resp_body_text, (js_text or "")
     )
 
     # Phase 6b: Resolve live token values
@@ -33956,7 +33947,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         url           = url,
         token_sources = token_sources,
         engine        = _engine,
-        html          = static_html + js_html,
+        html          = (static_html or "") + (js_html or ""),
         js_text       = js_text,
         progress_cb   = progress_cb,
     )
@@ -34015,7 +34006,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             logger.debug("sitekey_playwright error: %s", _sk_err)
     # Fallback: static parse if Playwright unavailable or found nothing
     if not _sk_full:
-        _sk_static = _extract_recaptcha_info(static_html + js_html, js_text, url)
+        _sk_static = _extract_recaptcha_info((static_html or "") + (js_html or ""), js_text, url)
         if _sk_static:
             _sk_full = _sk_static
             _sk_full['all_keys'] = [_sk_static] if _sk_static else []
@@ -34427,7 +34418,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH Phase 9: 3DS / SCA signal detection ───────────────────────────
     if progress_cb: progress_cb("🔐 3DS / SCA signal detection...")
-    _combined_text = static_html + js_html + js_text
+    _combined_text = (static_html or "") + (js_html or "") + (js_text or "")
     _3DS_SIGS = [
         (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction'), "Stripe 3DS confirmPayment"),
         (re.compile(r'(?i)stripe\.confirmCardPayment'),                       "Stripe confirmCardPayment"),
@@ -34508,11 +34499,11 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH: Framework detection ───────────────────────────────────────────
     if progress_cb: progress_cb("🔍 Detecting JS framework...")
-    frameworks = _detect_frameworks(static_html + js_html, js_text, script_urls=_script_srcs)
+    frameworks = _detect_frameworks((static_html or "") + (js_html or ""), js_text, script_urls=_script_srcs)
 
     # ── ENH: Multi-step form detection ────────────────────────────────────
     if progress_cb: progress_cb("🪜 Checking for multi-step checkout...")
-    multistep = _detect_multistep(static_html + js_html, js_text, url)
+    multistep = _detect_multistep((static_html or "") + (js_html or ""), js_text, url)
 
     # ── ENH: curl/Python snippet (first payment form or first form) ───────
     if progress_cb: progress_cb("📋 Generating curl/python snippet...")
@@ -34700,7 +34691,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         for r in live_result.get('live_requests', [])
     ]
     response_patterns = _scan_response_patterns(
-        html        = static_html + js_html,
+        html        = (static_html or "") + (js_html or ""),
         js_text     = js_text,
         url         = url,
         live_bodies = _live_bodies,
@@ -34716,7 +34707,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     # ── Velocity checks ───────────────────────────────────────────────
     if progress_cb: progress_cb("⚡ Detecting velocity / rate-limit protection...")
     _velocity = _detect_velocity_checks(
-        html               = static_html + js_html,
+        html               = (static_html or "") + (js_html or ""),
         js_text            = js_text,
         resp_headers       = _resp_headers,
         rate_limit_data    = rate_limit,
@@ -34781,7 +34772,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     # ── ENH 6: WebAuthn / Passkey detection ───────────────────────────────
     if progress_cb: progress_cb("🔐 Scanning WebAuthn / Passkey signals...")
-    _webauthn = _detect_webauthn_passkey(static_html + js_html, js_text)
+    _webauthn = _detect_webauthn_passkey((static_html or "") + (js_html or ""), js_text)
     if progress_cb and _webauthn:
         progress_cb(f"🔐 WebAuthn signals: {len(_webauthn)} found")
 
@@ -34813,7 +34804,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'threeds_signals':    threeds_signals,
         'cors_info':          cors_info,
         'response_patterns':  _scan_response_patterns(
-                                  static_html + js_html, js_text, url, []) \
+                                  (static_html or "") + (js_html or ""), js_text, url, []) \
                                if not locals().get('response_patterns') else response_patterns,
         'token_sources':      token_sources,
         'resolved_tokens':    resolved_tokens,
@@ -34916,7 +34907,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'api_versioning':      api_versioning,
         'well_known':          well_known,
         'authnet_keys':        _find_authnet_keys(
-                                   static_html + js_html,
+                                   (static_html or "") + (js_html or ""),
                                    base_url,
                                ),
         'payment_flow_analysis': {
@@ -37121,7 +37112,7 @@ def _run_payload_flow_sync(
 
     try:
         init_resp    = engine.get(page_url)
-        init_html = init_resp.text or ""
+        init_html    = init_resp.text
         init_cookies = engine.cookies
 
         # FIX: extract inline JS from init_html so token sources catch pk_ keys
@@ -37376,8 +37367,8 @@ def _run_payload_flow_sync(
                     headers={**_get_headers(), 'Accept': 'application/json'},
                     timeout=6, verify=False,
                 )
-                if _bt_r.status_code == 200 and len(_bt_r.text.strip()) > 20:
-                    braintree_client_token = _bt_r.text.strip()[:300]
+                if _bt_r.status_code == 200 and len((_bt_r.text or "").strip()) > 20:
+                    braintree_client_token = (_bt_r.text or "").strip()[:300]
                     token_type = 'braintree'
                     if progress_cb:
                         progress_cb(
@@ -37703,7 +37694,7 @@ def _run_payload_flow_sync(
             )
 
         submit_status = submit_resp.status_code
-        submit_body   = (submit_resp.text or '')[:10_000]
+        submit_body   = submit_resp.text[:10_000]
 
         _redirect_loc = ''
         try:
@@ -41138,7 +41129,7 @@ def _fire_post_classify_sync(data: dict, progress_cb=None) -> dict:
     resolved = dict(data.get('resolved_tokens', {}))
     try:
         _init_resp = _engine.get(page_url)
-        _init_html = _init_resp.text or ""
+        _init_html = _init_resp.text
         _init_js   = '\n'.join(re.findall(r'<script[^>]*>(.+?)</script>',
                                           _init_html, re.S | re.I))
         _fresh_ts  = _find_token_sources(_init_html, _init_js)
@@ -41315,7 +41306,7 @@ def _fire_post_classify_sync(data: dict, progress_cb=None) -> dict:
             _sr = _engine.get(f"{submit_url}?{_qs}", headers=submit_headers)
 
         submit_status = _sr.status_code
-        submit_body   = (_sr.text or '')[:20_000]
+        submit_body   = _sr.text[:20_000]
         try:
             submit_ct    = _sr.headers.get('Content-Type', '')
             redirect_loc = _sr.headers.get('Location', '')
@@ -41524,7 +41515,7 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 if content_len > 500_000:   # skip > 500KB
                     return
                 try:
-                    body_text = response.text() or ""
+                    body_text = response.text()
                     if len(body_text) > 500_000:
                         body_text = body_text[:500_000]
                 except Exception:
@@ -41647,8 +41638,7 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                         except Exception:
                             pass
                     elif 'multipart' in ct:
-                        _mbody = body if isinstance(body, str) else (body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else '')
-                        for match in re.finditer(r'name="([^"]+)"', _mbody):
+                        for match in re.finditer(r'name="([^"]+)"', body):
                             k = match.group(1)
                             label, icon, is_dyn, card_type = _classify_field(k, '')
                             fields.append({
@@ -44446,13 +44436,13 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     html = res["html"]
     method = res.get("method", "unknown")
-    html_size_kb = len(html.encode()) / 1024
+    html_size_kb = len((html or "").encode()) / 1024
 
     # Save and send as file
     import io
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d = re.sub(r'[^\w\-]', '_', domain)
-    html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
+    html_buf = io.BytesIO((html or '').encode('utf-8', errors='replace'))
 
     await msg.edit_text(
         f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
@@ -44984,7 +44974,6 @@ def _extract_strings_from_binary(data: bytes) -> list:
 
 def _parse_android_manifest(xml_text: str) -> dict:
     """AndroidManifest.xml ထဲမှာ package, permissions, activities ရှာ"""
-    xml_text = xml_text if isinstance(xml_text, str) else ""
     info = {"package": "", "permissions": [], "activities": [],
             "services": [], "receivers": [], "meta_data": {}}
     try:
@@ -45015,7 +45004,6 @@ def _parse_android_manifest(xml_text: str) -> dict:
 
 def _parse_ios_info_plist(plist_text: str) -> dict:
     """iOS Info.plist ထဲမှာ bundle ID, keys ရှာ"""
-    plist_text = plist_text if isinstance(plist_text, str) else ""
     info = {"bundle_id": "", "permissions": [], "url_schemes": [], "keys": {}}
     try:
         m = re.search(r'<key>CFBundleIdentifier</key>\s*<string>([^<]+)</string>', plist_text)
@@ -45112,12 +45100,12 @@ def analyze_app_file(filepath: str, progress_cb=None) -> dict:
 
                         # AndroidManifest.xml
                         if name == 'AndroidManifest.xml' and '<manifest' in text:
-                            result["app_info"] = _parse_android_manifest(text or "")
+                            result["app_info"] = _parse_android_manifest(text)
                             result["app_info"]["platform"] = "Android"
 
                         # iOS Info.plist
                         if name.endswith('Info.plist') and 'CFBundle' in text:
-                            result["app_info"] = _parse_ios_info_plist(text or "")
+                            result["app_info"] = _parse_ios_info_plist(text)
                             result["app_info"]["platform"] = "iOS"
 
                         text_count += 1
@@ -45425,12 +45413,12 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
             url, timeout=20, verify=False,
             allow_redirects=True, proxies=proxy
         )
-        result["html"]    = resp.text or ""
+        result["html"]    = resp.text
         result["headers"] = dict(resp.headers)
         result["status"]  = resp.status_code
         result["cookies"] = {c.name: c.value for c in sess.cookies}
 
-        html_text = resp.text or ""
+        html_text = resp.text
         base_url  = url
 
         # ── Collect JS URLs ──────────────────────────────────────
@@ -45520,7 +45508,7 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
                     # Accept JS and also text/plain (some CDNs serve it wrong)
                     if any(x in ct for x in ("javascript", "text/plain", "application/"))\
                             or js_url.endswith(".js"):
-                        text = r.text or ""
+                        text = r.text
                         if len(text) > 10:   # Skip empty/1-line files
                             return (js_url, text[:3_000_000])  # cap 3MB
             except Exception:
@@ -46606,11 +46594,6 @@ def _run_playwright_keydump(url: str) -> dict:
                             for store_name, values_str in stores.items():
                                 if not values_str:
                                     continue
-                                if not isinstance(values_str, str):
-                                    try:
-                                        values_str = str(values_str)
-                                    except Exception:
-                                        continue
                                 kd_hits = {}
                                 for label, (pat, cat_icon) in _KD_PATTERNS.items():
                                     try:
@@ -46662,7 +46645,6 @@ def _extract_framework_globals(html: str) -> str:
     __REDUX_STATE__, __APP_STATE__, _env_, ENV, config, APP_CONFIG.
     Returns all found JSON/value strings joined into one string.
     """
-    html = html or ''
     parts = []
     patterns = [
         # __NEXT_DATA__ script tag
@@ -46695,7 +46677,6 @@ def _extract_html_comments(html: str) -> str:
     Extract all HTML comments <!-- ... --> with content length > 10.
     Useful for finding dev notes, debug info, API keys left in comments.
     """
-    html = html or ''
     comments = re.findall(r'<!--([\s\S]*?)-->', html)
     return "\n".join(c.strip() for c in comments if len(c.strip()) > 10)
 
@@ -47079,7 +47060,7 @@ def _run_keydump_sync(url: str) -> dict:
     # ── Sitekey extraction from API responses ─────────────────────────────────
     try:
         _kd_live_r  = out.get("live_result") or {}
-        _kd_html    = (data.get("html") or "")
+        _kd_html    = data.get("html", "")
         _kd_all_js  = {js_url: js_text for js_url, js_text in data.get("js_sources", [])}
         out["sitekeys"] = _extract_sitekeys_from_data(_kd_html, _kd_all_js, _kd_live_r, url)
     except Exception as _sk_e:
