@@ -35177,9 +35177,47 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
     ]
 
     # ── HEADER BLOCK ─────────────────────────────────────────
-    rc          = data.get('recaptcha')
-    threeds     = data.get('threeds_signals', [])
-    wallets     = data.get('wallets', [])
+    rc              = data.get('recaptcha')
+    threeds         = data.get('threeds_signals', [])
+    wallets         = data.get('wallets', [])
+    checkout_steps  = data.get('checkout_steps') or {}
+    sdk_versions    = data.get('sdk_versions') or []
+    hosted_ep       = data.get('hosted_ep') or {}
+    waf_results     = data.get('waf_results') or {}
+    dynamic_pricing = data.get('dynamic_pricing') or {}
+    anti_fraud      = data.get('anti_fraud_layers') or {}
+    device_fps      = data.get('device_fingerprints') or {}
+    braintree_hosted= data.get('braintree_hosted') or {}
+    payment_sdks    = data.get('payment_sdks') or []
+    velocity_checks = data.get('velocity_checks') or {}
+    coupon_fields   = data.get('coupon_fields') or []
+    redirect_urls   = data.get('redirect_urls') or []
+    idempotency     = data.get('idempotency') or {}
+    webauthn        = data.get('webauthn') or {}
+    gw_completeness = data.get('gw_completeness') or []
+    api_versioning  = data.get('api_versioning') or {}
+    well_known      = data.get('well_known') or {}
+    authnet_keys    = data.get('authnet_keys') or []
+    multistep       = data.get('multistep') or {}
+    cors_info       = data.get('cors_info') or {}
+    csp_info        = data.get('csp_info') or {}
+    graphql_info    = data.get('graphql_info') or {}
+    api_schema      = data.get('api_schema') or {}
+    frameworks      = data.get('frameworks') or []
+    rate_limit      = data.get('rate_limit') or {}
+    auth_cookies    = data.get('auth_cookies') or []
+    token_sources   = data.get('token_sources') or []
+    resolved_tokens = data.get('resolved_tokens') or {}
+    headers         = data.get('headers') or {}
+    client_storage  = data.get('client_storage') or {}
+    live_antifraud  = data.get('live_antifraud') or []
+    live_fingerprints = data.get('live_fingerprints') or []
+    payment_flow    = data.get('payment_flow') or {}
+    payment_flow_analysis = data.get('payment_flow_analysis') or {}
+    form_action_issues = data.get('form_action_issues') or []
+    luhn_findings   = data.get('luhn_findings') or []
+    response_patterns = data.get('response_patterns') or {}
+    ct_mismatches   = data.get('content_type_mismatches') or []
     pay_cnt     = sum(1 for e in all_entries if e.get('is_payment'))
 
     # ── Risk assessment ───────────────────────────────────────
