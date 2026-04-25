@@ -7643,7 +7643,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
 
         # ── Scan rendered HTML ─────────────────────────
         try:
-            final_html = page.content()
+            final_html = page.content() or ""
             _scan_text(final_html, "Rendered HTML (post-JS)")
         except Exception:
             final_html = ""
@@ -7661,7 +7661,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 try:
                     js_resp = ctx.request.get(js_url, timeout=8000)
                     if js_resp.ok:
-                        _scan_text(js_resp.text(), f"JS via browser: {js_url[:80]}")
+                        _scan_text(js_resp.text() or "", f"JS via browser: {js_url[:80]}")
                 except Exception:
                     pass
         except Exception:
@@ -7686,7 +7686,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
 
     # ── Console log scan ─────────────────────────────
     if console_log:
-        _scan_text("\n".join(console_log), "Console log")
+        _scan_text("\n".join(s for s in console_log if s and isinstance(s, str)), "Console log")
 
     # ── Fill user_agent into all findings ────────────
     ua = _get_headers().get("User-Agent", "")
@@ -7774,7 +7774,7 @@ def _sitekey_scan_subpages(base_url: str, progress_cb=None) -> list:
             r = _req.get(sub_url, headers=_get_headers(), timeout=8,
                          allow_redirects=True, verify=False)
             if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
-                new_hits = _static_scan(r.text, r.url)
+                new_hits = _static_scan(r.text or "", r.url)
                 if new_hits:
                     findings.extend(new_hits)
                     if progress_cb:
@@ -8953,7 +8953,7 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
     try:
         resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
         resp.raise_for_status()
-        html     = resp.text
+        html     = resp.text or ""
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "page_url": url}
@@ -8995,7 +8995,7 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
         try:
             r = session.get(js_url, timeout=10, verify=False)
             if r.status_code == 200 and len(r.text) > 50:
-                js_sources[js_url] = r.text[:800_000]
+                js_sources[js_url] = (r.text or "")[:800_000]
         except Exception:
             pass
 
@@ -17877,7 +17877,7 @@ def _cartscan_run_sync(product_url: str, product_name: str,
                 ct = resp.headers.get("content-type", "")
                 if any(x in ct for x in ("javascript", "json", "html")):
                     try:
-                        body = resp.text()
+                        body = (resp.text() or "")
                         if body:
                             network_bodies.append((body, f"network ← {resp.url[:80]}"))
                     except Exception:
@@ -26545,6 +26545,8 @@ def _detect_dynamic_pricing(html: str, js_text: str) -> dict:
     max_amount: str | None = None
     currency: str | None = None
     is_dynamic = False
+    html    = html    or ''
+    js_text = js_text or ''
 
     # ── 1. JS amount watchers ─────────────────────────────────────────────
     _JS_AMT_PATS = [
@@ -26943,6 +26945,8 @@ def _extract_forms_static(html: str, page_url: str) -> list:
     """BeautifulSoup ဖြင့် <form> + orphan fields ကို extract လုပ်သည်။
     ENH: label map, aria-label, placeholder, select options, orphan field capture.
     """
+    if not html or not isinstance(html, str):
+        return []
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, 'html.parser')
 
@@ -34068,16 +34072,16 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         if not html:
             return False
         # Hard signal: known framework marker in page source
-        if _SPA_FRAMEWORK_RE.search(html):
+        if _SPA_FRAMEWORK_RE.search(html or ""):
             return True
         # Hard signal: empty root/app mount div
-        if _SPA_ROOT_RE.search(html):
+        if _SPA_ROOT_RE.search(html or ""):
             return True
         # Soft signal: noscript JS requirement notice
-        if _NOSCRIPT_RE.search(html):
+        if _NOSCRIPT_RE.search(html or ""):
             return True
         # Soft signal: no <form> tags at all AND page is short (shell HTML)
-        has_form = bool(re.search(r'<form[\s>]', html, re.I))
+        has_form = bool(re.search(r'<form[\s>]', html or '', re.I))
         if not has_form and len(html) < 8_000:
             return True
         return False
@@ -34110,7 +34114,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                         r'<form[^>]*action[^>]*/(?:login|signin|auth)',
                         _html, re.I
                     ))
-                    if _is_login and not re.search(r'card|payment|checkout', _html, re.I):
+                    if _is_login and not re.search(r'card|payment|checkout', _html or '', re.I):
                         return None
                     _sub_forms = _extract_forms_static(_html, _sr.url)
                     # ENH: detect embedded platforms in subpages too
@@ -34220,7 +34224,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                     continue
 
                 # Skip if Playwright got same shell back (login wall / redirect)
-                if _is_spa_html(_pw_html) and not re.search(r'<form[\s>]', _pw_html, re.I):
+                if _is_spa_html(_pw_html or '') and not re.search(r'<form[\s>]', _pw_html or '', re.I):
                     continue
 
                 _pw_forms = _extract_forms_static(_pw_html, _sub_url)
@@ -34738,7 +34742,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                r'', re.I)
     for _lr in live_result.get('live_requests', []):
         _combined_lr = (_lr.get('body','') or '') + (_lr.get('post_data','') or '') +                        (_lr.get('response_body','') or '')
-        for _cm in _CARD_NUM_RE.finditer(_combined_lr):
+        for _cm in _CARD_NUM_RE.finditer(_combined_lr or ""):
             _cn = _cm.group(0).replace(' ', '').replace('-', '')
             _valid = _luhn_check(_cn)
             _ep    = _lr.get('url', '')[:80]
