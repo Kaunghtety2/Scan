@@ -4949,8 +4949,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     };
                 """)
                 page = ctx.new_page()
-                # Human-like mouse movement
-                page.mouse.move(300 + int(200 * 0.5), 200 + int(100 * 0.5))
+
+                # ── Behavioral mouse: pre-navigation idle drift ───────────────
+                _bm = _BehavioralMouse(page)
+                _bm.idle_drift(n=1)
+
                 try:
                     page.goto(url, wait_until="networkidle", timeout=60_000)
                 except Exception:
@@ -4958,7 +4961,9 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         page.goto(url, wait_until="load", timeout=40_000)
                     except Exception:
                         pass
-                page.wait_for_timeout(2500)
+
+                # Post-load reading ritual (scroll + hover) — defeats Datadome
+                _bm.pre_interaction_ritual()
                 html = page.content()
                 browser.close()
                 if html and html.strip():
@@ -6129,6 +6134,427 @@ def _pick_ua():
     import random
     return random.choice(_UA_POOL_2026)
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🖱️  BEHAVIORAL MOUSE SIMULATION
+#     Human-like Playwright interaction to bypass Datadome, PerimeterX,
+#     Akamai Bot Manager, Shape Security, and HUMAN Protocol.
+#
+#     Key techniques
+#     ──────────────
+#     • Cubic Bezier mouse paths  — organic curves instead of teleport jumps
+#     • Micro-jitter overshoot    — tiny trembles + slight overshoot/correction
+#     • Per-character typing      — gaussian delay distribution (mean 72ms)
+#     • Realistic scroll          — smooth step-based scrollTo with pauses
+#     • Hover dwell time          — 120-400ms hover before every click
+#     • Focus/blur events         — tab through fields like a real user
+#     • Random idle movements     — occasional purposeless mouse drifts
+#     • Momentum-aware speed      — fast in open space, slow near targets
+# ══════════════════════════════════════════════════════════════════════════════
+
+import random
+import math
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class _BehavioralMouse:
+    """
+    Drop-in human-like mouse + keyboard helper for Playwright sync API.
+
+    Usage (inside any sync_playwright block)
+    ─────────────────────────────────────────
+        bm = _BehavioralMouse(page)
+
+        # Move to coordinates with a natural Bezier arc
+        bm.move_to(450, 300)
+
+        # Hover, dwell, then click — full human sequence
+        bm.human_click(element)
+
+        # Type with gaussian keystroke timing
+        bm.human_type(element, "test@example.com")
+
+        # Scroll the page naturally before interacting
+        bm.scroll_to_element(element)
+
+        # Full form-fill sequence on a payment form
+        bm.fill_form_human(field_map)
+
+        # Random idle drift — call periodically to look alive
+        bm.idle_drift()
+    """
+
+    # ── Timing constants (seconds unless noted) ──────────────────────────
+    TYPING_MEAN_MS  = 72     # mean keystroke delay  (gaussian)
+    TYPING_STD_MS   = 28     # std dev of keystroke delay
+    TYPING_MIN_MS   = 30     # floor — never faster than this
+    TYPING_MAX_MS   = 380    # cap  — occasional long pause
+    TYPO_RATE       = 0.04   # 4 % chance of a typo + backspace correction
+    HOVER_MIN_MS    = 120    # min hover dwell before click
+    HOVER_MAX_MS    = 410    # max hover dwell
+    MOVE_STEPS      = 28     # Bezier path sample points (≈ 28 frames at 60fps)
+    MOVE_STEP_MS    = 14     # ms between each mouse step  (~70px/s feels natural)
+    OVERSHOOT_PX    = 7      # max overshoot past target before correction
+    JITTER_RANGE_PX = 2      # ±px micro-tremor at each step
+    SCROLL_STEP_PX  = 80     # pixels per smooth scroll step
+    SCROLL_STEP_MS  = 40     # ms between scroll steps
+
+    # Common qwerty neighbours for realistic typos
+    _NEIGHBOURS: dict[str, str] = {
+        'a':'sqwz','b':'vghn','c':'xdfv','d':'serfcx','e':'wrsdf',
+        'f':'drtgvc','g':'ftyhn','h':'gyujb','i':'ujko','j':'huikm',
+        'k':'jiol','l':'kop','m':'njk','n':'bhjm','o':'iklp',
+        'p':'ol','q':'wa','r':'edft','s':'waedxz','t':'rfgy',
+        'u':'yhji','v':'cfgb','w':'qase','x':'zsdc','y':'tghu',
+        'z':'asx',
+    }
+
+    def __init__(self, page, viewport_w: int = 1366, viewport_h: int = 768):
+        self._page = page
+        self._vw   = viewport_w
+        self._vh   = viewport_h
+        # Start position: somewhere in the middle of the viewport
+        self._cx   = random.randint(400, 700)
+        self._cy   = random.randint(200, 450)
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _sleep(self, ms: float) -> None:
+        """Playwright-aware sleep — uses wait_for_timeout to keep event loop alive."""
+        try:
+            self._page.wait_for_timeout(max(1, int(ms)))
+        except Exception:
+            time.sleep(ms / 1000)
+
+    def _bezier(self, x0: float, y0: float,
+                x1: float, y1: float,
+                x2: float, y2: float,
+                x3: float, y3: float,
+                t: float) -> tuple[float, float]:
+        """Cubic Bezier point at parameter t ∈ [0,1]."""
+        mt = 1 - t
+        x = (mt**3 * x0 + 3 * mt**2 * t * x1 +
+             3 * mt * t**2 * x2 + t**3 * x3)
+        y = (mt**3 * y0 + 3 * mt**2 * t * y1 +
+             3 * mt * t**2 * y2 + t**3 * y3)
+        return x, y
+
+    def _rand_control(self, x0: float, y0: float,
+                      x3: float, y3: float) -> tuple[float, float, float, float]:
+        """
+        Generate two Bezier control points that create a natural arc.
+        Control points are offset perpendicular to the direct path with
+        a random magnitude — makes each path subtly different.
+        """
+        dx, dy  = x3 - x0, y3 - y0
+        dist    = math.hypot(dx, dy) or 1
+        # Perpendicular unit vector
+        nx, ny  = -dy / dist, dx / dist
+        # Random arc amplitude: 10-35% of the distance
+        amp1 = dist * random.uniform(0.10, 0.35) * random.choice([-1, 1])
+        amp2 = dist * random.uniform(0.10, 0.35) * random.choice([-1, 1])
+        c1x  = x0 + dx * 0.35 + nx * amp1
+        c1y  = y0 + dy * 0.35 + ny * amp1
+        c2x  = x0 + dx * 0.65 + nx * amp2
+        c2y  = y0 + dy * 0.65 + ny * amp2
+        return c1x, c1y, c2x, c2y
+
+    def _jitter(self, v: float, rng: float) -> float:
+        """Add gaussian micro-jitter to a coordinate."""
+        return v + random.gauss(0, rng / 2)
+
+    def _typing_delay(self) -> float:
+        """Gaussian keystroke delay in ms, clamped to [MIN, MAX]."""
+        d = random.gauss(self.TYPING_MEAN_MS, self.TYPING_STD_MS)
+        return max(self.TYPING_MIN_MS, min(self.TYPING_MAX_MS, d))
+
+    def _typo_char(self, char: str) -> str:
+        """Return a realistic neighbouring key typo for char."""
+        neighbours = self._NEIGHBOURS.get(char.lower(), '')
+        if neighbours:
+            return random.choice(neighbours)
+        return char
+
+    # ── Core movement API ─────────────────────────────────────────────────
+
+    def move_to(self, tx: float, ty: float,
+                steps: int | None = None,
+                step_ms: float | None = None) -> None:
+        """
+        Move mouse from current position to (tx, ty) via a cubic Bezier arc.
+        Adds micro-jitter at each step and a small overshoot + correction.
+        """
+        steps   = steps   or self.MOVE_STEPS
+        step_ms = step_ms or self.MOVE_STEP_MS
+        x0, y0  = self._cx, self._cy
+
+        # Optional slight overshoot past target
+        if random.random() < 0.45:
+            ovx = tx + random.uniform(-self.OVERSHOOT_PX, self.OVERSHOOT_PX)
+            ovy = ty + random.uniform(-self.OVERSHOOT_PX, self.OVERSHOOT_PX)
+        else:
+            ovx, ovy = tx, ty
+
+        c1x, c1y, c2x, c2y = self._rand_control(x0, y0, ovx, ovy)
+
+        # Move along Bezier
+        for i in range(1, steps + 1):
+            t    = i / steps
+            # Ease-in-out: slow start and end, fast middle
+            te   = t * t * (3 - 2 * t)
+            px, py = self._bezier(x0, y0, c1x, c1y, c2x, c2y, ovx, ovy, te)
+            px   = self._jitter(px, self.JITTER_RANGE_PX)
+            py   = self._jitter(py, self.JITTER_RANGE_PX)
+            try:
+                self._page.mouse.move(round(px), round(py))
+            except Exception:
+                break
+            # Variable speed — a bit faster in the middle
+            speed = 0.6 + 0.8 * math.sin(math.pi * t)
+            self._sleep(step_ms / speed)
+
+        # Correction move if overshot
+        if (ovx, ovy) != (tx, ty):
+            self._sleep(random.uniform(40, 90))
+            c1x2, c1y2, c2x2, c2y2 = self._rand_control(ovx, ovy, tx, ty)
+            for i in range(1, 8):
+                t  = i / 7
+                px, py = self._bezier(ovx, ovy, c1x2, c1y2, c2x2, c2y2, tx, ty, t)
+                try:
+                    self._page.mouse.move(round(px), round(py))
+                except Exception:
+                    break
+                self._sleep(step_ms * 0.7)
+
+        self._cx, self._cy = tx, ty
+
+    # ── Click / interaction ───────────────────────────────────────────────
+
+    def human_click(self, element=None,
+                    x: float | None = None,
+                    y: float | None = None,
+                    button: str = 'left') -> bool:
+        """
+        Full human click sequence:
+          1. Get element bounding box (if element passed)
+          2. Move to element with Bezier path
+          3. Hover dwell (120-410ms)
+          4. Mouse down + wait (micro-press duration)
+          5. Mouse up
+
+        Returns True on success.
+        """
+        try:
+            if element is not None:
+                try:
+                    element.scroll_into_view_if_needed()
+                    self._sleep(random.uniform(80, 200))
+                    bb = element.bounding_box()
+                    if bb:
+                        # Aim for a slightly randomised point inside the element
+                        tx = bb['x'] + bb['width']  * random.uniform(0.3, 0.7)
+                        ty = bb['y'] + bb['height'] * random.uniform(0.3, 0.7)
+                    else:
+                        element.click(timeout=3000)
+                        return True
+                except Exception:
+                    try:
+                        element.click(timeout=3000)
+                        return True
+                    except Exception:
+                        return False
+            elif x is not None and y is not None:
+                tx, ty = x, y
+            else:
+                return False
+
+            # Move to target
+            self.move_to(tx, ty)
+
+            # Hover dwell
+            dwell = random.uniform(self.HOVER_MIN_MS, self.HOVER_MAX_MS)
+            self._sleep(dwell)
+
+            # Press + short hold + release
+            press_ms = random.uniform(40, 130)
+            self._page.mouse.down(button=button)
+            self._sleep(press_ms)
+            self._page.mouse.up(button=button)
+            return True
+
+        except Exception as e:
+            logger.debug("_BehavioralMouse.human_click error: %s", e)
+            return False
+
+    # ── Typing ────────────────────────────────────────────────────────────
+
+    def human_type(self, element, text: str,
+                   clear_first: bool = True) -> None:
+        """
+        Type text into element with gaussian per-character delays,
+        occasional realistic typo + backspace correction, and random
+        micro-pauses between words.
+        """
+        try:
+            # Focus the element first with a click
+            self.human_click(element)
+            self._sleep(random.uniform(80, 200))
+
+            if clear_first:
+                try:
+                    # Select all and delete
+                    self._page.keyboard.press('Control+a')
+                    self._sleep(random.uniform(50, 120))
+                    self._page.keyboard.press('Delete')
+                    self._sleep(random.uniform(40, 90))
+                except Exception:
+                    pass
+
+            for i, char in enumerate(text):
+                # Occasional typo + correction
+                if (char.isalpha() and
+                        random.random() < self.TYPO_RATE and
+                        len(text) > 4):
+                    typo = self._typo_char(char)
+                    self._page.keyboard.type(typo)
+                    self._sleep(random.uniform(80, 180))
+                    self._page.keyboard.press('Backspace')
+                    self._sleep(random.uniform(60, 140))
+
+                # Type the real character
+                self._page.keyboard.type(char)
+
+                # Delay — longer after spaces and punctuation
+                if char in (' ', '.', ',', '@', '-', '_'):
+                    delay = self._typing_delay() * random.uniform(1.2, 2.5)
+                else:
+                    delay = self._typing_delay()
+
+                # Occasional longer pause (thinking / distraction)
+                if random.random() < 0.03:
+                    delay += random.uniform(300, 1200)
+
+                self._sleep(delay)
+
+        except Exception as e:
+            logger.debug("_BehavioralMouse.human_type error: %s", e)
+
+    # ── Scrolling ─────────────────────────────────────────────────────────
+
+    def scroll_to_element(self, element) -> None:
+        """Scroll element into view with smooth human-paced JS scrolling."""
+        try:
+            element.scroll_into_view_if_needed()
+            self._sleep(random.uniform(150, 350))
+        except Exception:
+            pass
+
+    def scroll_page(self, target_fraction: float = 0.5,
+                    from_fraction: float = 0.0) -> None:
+        """
+        Smoothly scroll from from_fraction to target_fraction of page height.
+        target_fraction = 1.0 means bottom of page.
+        """
+        try:
+            self._page.evaluate(
+                "() => document.body.scrollHeight"
+            )
+            page_h = self._page.evaluate("() => document.body.scrollHeight")
+            from_y = int(page_h * from_fraction)
+            to_y   = int(page_h * target_fraction)
+            step   = self.SCROLL_STEP_PX if to_y > from_y else -self.SCROLL_STEP_PX
+            current = from_y
+            while (step > 0 and current < to_y) or (step < 0 and current > to_y):
+                current = min(to_y, current + step) if step > 0 \
+                          else max(to_y, current + step)
+                self._page.evaluate(f"window.scrollTo(0, {current})")
+                self._sleep(self.SCROLL_STEP_MS + random.uniform(-8, 15))
+        except Exception as e:
+            logger.debug("_BehavioralMouse.scroll_page error: %s", e)
+
+    # ── Idle drift ───────────────────────────────────────────────────────
+
+    def idle_drift(self, n: int = 2) -> None:
+        """
+        Perform n random purposeless mouse movements — makes idle periods
+        look like a real user reading the page before interacting.
+        """
+        for _ in range(n):
+            tx = random.uniform(self._vw * 0.15, self._vw * 0.85)
+            ty = random.uniform(self._vh * 0.15, self._vh * 0.85)
+            self.move_to(tx, ty,
+                         steps=random.randint(12, 22),
+                         step_ms=random.uniform(18, 35))
+            self._sleep(random.uniform(200, 900))
+
+    # ── High-level helpers ────────────────────────────────────────────────
+
+    def fill_form_human(self, field_map: dict[str, str]) -> None:
+        """
+        Fill multiple form fields in a human-like order.
+
+        field_map: {css_selector: value_to_type}
+
+        Example:
+            bm.fill_form_human({
+                'input[name="email"]':    'test@test.com',
+                'input[name="number"]':   '4242424242424242',
+                'input[name="CVV2"]':     '123',
+            })
+        """
+        items = list(field_map.items())
+        # Occasionally skip first field and come back (like a real user tabbing)
+        if len(items) > 2 and random.random() < 0.25:
+            items = items[1:] + [items[0]]
+
+        for selector, value in items:
+            try:
+                el = self._page.query_selector(selector)
+                if not el or not el.is_visible():
+                    continue
+                self.scroll_to_element(el)
+                self._sleep(random.uniform(100, 300))
+                self.human_type(el, str(value))
+                # Brief pause between fields
+                self._sleep(random.uniform(150, 600))
+            except Exception as e:
+                logger.debug("fill_form_human field '%s' error: %s", selector, e)
+
+    def pre_interaction_ritual(self) -> None:
+        """
+        Run before any real interaction:
+          - 1-2 idle drifts (reading phase)
+          - Slow scroll to 30% of page (scanning content)
+          - Brief pause
+        Mimics a user arriving on the page and reading before acting.
+        """
+        self.idle_drift(n=random.randint(1, 2))
+        self.scroll_page(target_fraction=random.uniform(0.25, 0.45))
+        self._sleep(random.uniform(400, 1200))
+        # Move mouse toward page center (natural resting position)
+        self.move_to(
+            self._vw * random.uniform(0.35, 0.65),
+            self._vh * random.uniform(0.30, 0.60),
+        )
+        self._sleep(random.uniform(200, 700))
+
+    def post_fill_ritual(self) -> None:
+        """
+        Run after filling a form, before clicking submit:
+          - Scroll back to review fields
+          - Brief pause (user checking their input)
+          - Idle drift (hesitation)
+        """
+        self.scroll_page(target_fraction=0.3)
+        self._sleep(random.uniform(500, 1500))
+        self.idle_drift(n=1)
+        self._sleep(random.uniform(300, 900))
+
+
 def _build_stealth_browser_args_2026():
     """Return Chromium launch args for 2026 stealth mode."""
     return [
@@ -6490,20 +6916,26 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         except Exception:
             pass
 
-        if progress_cb: progress_cb("🖱️ Simulating user interaction to trigger lazy captchas...")
+        if progress_cb: progress_cb("🖱️ Behavioral mouse: human-like interaction (Bezier paths + typing delays)...")
 
-        # ── Simulate user interaction ─────────────────
+        # ── Behavioral Mouse Simulation ────────────────────────────────────
+        # Replaces simple .click() teleport with Bezier curves, hover dwell,
+        # gaussian keypress timing — defeats Datadome / PerimeterX / HUMAN
+        _bm_ex = _BehavioralMouse(page)
         try:
-            # Scroll slowly to trigger lazy-load captchas
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
-            page.wait_for_timeout(1200)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(1200)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1200)
+            # Phase A: Reading ritual — idle drifts + gradual scroll
+            _bm_ex.pre_interaction_ritual()
 
-            # Click/focus on form fields and buttons to trigger captcha widgets
-            for selector in [
+            # Phase B: Smooth multi-step scroll (replaces instant JS scrollTo)
+            _bm_ex.scroll_page(target_fraction=0.33)
+            _bm_ex.scroll_page(target_fraction=0.66)
+            _bm_ex.scroll_page(target_fraction=1.0)
+            _bm_ex.scroll_page(target_fraction=0.0)  # scroll back up
+            _bm_ex._sleep(800)
+
+            # Phase C: Human-click each visible interactive element
+            # (triggers captcha widgets, lazy-load iframes, React event handlers)
+            _INTERACT_SELECTORS = [
                 'input[type="email"]', 'input[type="text"]',
                 'input[name="amount"]', 'input[name="give-amount"]',
                 'input[name="donation_amount"]', 'input[type="number"]',
@@ -6524,19 +6956,20 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 # Payment step triggers
                 '[class*="payment"]', '[class*="checkout"]',
                 '[class*="give-"]', '[id*="give-"]',
-            ]:
+            ]
+            for _sel in _INTERACT_SELECTORS:
                 try:
-                    el = page.query_selector(selector)
-                    if el and el.is_visible():
-                        el.scroll_into_view_if_needed()
-                        page.wait_for_timeout(300)
-                        try:
-                            el.click(timeout=2000)
-                        except Exception:
-                            pass
-                        page.wait_for_timeout(300)
+                    _el = page.query_selector(_sel)
+                    if _el and _el.is_visible():
+                        _bm_ex.scroll_to_element(_el)
+                        _bm_ex._sleep(random.uniform(100, 250))
+                        _bm_ex.human_click(_el)   # Bezier move + hover dwell
+                        _bm_ex._sleep(random.uniform(200, 500))
                 except Exception:
                     pass
+
+            # Phase D: Brief idle after interaction (bot detection window)
+            _bm_ex.idle_drift(n=1)
 
             # Wait for captcha iframes to appear after interaction
             for captcha_frame_sel in [
@@ -25836,6 +26269,484 @@ def _synth_field_meta(name: str):
     return name.replace("_", " ").title(), None, "✏️"
 
 
+# ══════════════════════════════════════════════════════════════
+# A: Multi-page checkout step tracker
+# ══════════════════════════════════════════════════════════════
+
+def _detect_checkout_steps(html: str, js_text: str, url: str) -> dict:
+    """
+    Detect multi-step checkout flow: how many steps exist,
+    which step is currently active, and step labels.
+    """
+    combined = html + js_text
+    steps_found: list[dict] = []
+    current_step: int | None = None
+    total_steps: int | None = None
+    method = 'unknown'
+
+    # ── 1. aria-label / data-step attributes ──────────────────────────────
+    _ARIA_STEP = re.compile(
+        r'<[^>]+(?:data-step|data-checkout-step|data-step-index)'
+        r'\s*=\s*["\']?(\d+)["\']?[^>]*(?:aria-label=["\']([^"\']*)["\'])?[^>]*>',
+        re.I
+    )
+    for m in _ARIA_STEP.finditer(html):
+        n    = int(m.group(1))
+        lbl  = m.group(2) or f'Step {n}'
+        steps_found.append({'step': n, 'label': lbl.strip()[:60]})
+
+    # ── 2. WooCommerce / Magento / Shopify progress bars ─────────────────
+    _STEP_CLASS = re.compile(
+        r'class=["\'][^"\']*(?:checkout-step|step-item|progress-step|'
+        r'breadcrumb-item|wizard-step|step-indicator)[^"\']*["\'][^>]*>([^<]{2,60})',
+        re.I
+    )
+    for m in _STEP_CLASS.finditer(html):
+        lbl = re.sub(r'\s+', ' ', m.group(1)).strip()
+        if lbl and len(lbl) > 1:
+            steps_found.append({'step': len(steps_found) + 1, 'label': lbl[:60]})
+        if len(steps_found) >= 10:
+            break
+
+    # ── 3. JS step config / router ────────────────────────────────────────
+    _JS_STEPS = [
+        re.compile(r'(?:totalSteps|stepsCount|numSteps|step_count)\s*[=:]\s*(\d+)', re.I),
+        re.compile(r'steps\s*[=:]\s*\[(?:[^]]{0,300})\]', re.I),
+        re.compile(r'(?:currentStep|activeStep|stepIndex|current_step)\s*[=:]\s*(\d+)', re.I),
+    ]
+    for pat in _JS_STEPS:
+        m = pat.search(js_text)
+        if m:
+            try:
+                val = int(m.group(1))
+                if pat.pattern.startswith('(?:totalSteps'):
+                    total_steps = val
+                elif pat.pattern.startswith('(?:currentStep'):
+                    current_step = val
+                method = 'js_config'
+            except (IndexError, ValueError):
+                pass
+
+    # ── 4. URL step indicator ─────────────────────────────────────────────
+    _url_step = re.search(r'/(?:step|checkout)[/_-]?(\d+)|[?&]step=(\d+)', url, re.I)
+    if _url_step:
+        current_step = int(_url_step.group(1) or _url_step.group(2))
+        method = 'url_param'
+
+    # ── 5. Active step detection ─────────────────────────────────────────
+    _ACTIVE_PAT = re.compile(
+        r'class=["\'][^"\']*(?:active|current|is-active|selected)[^"\']*["\'][^>]*>'
+        r'[^<]*(?:[Ss]tep|[Cc]heckout|[Bb]illing|[Ss]hipping|[Pp]ayment)[^<]*<',
+        re.I
+    )
+    if not current_step and _ACTIVE_PAT.search(html):
+        method = 'active_class'
+
+    # ── Dedup + sort ──────────────────────────────────────────────────────
+    seen_labels: set[str] = set()
+    deduped = []
+    for s in steps_found:
+        key = s['label'].lower()[:30]
+        if key not in seen_labels:
+            seen_labels.add(key)
+            deduped.append(s)
+
+    if not total_steps and deduped:
+        total_steps = len(deduped)
+
+    return {
+        'detected':      bool(deduped or total_steps),
+        'total_steps':   total_steps,
+        'current_step':  current_step,
+        'steps':         deduped[:10],
+        'method':        method,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# B: Gateway SDK version detector
+# ══════════════════════════════════════════════════════════════
+
+def _detect_sdk_versions(html: str, js_text: str) -> list:
+    """
+    Detect loaded gateway SDK versions and variants.
+    Returns list of {gateway, sdk, version, variant, note}
+    """
+    combined = html + js_text
+    results: list[dict] = []
+
+    # ── Stripe ────────────────────────────────────────────────────────────
+    _STRIPE_CHECKS = [
+        # Stripe.js v3 (current) — js.stripe.com/v3
+        (re.compile(r'js\.stripe\.com/v3', re.I),
+         'Stripe.js', 'v3', 'current',
+         'PaymentElement / CardElement API'),
+        # Stripe.js v2 (legacy)
+        (re.compile(r'js\.stripe\.com/v2', re.I),
+         'Stripe.js', 'v2', 'legacy',
+         '⚠️ Legacy — createToken() only, no SCA/3DS2'),
+        # Stripe.js v1 (very old)
+        (re.compile(r'js\.stripe\.com/v1', re.I),
+         'Stripe.js', 'v1', 'deprecated',
+         '🔴 Deprecated — no longer supported by Stripe'),
+        # PaymentElement (new embedded UI)
+        (re.compile(r'PaymentElement|stripe\.elements\(\).*payment', re.I | re.S),
+         'Stripe PaymentElement', 'v3+', 'recommended',
+         'Handles cards, wallets, BNPL in one element'),
+        # Stripe Terminal SDK
+        (re.compile(r'stripe-terminal|StripeTerminal', re.I),
+         'Stripe Terminal SDK', 'n/a', 'in-person',
+         'Physical card reader integration'),
+        # Stripe Connect
+        (re.compile(r'stripe\.com/connect|StripeConnect', re.I),
+         'Stripe Connect', 'n/a', 'platform',
+         'Marketplace / multi-party payment'),
+    ]
+    for pat, sdk, ver, variant, note in _STRIPE_CHECKS:
+        if pat.search(combined):
+            results.append({
+                'gateway': 'Stripe', 'sdk': sdk,
+                'version': ver, 'variant': variant, 'note': note,
+            })
+
+    # ── Braintree ─────────────────────────────────────────────────────────
+    _BT_CHECKS = [
+        (re.compile(r'braintree-web@([\d.]+)', re.I),
+         'braintree-web', None, 'current', 'Hosted Fields / Drop-in UI'),
+        (re.compile(r'braintree\.com/web/([\d.]+)', re.I),
+         'Braintree CDN', None, 'cdn', None),
+        (re.compile(r'BraintreeDropIn|dropin\.create', re.I),
+         'Braintree Drop-in UI', None, 'hosted', 'Full UI, no PCI scope'),
+        (re.compile(r'braintree\.hostedFields|hostedFields\.create', re.I),
+         'Braintree Hosted Fields', None, 'custom-ui', 'Custom UI, no PCI scope'),
+        (re.compile(r'PayPalCheckout|braintree.*paypal', re.I | re.S),
+         'Braintree PayPal', None, 'wallet', 'PayPal via Braintree'),
+    ]
+    for pat, sdk, ver, variant, note in _BT_CHECKS:
+        m = pat.search(combined)
+        if m:
+            detected_ver = m.group(1) if ver is None and m.lastindex else (ver or 'unknown')
+            results.append({
+                'gateway': 'Braintree', 'sdk': sdk,
+                'version': detected_ver, 'variant': variant,
+                'note': note or '',
+            })
+
+    # ── Adyen ─────────────────────────────────────────────────────────────
+    _ADYEN_CHECKS = [
+        (re.compile(r'@adyen/web@?([\d.]+)?|adyen-web@([\d.]+)', re.I),
+         'Adyen Web Components', None, 'current',
+         'Drop-in / Component API (v5+)'),
+        (re.compile(r'checkoutshopper.*?adyen\.com', re.I),
+         'Adyen Checkout Shopper', None, 'cdn', None),
+        (re.compile(r'AdyenCheckout\s*\(', re.I),
+         'Adyen Checkout JS', None, 'component', 'AdyenCheckout() init detected'),
+        (re.compile(r'adyen-cse|CSEKey|adyen\.encrypt', re.I),
+         'Adyen CSE (Legacy)', None, 'legacy',
+         '⚠️ Client-Side Encryption legacy — use Web Components'),
+    ]
+    for pat, sdk, ver, variant, note in _ADYEN_CHECKS:
+        m = pat.search(combined)
+        if m:
+            gv = next((g for g in (m.group(1), m.group(2)) if g), ver or 'unknown')
+            results.append({
+                'gateway': 'Adyen', 'sdk': sdk,
+                'version': gv, 'variant': variant, 'note': note or '',
+            })
+
+    # ── Square ────────────────────────────────────────────────────────────
+    _SQ_CHECKS = [
+        (re.compile(r'web\.squarecdn\.com/v([\d]+)', re.I),
+         'Square Web Payments SDK', None, 'current', None),
+        (re.compile(r'SqPaymentForm', re.I),
+         'Square SqPaymentForm', None, 'legacy',
+         '⚠️ Deprecated by Square — migrate to Web Payments SDK'),
+    ]
+    for pat, sdk, ver, variant, note in _SQ_CHECKS:
+        m = pat.search(combined)
+        if m:
+            gv = m.group(1) if m.lastindex else (ver or 'unknown')
+            results.append({
+                'gateway': 'Square', 'sdk': sdk,
+                'version': f'v{gv}' if gv and not gv.startswith('v') else gv,
+                'variant': variant, 'note': note or '',
+            })
+
+    # ── PayPal ────────────────────────────────────────────────────────────
+    if re.search(r'paypal\.com/sdk/js\?client-id=', combined, re.I):
+        _pp_sdk_ver = re.search(r'paypal\.com/sdk/js\?[^"\']*version=([\d.]+)', combined, re.I)
+        results.append({
+            'gateway': 'PayPal', 'sdk': 'PayPal JS SDK',
+            'version': _pp_sdk_ver.group(1) if _pp_sdk_ver else 'current',
+            'variant': 'smart-buttons', 'note': 'PayPal Smart Buttons / Hosted Fields',
+        })
+
+    # ── Klarna ────────────────────────────────────────────────────────────
+    if re.search(r'klarna\.com/v1/library|klarnaCheckout|KlarnaOSM', combined, re.I):
+        results.append({
+            'gateway': 'Klarna', 'sdk': 'Klarna Checkout SDK',
+            'version': 'v1', 'variant': 'embedded', 'note': 'BNPL / Pay Later embed',
+        })
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+# C: Dynamic pricing detector
+# ══════════════════════════════════════════════════════════════
+
+def _detect_dynamic_pricing(html: str, js_text: str) -> dict:
+    """
+    Detect if the amount field value changes dynamically
+    (quantity selectors, tiered pricing, custom amount inputs,
+    coupon/promo code discount application).
+    """
+    signals: list[dict] = []
+    amount_fields: list[str] = []
+    min_amount: str | None = None
+    max_amount: str | None = None
+    currency: str | None = None
+    is_dynamic = False
+
+    # ── 1. JS amount watchers ─────────────────────────────────────────────
+    _JS_AMT_PATS = [
+        (re.compile(r'(?:amount|price|total)\s*[=:]\s*(?:qty|quantity)\s*\*\s*(?:price|rate|unitPrice)', re.I),
+         'quantity × price calculation'),
+        (re.compile(r'addEventListener\(["\'](?:change|input)["\'][^)]*(?:amount|qty|quantity|price)', re.I | re.S),
+         'amount field change listener'),
+        (re.compile(r'(?:calculateTotal|updateTotal|computePrice|recalculate)\s*\(', re.I),
+         'price recalculation function'),
+        (re.compile(r'(?:discount|coupon|promo)\s*(?:code|applied|amount)', re.I),
+         'coupon/promo discount'),
+        (re.compile(r'tiered?(?:Pricing|Price|Rate)|priceTier|price_tier', re.I),
+         'tiered pricing'),
+        (re.compile(r'(?:min|minimum)[_\s]?(?:amount|donation|price)\s*[=:]\s*["\']?([\d.]+)', re.I),
+         'min amount enforced'),
+        (re.compile(r'(?:max|maximum)[_\s]?(?:amount|donation|price)\s*[=:]\s*["\']?([\d.]+)', re.I),
+         'max amount enforced'),
+        (re.compile(r'suggested[_\s]?(?:amounts?|donations?)\s*[=:]\s*\[([^\]]+)\]', re.I),
+         'suggested amounts array'),
+    ]
+    for pat, desc in _JS_AMT_PATS:
+        m = pat.search(js_text)
+        if m:
+            is_dynamic = True
+            extra = {}
+            try:
+                if 'min' in desc:
+                    min_amount = m.group(1)
+                elif 'max' in desc:
+                    max_amount = m.group(1)
+                elif 'suggested' in desc:
+                    extra['suggested'] = m.group(1)[:60]
+            except (IndexError, AttributeError):
+                pass
+            signals.append({'signal': desc, 'source': 'js', **extra})
+
+    # ── 2. HTML amount input attributes ──────────────────────────────────
+    _AMT_INPUT = re.compile(
+        r'<input[^>]+(?:name|id)=["\'][^"\']*(?:amount|price|total|donation)[^"\']*["\'][^>]*>',
+        re.I
+    )
+    for m in _AMT_INPUT.finditer(html):
+        tag = m.group(0)
+        field_name = re.search(r'name=["\']([^"\']+)["\']', tag, re.I)
+        if field_name:
+            amount_fields.append(field_name.group(1))
+        _min = re.search(r'min=["\']?([\d.]+)', tag, re.I)
+        _max = re.search(r'max=["\']?([\d.]+)', tag, re.I)
+        if _min and not min_amount:
+            min_amount = _min.group(1)
+            is_dynamic = True
+            signals.append({'signal': f'HTML min={min_amount}', 'source': 'html'})
+        if _max and not max_amount:
+            max_amount = _max.group(1)
+            is_dynamic = True
+            signals.append({'signal': f'HTML max={max_amount}', 'source': 'html'})
+        _step = re.search(r'step=["\']?([\d.]+)', tag, re.I)
+        if _step:
+            signals.append({'signal': f'Amount step={_step.group(1)}', 'source': 'html'})
+
+    # ── 3. Radio / preset amount buttons ─────────────────────────────────
+    _RADIO_AMT = re.compile(
+        r'<input[^>]+type=["\']radio["\'][^>]*value=["\']?([\d.]+)["\']?[^>]*'
+        r'(?:name=["\'][^"\']*(?:amount|donation|price)[^"\']*["\'])?',
+        re.I
+    )
+    preset_amounts = []
+    for m in _RADIO_AMT.finditer(html):
+        try:
+            v = float(m.group(1))
+            if 0 < v < 100_000:
+                preset_amounts.append(m.group(1))
+        except ValueError:
+            pass
+    if preset_amounts:
+        is_dynamic = True
+        signals.append({
+            'signal':  f'Preset amounts: {", ".join(preset_amounts[:6])}',
+            'source': 'html_radio',
+        })
+
+    # ── 4. Currency detection ─────────────────────────────────────────────
+    _CURR_PAT = re.compile(
+        r'(?:currency|Currency)\s*[=:]\s*["\']([A-Z]{3})["\']'
+        r'|(?:Intl\.NumberFormat|new Intl)\s*\(\s*["\']([a-z-]+)["\'][^)]*["\']([A-Z]{3})["\']',
+        re.I
+    )
+    _cm = _CURR_PAT.search(js_text + html)
+    if _cm:
+        currency = _cm.group(1) or _cm.group(3)
+
+    return {
+        'is_dynamic':    is_dynamic,
+        'amount_fields': list(set(amount_fields))[:6],
+        'min_amount':    min_amount,
+        'max_amount':    max_amount,
+        'currency':      currency,
+        'preset_amounts': list(dict.fromkeys(preset_amounts))[:8],
+        'signals':       signals[:10],
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# D: WAF / bot-protection fingerprinter
+# ══════════════════════════════════════════════════════════════
+
+def _detect_waf_fingerprint(
+    html: str,
+    js_text: str,
+    headers: dict | None = None,
+    cookies: dict | None = None,
+) -> list:
+    """
+    Detect WAF / bot-protection vendors from response headers,
+    cookies, HTML/JS content, and script URLs.
+    Returns list of {vendor, confidence, signals, bypass_note}
+    """
+    combined  = html + js_text
+    headers   = {k.lower(): v for k, v in (headers or {}).items()}
+    cookies   = {k.lower(): v for k, v in (cookies or {}).items()}
+    results: list[dict] = []
+
+    def _build(vendor, confidence, signals, bypass_note=''):
+        results.append({
+            'vendor':      vendor,
+            'confidence':  confidence,   # 'confirmed' | 'likely' | 'possible'
+            'signals':     signals,
+            'bypass_note': bypass_note,
+        })
+
+    # ── Cloudflare ────────────────────────────────────────────────────────
+    _cf_sigs = []
+    if 'cf-ray' in headers:
+        _cf_sigs.append('cf-ray header')
+    if 'cf-cache-status' in headers:
+        _cf_sigs.append('cf-cache-status header')
+    if '__cfruid' in cookies or 'cf_clearance' in cookies:
+        _cf_sigs.append('cf_clearance / __cfruid cookie')
+    if re.search(r'cloudflare|__cf_chl|cf-challenge|cf_chl_prog', combined, re.I):
+        _cf_sigs.append('CF challenge JS')
+    if re.search(r'challenges\.cloudflare\.com|cdn-cgi/challenge', combined, re.I):
+        _cf_sigs.append('CF challenge URL')
+    if _cf_sigs:
+        conf = 'confirmed' if len(_cf_sigs) >= 2 else 'likely'
+        _build('Cloudflare', conf, _cf_sigs,
+               'JS challenge / Turnstile CAPTCHA — requires real browser or Playwright')
+
+    # ── Akamai Bot Manager ────────────────────────────────────────────────
+    _ak_sigs = []
+    if 'akamai-origin-hop' in headers or 'akamai-grn' in headers:
+        _ak_sigs.append('Akamai header')
+    if 'ak_bmsc' in cookies or 'bm_sz' in cookies or '_abck' in cookies:
+        _ak_sigs.append('ak_bmsc / _abck cookie (Bot Manager)')
+    if re.search(r'akamai|akam\b|akmai', combined, re.I):
+        _ak_sigs.append('Akamai JS reference')
+    if re.search(r'_abck|bm_sz|bmak\b', combined, re.I):
+        _ak_sigs.append('Akamai sensor script variable')
+    if _ak_sigs:
+        conf = 'confirmed' if '_abck' in cookies or 'ak_bmsc' in cookies else 'likely'
+        _build('Akamai Bot Manager', conf, _ak_sigs,
+               '_abck cookie requires sensor data from Akamai JS — very hard to bypass headless')
+
+    # ── Imperva / Incapsula ───────────────────────────────────────────────
+    _im_sigs = []
+    if 'x-iinfo' in headers or 'x-cdn' in headers:
+        _im_sigs.append('X-Iinfo / X-CDN header')
+    if 'incap_ses' in cookies or 'visid_incap' in cookies or 'nlbi_' in cookies:
+        _im_sigs.append('incap_ses / visid_incap cookie')
+    if re.search(r'imperva|incapsula|/_Incapsula_Resource', combined, re.I):
+        _im_sigs.append('Imperva/Incapsula JS reference')
+    if _im_sigs:
+        conf = 'confirmed' if len(_im_sigs) >= 2 else 'likely'
+        _build('Imperva / Incapsula', conf, _im_sigs,
+               'Cookie-based challenge — Playwright with stealth plugin often sufficient')
+
+    # ── Kasada ────────────────────────────────────────────────────────────
+    _ks_sigs = []
+    if re.search(r'kasada|kpsdk|kp-telemetry', combined, re.I):
+        _ks_sigs.append('Kasada SDK JS')
+    if 'x-kpsdk-ct' in headers or 'x-kpsdk-st' in headers:
+        _ks_sigs.append('x-kpsdk-ct / x-kpsdk-st header')
+    if 'kpsdk_w' in cookies or 'kpsdk_d' in cookies:
+        _ks_sigs.append('kpsdk cookie')
+    if _ks_sigs:
+        _build('Kasada', 'confirmed', _ks_sigs,
+               '🔴 Very hard — custom crypto + TLS fingerprinting + headless detection')
+
+    # ── DataDome ─────────────────────────────────────────────────────────
+    _dd_sigs = []
+    if re.search(r'datadome\.co|dd\.js|ddm\.js', combined, re.I):
+        _dd_sigs.append('DataDome JS loaded')
+    if 'datadome' in cookies:
+        _dd_sigs.append('datadome cookie')
+    if 'x-datadome-clientid' in headers:
+        _dd_sigs.append('X-DataDome-ClientID header')
+    if _dd_sigs:
+        _build('DataDome', 'confirmed', _dd_sigs,
+               'ML bot detection — missing cookie triggers CAPTCHA or 403')
+
+    # ── PerimeterX / HUMAN ────────────────────────────────────────────────
+    _px_sigs = []
+    if re.search(r'perimeterx|px\.js|pxScript|/_px/', combined, re.I):
+        _px_sigs.append('PerimeterX JS reference')
+    if re.search(r'_pxhd|_pxvid|_px2|_px3', cookies, re.I) or \
+       any(k.startswith('_px') for k in cookies):
+        _px_sigs.append('_px* cookie')
+    if 'x-px-client-uuid' in headers:
+        _px_sigs.append('X-PX-Client-UUID header')
+    if _px_sigs:
+        _build('PerimeterX (HUMAN)', 'confirmed', _px_sigs,
+               'JS sensor data required — Playwright stealth + human-like delays needed')
+
+    # ── Cloudflare Turnstile (standalone) ─────────────────────────────────
+    if re.search(r'challenges\.cloudflare\.com/turnstile|cf-turnstile', combined, re.I):
+        _build('Cloudflare Turnstile', 'confirmed',
+               ['Turnstile widget JS detected'],
+               'CAPTCHA-like widget — cf-turnstile-response token required in POST')
+
+    # ── reCAPTCHA Enterprise (stricter than standard) ─────────────────────
+    if re.search(r'enterprise\.js|recaptcha/enterprise', combined, re.I):
+        _build('reCAPTCHA Enterprise', 'confirmed',
+               ['enterprise.js loaded'],
+               '🔴 Harder than standard reCAPTCHA — token bound to user interaction')
+
+    # ── AWS WAF (managed rules) ────────────────────────────────────────────
+    _aws_sigs = []
+    if 'x-amzn-requestid' in headers or 'x-amz-cf-id' in headers:
+        _aws_sigs.append('AWS header (CF/APIGateway)')
+    if 'aws-waf-token' in cookies:
+        _aws_sigs.append('aws-waf-token cookie')
+    if re.search(r'aws-waf-challenge|awswaf\.js', combined, re.I):
+        _aws_sigs.append('AWS WAF challenge JS')
+    if _aws_sigs:
+        conf = 'confirmed' if 'aws-waf-token' in cookies else 'possible'
+        _build('AWS WAF', conf, _aws_sigs,
+               'Token-based challenge — aws-waf-token cookie required')
+
+    return results
+
+
 def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
     """
     ENH: Detect known third-party donation/payment embed platforms from
@@ -27592,6 +28503,197 @@ def _lookup_cardpointe_code(
     return None
 
 
+def _extract_raw_response_messages(
+    body: str,
+    is_json: bool = False,
+) -> dict:
+    """
+    Extract raw decline / success / action messages that the website itself
+    sends back — as displayed to the customer or returned in the API.
+
+    Returns:
+        {
+          'decline':  [{'text': str, 'source': str, 'category': str}],
+          'success':  [{'text': str, 'source': str, 'category': str}],
+          'action':   [{'text': str, 'source': str, 'category': str}],
+          'raw_code': str | None,   # numeric or string response code
+          'all':      [str],        # flat deduped message list
+        }
+    """
+    decline_msgs: list[dict] = []
+    success_msgs: list[dict] = []
+    action_msgs:  list[dict] = []
+    raw_code:     str | None = None
+    _seen: set[str] = set()
+
+    def _add(bucket: list, text: str, source: str, category: str):
+        key = text.strip().lower()[:80]
+        if key and key not in _seen and len(text.strip()) > 3:
+            _seen.add(key)
+            bucket.append({'text': text.strip()[:200], 'source': source, 'category': category})
+
+    body_low = body.lower()
+
+    # ── 1. JSON parse — structured message fields ─────────────────────────
+    _json_obj: dict | None = None
+    _raw = body.lstrip()
+    if is_json or _raw.startswith(('{', '[')):
+        try:
+            import json as _j
+            _json_obj = _j.loads(body)
+        except Exception:
+            pass
+
+    if isinstance(_json_obj, dict):
+        # Gateway-specific message keys
+        _MSG_KEYS = (
+            'message', 'error_message', 'errorMessage', 'description',
+            'error', 'detail', 'details', 'reason', 'reason_message',
+            'resptext', 'responsetext', 'response_text', 'displayMessage',
+            'display_message', 'customer_message', 'refusalReason',
+            'decline_message', 'text', 'msg',
+        )
+        _CODE_KEYS = (
+            'code', 'error_code', 'errorCode', 'response_code', 'responseCode',
+            'respcode', 'resultCode', 'decline_code', 'result_code', 'respstat',
+            'status_code', 'gateway_code',
+        )
+
+        def _walk(obj, depth=0):
+            nonlocal raw_code
+            if depth > 4 or not isinstance(obj, dict):
+                return
+            for k, v in obj.items():
+                kl = k.lower()
+                if kl in _MSG_KEYS and isinstance(v, str) and v.strip():
+                    txt = v.strip()
+                    if any(w in txt.lower() for w in (
+                        'declin', 'fail', 'invalid', 'insufficient', 'not honor',
+                        'refused', 'reject', 'error', 'wrong', 'incorrect',
+                        'expired', 'stolen', 'lost', 'blocked', 'fraud',
+                        'cvv', 'cvc', 'csc', 'avs', 'zip', 'velocity',
+                        'limit', 'restricted', 'pickup', 'do not',
+                    )):
+                        _add(decline_msgs, txt, f'json:{k}', 'gateway_message')
+                    elif any(w in txt.lower() for w in (
+                        'success', 'approved', 'authoris', 'authoriz', 'confirm',
+                        'thank', 'complete', 'accepted', 'paid', 'captured',
+                    )):
+                        _add(success_msgs, txt, f'json:{k}', 'gateway_message')
+                    elif any(w in txt.lower() for w in (
+                        '3ds', '3d secure', 'authentication', 'verify', 'challenge',
+                        'redirect', 'action required', 'requires', 'otp',
+                    )):
+                        _add(action_msgs, txt, f'json:{k}', 'gateway_message')
+                    else:
+                        # surface ANY message regardless of category
+                        _add(decline_msgs, txt, f'json:{k}', 'generic_message')
+
+                if kl in _CODE_KEYS and isinstance(v, (str, int)) and not raw_code:
+                    raw_code = str(v).strip()[:30]
+
+                if isinstance(v, dict):
+                    _walk(v, depth + 1)
+                elif isinstance(v, list):
+                    for item in v[:5]:
+                        if isinstance(item, dict):
+                            _walk(item, depth + 1)
+                        elif isinstance(item, str) and item.strip():
+                            # list of error strings
+                            _add(decline_msgs, item, f'json:{k}[]', 'error_list')
+
+        _walk(_json_obj)
+
+    # ── 2. Regex — HTML visible error/success messages ────────────────────
+    # Error divs / alert boxes
+    _HTML_ERR_PATS = [
+        # WooCommerce / generic error notice
+        re.compile(r'class=["\'][^"\']*(?:error|alert|notice|warning|danger|invalid|declined)[^"\']*["\'][^>]*>([^<]{6,200})', re.I),
+        # Success notice
+        re.compile(r'class=["\'][^"\']*(?:success|approved|confirm|complete|thank)[^"\']*["\'][^>]*>([^<]{6,200})', re.I),
+        # <p class="error"> / <div class="error">
+        re.compile(r'<(?:p|span|div|li)[^>]+class=["\'][^"\']*(?:msg|message|status)[^"\']*["\'][^>]*>([^<]{6,200})', re.I),
+        # <strong> inside error blocks
+        re.compile(r'class=["\'][^"\']*error[^"\']*["\'][^>]*>[^<]*<strong>([^<]{4,150})</strong>', re.I),
+    ]
+    for pat in _HTML_ERR_PATS:
+        for m in pat.finditer(body):
+            txt = re.sub(r'\s+', ' ', m.group(1)).strip()
+            txt = re.sub(r'<[^>]+>', '', txt).strip()
+            if not txt or len(txt) < 4:
+                continue
+            tl = txt.lower()
+            if any(w in tl for w in ('declin', 'fail', 'invalid', 'insuffici', 'error', 'refused', 'wrong', 'not honor')):
+                _add(decline_msgs, txt, 'html_element', 'visible_error')
+            elif any(w in tl for w in ('success', 'approved', 'thank', 'complete', 'paid')):
+                _add(success_msgs, txt, 'html_element', 'visible_success')
+            elif any(w in tl for w in ('authenticat', 'verify', '3ds', 'challenge', 'redirect')):
+                _add(action_msgs, txt, 'html_element', 'visible_action')
+
+    # ── 3. Inline text patterns ───────────────────────────────────────────
+    _INLINE_DECLINE = [
+        re.compile(r'(?:Your\s+)?[Cc]ard\s+(?:was\s+)?declined[.:,]?\s*([^.<]{0,120})', re.I),
+        re.compile(r'[Tt]ransaction\s+(?:was\s+)?(?:declined|failed|refused)[.:,]?\s*([^.<]{0,120})', re.I),
+        re.compile(r'[Pp]ayment\s+(?:was\s+)?(?:declined|failed|refused|rejected)[.:,]?\s*([^.<]{0,120})', re.I),
+        re.compile(r'[Ii]nsufficient\s+[Ff]unds?[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Dd]o\s+[Nn]ot\s+[Hh]onor[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Ii]nvalid\s+(?:card|CVV|CVC|expiry|account)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Ss]tolen\s+[Cc]ard[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Pp]ick\s+[Uu]p\s+[Cc]ard[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Ll]ost\s+[Cc]ard[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Ss]ecurity\s+(?:code|check)\s+(?:failed|invalid)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Vv]elocity\s+(?:limit|exceeded|check)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Ff]raud\s+(?:detected|suspected|block)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Rr]estricted\s+card[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Ee]xpired?\s+card[.:,]?\s*([^.<]{0,100})', re.I),
+        # Generic: "Error: …" / "Declined: …"
+        re.compile(r'(?:Error|Declined|Refused|Failed)\s*[:\-]\s*([A-Za-z0-9 _\-]{4,100})', re.I),
+    ]
+    _INLINE_SUCCESS = [
+        re.compile(r'[Pp]ayment\s+(?:of\s+[^\s]+\s+)?(?:was\s+)?(?:successful|approved|received|complete)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Tt]ransaction\s+(?:was\s+)?(?:approved|complete|successful)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Oo]rder\s+(?:was\s+)?(?:confirmed|placed|complete)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Tt]hank\s+you\s+for\s+(?:your\s+)?(?:order|payment|purchase)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Aa]uthoriz(?:ed|ation)\s+(?:approved|successful|complete)[.:,]?\s*([^.<]{0,100})', re.I),
+    ]
+    _INLINE_ACTION = [
+        re.compile(r'[Pp]lease\s+(?:verify|authenticate|complete)\s+(?:your\s+)?(?:card|payment|identity)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Yy]our\s+(?:bank|issuer)\s+requires?\s+(?:additional\s+)?(?:verification|authentication)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'3[Dd]\s+[Ss]ecure\s+(?:authentication|verification)\s+(?:required|needed)[.:,]?\s*([^.<]{0,100})', re.I),
+        re.compile(r'[Oo]ne.?[Tt]ime\s+[Pp]assword[.:,]?\s*([^.<]{0,100})', re.I),
+    ]
+
+    for pat in _INLINE_DECLINE:
+        for m in pat.finditer(body):
+            full = (m.group(0) + ' ' + (m.group(1) or '')).strip()[:200]
+            _add(decline_msgs, full, 'inline_text', 'inline_decline')
+
+    for pat in _INLINE_SUCCESS:
+        for m in pat.finditer(body):
+            full = (m.group(0) + ' ' + (m.group(1) or '')).strip()[:200]
+            _add(success_msgs, full, 'inline_text', 'inline_success')
+
+    for pat in _INLINE_ACTION:
+        for m in pat.finditer(body):
+            full = (m.group(0) + ' ' + (m.group(1) or '')).strip()[:200]
+            _add(action_msgs, full, 'inline_text', 'inline_action')
+
+    # ── 4. All flat list ──────────────────────────────────────────────────
+    all_msgs = (
+        [d['text'] for d in success_msgs] +
+        [d['text'] for d in decline_msgs] +
+        [d['text'] for d in action_msgs]
+    )
+
+    return {
+        'decline': decline_msgs,
+        'success': success_msgs,
+        'action':  action_msgs,
+        'raw_code': raw_code,
+        'all':     all_msgs,
+    }
+
+
 def _scan_response_patterns(
     html: str,
     js_text: str,
@@ -27879,12 +28981,33 @@ def _scan_response_patterns(
     else:
         verdict = 'unknown'
 
+    # ── Extract raw response messages from all live bodies ───────────────
+    _raw_msgs: dict = {'decline': [], 'success': [], 'action': [], 'raw_code': None, 'all': []}
+    for body, _ in sources:
+        if body and len(body) > 10:
+            _partial = _extract_raw_response_messages(
+                body,
+                is_json=bool(body.lstrip().startswith(('{', '['))),
+            )
+            for _cat in ('decline', 'success', 'action'):
+                for _item in _partial[_cat]:
+                    if _item['text'] not in {x['text'] for x in _raw_msgs[_cat]}:
+                        _raw_msgs[_cat].append(_item)
+            if not _raw_msgs['raw_code'] and _partial['raw_code']:
+                _raw_msgs['raw_code'] = _partial['raw_code']
+    _raw_msgs['all'] = (
+        [x['text'] for x in _raw_msgs['success']] +
+        [x['text'] for x in _raw_msgs['decline']] +
+        [x['text'] for x in _raw_msgs['action']]
+    )
+
     return {
         'success':        found_success,
         'decline':        found_decline,
         'response_codes': found_codes,
         'stripe_codes':   found_stripe,
         'verdict':        verdict,
+        'raw_messages':   _raw_msgs,
     }
 
 
@@ -31175,7 +32298,11 @@ def _analyze_payment_flow_sequence(data: dict) -> list:
     wallets    = data.get('wallets', [])
     ms         = data.get('multistep') or {}
     threeds    = data.get('threeds_signals', [])
-    hosted_ep  = data.get('hosted_ep', {})
+    hosted_ep       = data.get('hosted_ep', {})
+    checkout_steps  = data.get('checkout_steps', {})
+    sdk_versions    = data.get('sdk_versions', [])
+    dynamic_pricing = data.get('dynamic_pricing', {})
+    waf_results     = data.get('waf_results', [])
     cors       = data.get('cors_info') or {}
     rp         = data.get('response_patterns') or {}
     tok_srcs   = data.get('token_sources', [])
@@ -32607,6 +33734,61 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     gateways = _detect_payment_gateway(static_html + js_html, js_text)
     if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
 
+    # ── A: Multi-page checkout step tracker ──────────────────────────────
+    _checkout_steps = _detect_checkout_steps(
+        html    = static_html + js_html,
+        js_text = js_text,
+        url     = url,
+    )
+    if _checkout_steps['detected'] and progress_cb:
+        progress_cb(
+            f"📋 Checkout steps: {_checkout_steps['total_steps'] or '?'} steps"
+            + (f" (current: step {_checkout_steps['current_step']})"
+               if _checkout_steps['current_step'] else '')
+        )
+
+    # ── B: Gateway SDK version detect ────────────────────────────────────
+    _sdk_versions = _detect_sdk_versions(
+        html    = static_html + js_html,
+        js_text = js_text,
+    )
+    if _sdk_versions and progress_cb:
+        _sdks = ', '.join(f"{s['sdk']} {s['version']}" for s in _sdk_versions[:3])
+        progress_cb(f"🔧 SDK: {_sdks}")
+
+    # ── C: Hosted fields endpoint mapping ───────────────────────────────
+    _hosted_ep = _detect_hosted_fields_endpoint(
+        html              = static_html + js_html,
+        js_text           = js_text,
+        gateways          = gateways,
+        intercepted_requests = real_requests,
+    )
+    if _hosted_ep.get('gateway') and progress_cb:
+        progress_cb(
+            f"🔐 Hosted fields: {_hosted_ep['gateway']} → "
+            f"token via {_hosted_ep.get('token_method','?')}"
+        )
+
+    # ── C2: Dynamic pricing detect ───────────────────────────────────────
+    _dynamic_pricing = _detect_dynamic_pricing(
+        html    = static_html + js_html,
+        js_text = js_text,
+    )
+    if _dynamic_pricing['is_dynamic'] and progress_cb:
+        _dp_sigs = ', '.join(s['signal'] for s in _dynamic_pricing['signals'][:2])
+        progress_cb(f"💰 Dynamic pricing: {_dp_sigs}")
+
+    # ── D: WAF / bot-protection fingerprint ─────────────────────────────
+    _waf_results = _detect_waf_fingerprint(
+        html    = static_html + js_html,
+        js_text = js_text,
+        headers = getattr(_engine, '_last_headers', {}),
+        cookies = {c.name: c.value for c in getattr(_engine, 'cookies', [])},
+    )
+    if _waf_results and progress_cb:
+        _waf_names = ', '.join(w['vendor'] for w in _waf_results[:3])
+        progress_cb(f"🛡️ WAF detected: {_waf_names}")
+
     # ── C: Hosted fields endpoint mapping ───────────────────────────────
     _hosted_ep = _detect_hosted_fields_endpoint(
         html              = static_html + js_html,
@@ -33030,11 +34212,13 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                             viewport={'width': 1366, 'height': 768},
                             ignore_https_errors=True,
                         )
-                        _ctx.add_init_script(
-                            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                            "window.chrome={runtime:{}};"
-                        )
+                        _ctx.add_init_script(_build_stealth_init_script_2026())
                         _pg = _ctx.new_page()
+
+                        # Behavioral mouse for subpage scan
+                        _bm_sub = _BehavioralMouse(_pg)
+                        _bm_sub.idle_drift(n=1)
+
                         try:
                             _pg.goto(_sub_url, wait_until='networkidle', timeout=35_000)
                         except Exception:
@@ -33042,10 +34226,15 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                 _pg.goto(_sub_url, wait_until='load', timeout=20_000)
                             except Exception:
                                 pass
+
+                        # Human reading ritual after load
                         try:
-                            _pg.wait_for_timeout(2500)
+                            _bm_sub.pre_interaction_ritual()
                         except Exception:
-                            pass
+                            try:
+                                _pg.wait_for_timeout(2500)
+                            except Exception:
+                                pass
 
                         # DOM field extraction (mirrors _extract_requests_playwright logic)
                         _dom_raw = _pg.evaluate("""() => {
@@ -33608,6 +34797,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'requests':          real_requests,
         'gateways':          gateways,
         'hosted_ep':         _hosted_ep,
+        'checkout_steps':    _checkout_steps,
+        'sdk_versions':      _sdk_versions,
+        'dynamic_pricing':   _dynamic_pricing,
+        'waf_results':       _waf_results,
         'headers':           headers_result,
         'token_sources':     token_sources,
         'resolved_tokens':   resolved_tokens,
@@ -35197,6 +36390,76 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 lines.append(f"    ❌ Missing: _{escape_md(_mp)}_")
             for _pp in _g.get('present', [])[:3]:
                 lines.append(f"    ✅ `{escape_md(_pp)}`")
+
+    # ── A: Multi-page checkout steps ──────────────────────────────────────
+    if checkout_steps and checkout_steps.get('detected'):
+        _cs_total   = checkout_steps.get('total_steps')
+        _cs_current = checkout_steps.get('current_step')
+        _cs_steps   = checkout_steps.get('steps', [])
+        _cs_hdr = f"Checkout Flow — {_cs_total or '?'} steps"
+        if _cs_current:
+            _cs_hdr += f" (current: step {_cs_current})"
+        lines.append(f"\n{SEP_MINOR}")
+        lines.append(_sec(_cs_hdr, "📋"))
+        if _cs_steps:
+            for _st in _cs_steps[:6]:
+                _active = " ← *current*" if _st['step'] == _cs_current else ""
+                lines.append(f"  Step {_st['step']}: _{escape_md(_st['label'][:50])}_{_active}")
+        else:
+            lines.append(f"  _{checkout_steps.get('method','?')} detection_")
+
+    # ── B: SDK versions ───────────────────────────────────────────────────
+    if sdk_versions:
+        lines.append(f"\n{SEP_MINOR}")
+        lines.append(_sec(f"Gateway SDK Versions  ·  {len(sdk_versions)} detected", "🔧"))
+        for _sv in sdk_versions[:6]:
+            _ver_str = f" `{escape_md(_sv.get('version','?'))}`" if _sv.get('version') else ''
+            _variant = f" _{escape_md(_sv.get('variant',''))}_" if _sv.get('variant') else ''
+            _note    = f"\n    _{escape_md(_sv.get('note','')[:80])}_" if _sv.get('note') else ''
+            _legacy  = ' ⚠️' if 'legacy' in (_sv.get('variant','') + _sv.get('note','')).lower() else ''
+            lines.append(
+                f"  *{escape_md(_sv.get('sdk', _sv.get('gateway','?')))}*"
+                f"{_ver_str}{_variant}{_legacy}{_note}"
+            )
+
+    # ── C: Dynamic pricing ────────────────────────────────────────────────
+    if dynamic_pricing and dynamic_pricing.get('is_dynamic'):
+        lines.append(f"\n{SEP_MINOR}")
+        lines.append(_sec("Dynamic Pricing Detected", "💰"))
+        _dp_sigs  = dynamic_pricing.get('signals', [])
+        _dp_min   = dynamic_pricing.get('min_amount')
+        _dp_max   = dynamic_pricing.get('max_amount')
+        _dp_curr  = dynamic_pricing.get('currency')
+        _dp_pre   = dynamic_pricing.get('preset_amounts', [])
+        _dp_flds  = dynamic_pricing.get('amount_fields', [])
+        if _dp_flds:
+            lines.append(f"  Fields: {' · '.join(f'`{escape_md(f)}`' for f in _dp_flds[:4])}")
+        if _dp_curr:
+            lines.append(f"  Currency: `{escape_md(_dp_curr)}`")
+        if _dp_min or _dp_max:
+            _range = (f"`{escape_md(_dp_min)}`" if _dp_min else '?') + \
+                     ' – ' + (f"`{escape_md(_dp_max)}`" if _dp_max else '∞')
+            lines.append(f"  Range: {_range}")
+        if _dp_pre:
+            lines.append(f"  Presets: {' · '.join(escape_md(p) for p in _dp_pre[:6])}")
+        for _ds in _dp_sigs[:4]:
+            lines.append(f"  • _{escape_md(_ds.get('signal','')[:70])}_")
+
+    # ── D: WAF / bot-protection ───────────────────────────────────────────
+    if waf_results:
+        lines.append(f"\n{SEP_MINOR}")
+        lines.append(_sec(f"WAF / Bot-Protection  ·  {len(waf_results)} detected", "🛡️"))
+        _CONF_ICON = {'confirmed': '🔴', 'likely': '🟠', 'possible': '🟡'}
+        for _w in waf_results[:5]:
+            _ci    = _CONF_ICON.get(_w.get('confidence',''), '⚪')
+            _vend  = escape_md(_w.get('vendor', '?'))
+            _conf  = escape_md(_w.get('confidence', '?'))
+            lines.append(f"  {_ci} *{_vend}* — _{_conf}_")
+            for _ws in _w.get('signals', [])[:2]:
+                lines.append(f"    • `{escape_md(_ws[:60])}`")
+            _bypass = _w.get('bypass_note', '')
+            if _bypass:
+                lines.append(f"    _{escape_md(_bypass[:100])}_")
 
     lines.append(f"\n{SEP_MINOR}")
     lines.append("⚠️ _Authorized testing only._")
@@ -37230,8 +38493,18 @@ def _build_python_script(data: dict) -> str:
     # ── Tokenization step ─────────────────────────────────────────────────
     def _tokenize_step() -> list[str]:
         lines = []
-        if gw_name == 'Stripe' or hosted.get('gateway') == 'Stripe':
-            # Find pk_
+        # ── Resolve effective gateway (gw_name takes priority, hosted fallback) ──
+        _eff_gw = gw_name if gw_name in ('Stripe', 'Braintree', 'Adyen') else hosted.get('gateway', '')
+
+        # ── Collect token target field names from hosted extra_fields ─────────
+        # These are the form fields that receive the gateway token after tokenization
+        _hosted_token_fields: list[str] = [
+            _ef['name'] for _ef in (hosted.get('extra_fields') or [])
+            if _ef.get('name') and _ef.get('required')
+        ]
+
+        if _eff_gw == 'Stripe':
+            # Find pk_ from resolved tokens, token_sources, or hosted extra_fields
             pk_val = ''
             for rt in resolved.values():
                 v = rt.get('value', '')
@@ -37244,9 +38517,17 @@ def _build_python_script(data: dict) -> str:
                     if v and re.match(r'pk_(?:live|test)_', v):
                         pk_val = v
                         break
+            if not pk_val:
+                for _ef in (hosted.get('extra_fields') or []):
+                    v = _ef.get('value', '')
+                    if v and re.match(r'pk_(?:live|test)_', v):
+                        pk_val = v
+                        break
             pk_line = f'STRIPE_PK = "{pk_val}"' if pk_val else 'STRIPE_PK = "pk_live_XXXX"  # replace with actual pk_'
+            _hf_comment = repr(_hosted_token_fields or ['payment_method', 'stripeToken', 'paymentMethodId'])
             lines += [
                 "# ── Step 2: Tokenize card via Stripe ────────────────────────",
+                f"# Hosted-fields token target(s): {_hf_comment}",
                 pk_line,
                 'token_r = requests.post(',
                 '    "https://api.stripe.com/v1/payment_methods",',
@@ -37263,9 +38544,11 @@ def _build_python_script(data: dict) -> str:
                 'stripe_pm = token_r.json().get("id", "")  # pm_xxx',
                 'print(f"Stripe pm_: {stripe_pm[:20]}…")',
             ]
-        elif gw_name == 'Braintree' or hosted.get('gateway') == 'Braintree':
+        elif _eff_gw == 'Braintree':
+            _hf_comment = repr(_hosted_token_fields or ['payment_method_nonce'])
             lines += [
                 "# ── Step 2: Tokenize card via Braintree (requires client SDK) ─",
+                f"# Hosted-fields token target(s): {_hf_comment}",
                 "# Note: Braintree hosted fields tokenize in-browser.",
                 "# Use braintree Python SDK or obtain nonce from JS payload.",
                 'import braintree',
@@ -37289,7 +38572,7 @@ def _build_python_script(data: dict) -> str:
                 '})',
                 'nonce = result.transaction.id if result.is_success else ""',
             ]
-        elif gw_name == 'Adyen' or hosted.get('gateway') == 'Adyen':
+        elif _eff_gw == 'Adyen':
             client_key = ''
             for ef in (hosted.get('extra_fields') or []):
                 if ef.get('name') == 'clientKey' and ef.get('value'):
@@ -37524,7 +38807,7 @@ def _build_python_script(data: dict) -> str:
     ''').lstrip('\n')
 
     # ── PayloadSession class ───────────────────────────────────────────────
-    sc.append(_SESSION_SRC)
+    sc.extend(_SESSION_SRC.splitlines())
 
     sc.append('# ── Test credentials (replace before use) ────────────────────────')
     sc.append('CARD_NUMBER    = "4242424242424242"  # Stripe test Visa')
@@ -37634,7 +38917,7 @@ def _build_python_script(data: dict) -> str:
             return found
 
     ''').lstrip('\n')
-    sc.append(_EXTRACT_TOKENS_SRC)
+    sc.extend(_EXTRACT_TOKENS_SRC.splitlines())
 
 
     # Step 1
@@ -37679,19 +38962,53 @@ def _build_python_script(data: dict) -> str:
 
     # Step 3
     sc.append('')
-    sc.append('# ── Step 3: Submit payment ───────────────────────────────────────')
-    post_lines = _post_body_lines()
+    sc.append('# ── Step 3: Build form body + Submit ────────────────────────────────')
+    sc.append('mapper  = DynamicFieldMapper()')
+    # Build overrides from gateway token if available
+    # Check both gw_name and hosted.get('gateway') so hosted-only detections are covered
+    _eff_gw_step3 = gw_name if gw_name in ('Stripe', 'Braintree', 'Adyen') else hosted.get('gateway', '')
+    # Collect actual target field names from hosted extra_fields (required=True entries)
+    _hosted_req_fields = [
+        ef['name'] for ef in (hosted.get('extra_fields') or [])
+        if ef.get('name') and ef.get('required')
+    ]
+    if _eff_gw_step3 == 'Stripe':
+        sc.append('# Override gateway token field automatically (Stripe pm_xxx → all known token fields)')
+        if _hosted_req_fields:
+            # Build overrides dict from actual detected field names + common fallbacks
+            _all_stripe_fields = list(dict.fromkeys(
+                _hosted_req_fields + ['stripeToken', 'payment_method', 'paymentMethodId']
+            ))
+            _ovr_pairs = ', '.join(f'"{n}": stripe_pm' for n in _all_stripe_fields)
+            sc.append(f'_overrides = {{{_ovr_pairs}}}')
+        else:
+            sc.append('_overrides = {"stripeToken": stripe_pm, "payment_method": stripe_pm,')
+            sc.append('              "paymentMethodId": stripe_pm, "payment_method_nonce": stripe_pm}')
+    elif _eff_gw_step3 == 'Braintree':
+        if _hosted_req_fields:
+            _ovr_pairs = ', '.join(f'"{n}": nonce' for n in _hosted_req_fields)
+            sc.append(f'_overrides = {{{_ovr_pairs}}}')
+        else:
+            sc.append('_overrides = {"payment_method_nonce": nonce}')
+    else:
+        sc.append('_overrides = {}')
+    sc.append('')
+    sc.append('# Build the POST body — auto-typed from field name/type/placeholder')
+    sc.append(f'_raw_fields = {repr(fields)}')
+    sc.append('post_body = mapper.build_form(')
+    sc.append('    fields    = _raw_fields,')
+    sc.append('    overrides = _overrides,')
+    sc.append('    token_map = tokens,   # CSRF/nonce injected automatically')
+    sc.append(')')
+    sc.append('mapper.diff_report(_raw_fields, post_body)')
+    sc.append('print(f"POST body ({len(post_body)} fields): {list(post_body.keys())}")')
+    sc.append('')
     _ct_header = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
 
     if submit_url:
         sc.append(f'resp = session.{method.lower()}(')
         sc.append(f'    "{submit_url}",')
-        if is_json_enc:
-            sc.append('    json={')
-        else:
-            sc.append('    data={')
-        sc.extend(post_lines if post_lines else ['        # no fields detected'])
-        sc.append('    },')
+        sc.append(f'    {"json" if is_json_enc else "data"}=post_body,')
         sc.append('    headers={')
         sc.append(f'        "Content-Type": "{_ct_header}",')
         sc.append('        # Referer, Origin, X-CSRF-Token auto-set by PayloadSession')
@@ -37958,7 +39275,224 @@ def _build_python_script(data: dict) -> str:
         '',
     ]
 
-    # Step 4
+    # ── DynamicFieldMapper class ──────────────────────────────────────────
+    sc += [
+        '# ── Dynamic Field Mapper ────────────────────────────────────────────',
+        'class DynamicFieldMapper:',
+        '    """',
+        '    Automatically fills HTML form fields with correctly typed fake data.',
+        '    Detects field purpose from: name, id, placeholder, autocomplete,',
+        '    type attribute, aria-label, and surrounding <label> text.',
+        '    Returns a ready-to-submit dict.',
+        '    """',
+        '',
+        '    # ── Typed fake data bank ────────────────────────────────────────',
+        '    _DATA: dict = {',
+        '        # identity',
+        '        "email":         "test@protonmail.com",',
+        '        "email_confirm": "test@protonmail.com",',
+        '        "first_name":    "John",',
+        '        "last_name":     "Doe",',
+        '        "full_name":     "John Doe",',
+        '        "username":      "johndoe_test",',
+        '        "company":       "Test Corp",',
+        '        # contact',
+        '        "phone":         "+12125550123",',
+        '        "phone_us":      "2125550123",',
+        '        "mobile":        "+12125550123",',
+        '        # address',
+        '        "address1":      "123 Test Street",',
+        '        "address2":      "Apt 4B",',
+        '        "city":          "New York",',
+        '        "state":         "NY",',
+        '        "state_code":    "NY",',
+        '        "zip":           "10001",',
+        '        "postal_code":   "10001",',
+        '        "country":       "US",',
+        '        "country_code":  "US",',
+        '        # payment',
+        '        "card_number":   "4242424242424242",',
+        '        "card_exp_month":"12",',
+        '        "card_exp_year": "2029",',
+        '        "card_exp_mmyy": "12/29",',
+        '        "card_cvc":      "123",',
+        '        "card_name":     "John Doe",',
+        '        "routing":       "021000021",',
+        '        "account_num":   "000123456789",',
+        '        "account_type":  "checking",',
+        '        # order',
+        '        "amount":        "10.00",',
+        '        "quantity":      "1",',
+        '        "currency":      "USD",',
+        '        # auth',
+        '        "password":      "TestPass123!",',
+        '        "dob":           "1990-01-15",',
+        '        "dob_day":       "15",',
+        '        "dob_month":     "01",',
+        '        "dob_year":      "1990",',
+        '        "ssn_last4":     "1234",',
+        '    }',
+        '',
+        '    # ── Pattern → data_key rules  (checked in order) ───────────────',
+        '    _RULES: list[tuple] = [',
+        '        # (regex_on_attrs, data_key)',
+        '        # email',
+        r'        (re.compile(r"\bemail(?:[-_]?(?:confirm|2|address|addr))?\b",    re.I), "email"),',
+        r'        (re.compile(r"\bconfirm[-_]?(?:email|mail)\b",                   re.I), "email_confirm"),',
+        '        # name',
+        r'        (re.compile(r"\bfirst[-_]?name|fname|given[-_]?name\b",          re.I), "first_name"),',
+        r'        (re.compile(r"\blast[-_]?name|lname|family[-_]?name|surname\b",  re.I), "last_name"),',
+        r'        (re.compile(r"\bfull[-_]?name|your[-_]?name|name\b",             re.I), "full_name"),',
+        r'        (re.compile(r"\bcompany|organisation|organization|business\b",    re.I), "company"),',
+        '        # phone',
+        r'        (re.compile(r"\bphone|telephone|tel(?:ephone)?|mobile|cell\b",   re.I), "phone"),',
+        '        # address',
+        r'        (re.compile(r"\baddress[-_]?(?:1|one|line1)?\b",                 re.I), "address1"),',
+        r'        (re.compile(r"\baddress[-_]?(?:2|two|line2|apt|suite)\b",        re.I), "address2"),',
+        r'        (re.compile(r"\bcity|town|suburb\b",                              re.I), "city"),',
+        r'        (re.compile(r"\bstate|province|region\b",                         re.I), "state"),',
+        r'        (re.compile(r"\bzip|post(?:al)?[-_]?code|eircode\b",             re.I), "zip"),',
+        r'        (re.compile(r"\bcountry\b",                                       re.I), "country"),',
+        '        # card',
+        r'        (re.compile(r"\bcard[-_]?(?:number|num|no)|cc[-_]?num(?:ber)?\b",re.I), "card_number"),',
+        r'        (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:month|mon|mm)\b",     re.I), "card_exp_month"),',
+        r'        (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:year|yr|yy)\b",       re.I), "card_exp_year"),',
+        r'        (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:date|mmyy|mmyyyy)\b", re.I), "card_exp_mmyy"),',
+        r'        (re.compile(r"\bcvc|cvv|csc|security[-_]?code|card[-_]?code\b",  re.I), "card_cvc"),',
+        r'        (re.compile(r"\bcard(?:holder)?[-_]?name|name[-_]?on[-_]?card\b",re.I), "card_name"),',
+        '        # bank',
+        r'        (re.compile(r"\brouting[-_]?(?:number|num|no)\b",                re.I), "routing"),',
+        r'        (re.compile(r"\baccount[-_]?(?:number|num|no)\b",                re.I), "account_num"),',
+        r'        (re.compile(r"\baccount[-_]?type\b",                              re.I), "account_type"),',
+        '        # order/amount',
+        r'        (re.compile(r"\bamount|donation|price|total\b",                   re.I), "amount"),',
+        r'        (re.compile(r"\bquantity|qty\b",                                  re.I), "quantity"),',
+        r'        (re.compile(r"\bcurrency|curr\b",                                 re.I), "currency"),',
+        '        # dob',
+        r'        (re.compile(r"\bdob[-_]?day|birth[-_]?day\b",                    re.I), "dob_day"),',
+        r'        (re.compile(r"\bdob[-_]?month|birth[-_]?month\b",                re.I), "dob_month"),',
+        r'        (re.compile(r"\bdob[-_]?year|birth[-_]?year\b",                  re.I), "dob_year"),',
+        r'        (re.compile(r"\bdob|birth(?:date|day)?\b",                        re.I), "dob"),',
+        '        # auth',
+        r'        (re.compile(r"\bpassword|passwd|pass\b",                          re.I), "password"),',
+        r'        (re.compile(r"\bssn[-_]?last[-_]?4|last[-_]?4\b",               re.I), "ssn_last4"),',
+        '    ]',
+        '',
+        '    # input type → fallback data_key',
+        '    _TYPE_MAP: dict[str, str] = {',
+        '        "email":    "email",',
+        '        "tel":      "phone",',
+        '        "number":   "amount",',
+        '        "password": "password",',
+        '        "date":     "dob",',
+        '        "url":      "https://example.com",',
+        '    }',
+        '',
+        '    def _fingerprint(self, field: dict) -> str:',
+        '        """Combine all text attributes into one string for pattern matching."""',
+        '        return " ".join(filter(None, [',
+        '            field.get("name", ""),',
+        '            field.get("id", ""),',
+        '            field.get("placeholder", ""),',
+        '            field.get("autocomplete", ""),',
+        '            field.get("aria_label", ""),',
+        '            field.get("label", ""),',
+        '        ])).lower()',
+        '',
+        '    def map_field(self, field: dict, overrides: dict | None = None) -> str | None:',
+        '        """',
+        '        Return the correct fake value for a single field dict.',
+        '        field keys expected: name, type, id, placeholder,',
+        '                             autocomplete, label, aria_label.',
+        '        overrides: {field_name: value} — take priority over auto-detect.',
+        '        Returns None for fields that should be skipped (submit, honeypot).',
+        '        """',
+        '        ft  = (field.get("type") or "text").lower()',
+        '        nm  = field.get("name", "")',
+        '',
+        '        # Skip non-data fields',
+        '        if ft in ("submit", "button", "reset", "image", "file", "hidden", "iframe"):',
+        '            return None',
+        '        if field.get("is_honeypot"):',
+        '            return ""   # honeypot must be empty',
+        '',
+        '        # Caller override takes top priority',
+        '        if overrides and nm in overrides:',
+        '            return overrides[nm]',
+        '',
+        '        fp = self._fingerprint(field)',
+        '',
+        '        # Rule scan',
+        '        for pat, data_key in self._RULES:',
+        '            if pat.search(fp):',
+        '                val = self._DATA.get(data_key, "")',
+        '                return val',
+        '',
+        '        # input type fallback',
+        '        if ft in self._TYPE_MAP:',
+        '            return self._TYPE_MAP[ft]',
+        '',
+        '        # radio / checkbox — pick first option value',
+        '        if ft in ("radio", "checkbox"):',
+        '            opts = field.get("options", [])',
+        '            return opts[0].get("value", "on") if opts else "on"',
+        '',
+        '        # select — pick first non-empty option',
+        '        if ft == "select":',
+        '            opts = field.get("options", [])',
+        '            for o in opts:',
+        '                v = o.get("value", "")',
+        '                if v and v not in ("", "0", "none", "select", "choose"):',
+        '                    return v',
+        '            return ""',
+        '',
+        '        # textarea — generic text',
+        '        if ft == "textarea":',
+        '            return "Test comment"',
+        '',
+        '        return ""   # unknown — empty string',
+        '',
+        '    def build_form(self, fields: list[dict],',
+        '                   overrides:  dict | None = None,',
+        '                   token_map:  dict | None = None) -> dict:',
+        '        """',
+        '        Map a full list of field dicts to a submit-ready dict.',
+        '        token_map: resolved CSRF/nonce tokens {name: value}.',
+        '        Returns {field_name: value} skipping None entries.',
+        '        """',
+        '        result = {}',
+        '        for f in fields:',
+        '            nm = f.get("name", "")',
+        '            if not nm:',
+        '                continue',
+        '            # Token fields — inject resolved value',
+        '            if token_map and nm in token_map:',
+        '                result[nm] = token_map[nm]',
+        '                continue',
+        '            val = self.map_field(f, overrides)',
+        '            if val is not None:',
+        '                result[nm] = val',
+        '        return result',
+        '',
+        '    def diff_report(self, fields: list[dict], built: dict):',
+        '        """Print a coverage report — which fields were mapped vs skipped."""',
+        '        print("\\n── Field Mapping Report ──────────────────────────")',
+        '        for f in fields:',
+        '            nm = f.get("name", "")',
+        '            ft = (f.get("type") or "text").lower()',
+        '            if not nm:',
+        '                continue',
+        '            if nm in built:',
+        '                v = str(built[nm])[:30]',
+        '                print(f"  ✅ {nm:<28} = {v}")',
+        '            elif ft in ("submit","button","hidden","iframe"):',
+        '                print(f"  ⏭️  {nm:<28}   [{ft} — skipped]")',
+        '            else:',
+        '                print(f"  ❌ {nm:<28}   [no match — empty]")',
+        '        print("─" * 50)',
+        '',
+        '',
+    ]
     sc.append('')
     sc.append('# ── Step 4: Analyse response ─────────────────────────────────────────')
     sc.append('engine = ResponseAnalysisEngine()')
@@ -46842,10 +48376,9 @@ async def payload_action_callback(
                 await query.message.reply_document(
                     document=f, filename=fname,
                     caption=(
-                        f"📜 *{escape_md(domain)}* — Run-ready Python script\n"
-                        f"_pip install requests · then python {escape_md(fname)}_"
+                        f"📜 {domain} — Run-ready Python script\n"
+                        f"pip install requests  •  python {fname}"
                     ),
-                    parse_mode='Markdown'
                 )
             _os.unlink(tmp)
         except Exception as e:
@@ -47227,6 +48760,8 @@ async def payload_action_callback(
         decl_pats = patterns.get('decline', [])
         code_pats = patterns.get('response_codes', [])
         str_codes = patterns.get('stripe_codes', [])
+        raw_msgs  = patterns.get('raw_messages', {})
+
         if succ_pats or decl_pats or code_pats or str_codes:
             out += ["", "🔍 *Pattern Matches*"]
         for p in succ_pats[:4]:
@@ -47240,6 +48775,26 @@ async def payload_action_callback(
             out.append(f"  # code `{escape_md(c['code'])}` — {escape_md(c['meaning'][:40])}")
         for s in str_codes[:2]:
             out.append(f"  🔴 Stripe `{escape_md(s['code'])}` — {escape_md(s['description'][:50])}")
+
+        # ── Raw site messages ──────────────────────────────────────────
+        _raw_dec  = raw_msgs.get('decline', [])
+        _raw_succ = raw_msgs.get('success', [])
+        _raw_act  = raw_msgs.get('action', [])
+        _raw_code = raw_msgs.get('raw_code')
+        if _raw_succ or _raw_dec or _raw_act or _raw_code:
+            out += ["", "💬 *Site Response Messages*"]
+            if _raw_code:
+                out.append(f"  🔢 Code: `{escape_md(str(_raw_code)[:30])}`")
+            for m in _raw_succ[:3]:
+                _src = f" _{escape_md(m.get('source','')[:20])}_" if m.get('source') else ''
+                out.append(f"  ✅ {escape_md(m['text'][:100])}{_src}")
+            for m in _raw_dec[:5]:
+                _src  = f" _{escape_md(m.get('source','')[:20])}_" if m.get('source') else ''
+                _icon = '🔴' if 'decline' in m.get('category','') or 'error' in m.get('category','') else '⚠️'
+                out.append(f"  {_icon} {escape_md(m['text'][:100])}{_src}")
+            for m in _raw_act[:2]:
+                _src = f" _{escape_md(m.get('source','')[:20])}_" if m.get('source') else ''
+                out.append(f"  🔐 {escape_md(m['text'][:100])}{_src}")
 
         if j_keys:
             out += ["", "📦 *JSON Keys*"]
