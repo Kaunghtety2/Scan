@@ -27261,7 +27261,7 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                         return
                     if _KEY_RE.search(response.url):
                         return          # skip CDN/external JS
-                    body = response.body().decode("utf-8", errors="replace") or ""[:12_000]
+                    body = (response.body().decode("utf-8", errors="replace") or "")[:12_000]
                     if _KEY_RE.search(body):
                         _resp_bodies[response.url] = body
                 except Exception:
@@ -45425,7 +45425,7 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
             url, timeout=20, verify=False,
             allow_redirects=True, proxies=proxy
         )
-        result["html"]    = resp.text
+        result["html"]    = resp.text or ""
         result["headers"] = dict(resp.headers)
         result["status"]  = resp.status_code
         result["cookies"] = {c.name: c.value for c in sess.cookies}
