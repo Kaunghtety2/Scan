@@ -1199,7 +1199,7 @@ def fetch_sitemap(base_url: str) -> set:
             r = requests.get(url, headers=_get_headers(), timeout=15, verify=False, proxies=proxy_manager.get_proxy())
             if r.status_code != 200:
                 return
-            text = r.text
+            text = r.text or ""
             # Sitemap index → recurse
             if '<sitemapindex' in text:
                 for m in re.finditer(r'<loc>\s*(https?://[^<]+)\s*</loc>', text):
@@ -3238,7 +3238,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Fetch main page
         resp = sess.get(url, timeout=TIMEOUT, verify=False,
                         proxies=proxy, allow_redirects=True)
-        html         = resp.text
+        html = resp.text or ""
         body_low     = html.lower()[:120000]
         hdrs         = dict(resp.headers)
         hdrs_str     = "\n".join(f"{k}: {v}" for k, v in hdrs.items()).lower()
@@ -8955,7 +8955,7 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
     try:
         resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
         resp.raise_for_status()
-        html     = resp.text
+        html = resp.text or ""
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "page_url": url}
@@ -10031,7 +10031,7 @@ def _static_extract(url: str) -> dict:
         session.proxies.update(px)
     try:
         resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        html = resp.text
+        html = resp.text or ""
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "html": "", "network_log": [], "page_url": url}
@@ -11832,7 +11832,7 @@ def _deep_asset_fetch(url: str, existing_network_log: list,
     # ── Step 1: Fetch page HTML to find <script src> tags ───────────
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
-        html = resp.text
+        html = resp.text or ""
     except Exception:
         return []
 
@@ -13509,7 +13509,7 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
     try:
         proxy = proxy_manager.get_proxy()
         resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
-        html  = resp.text
+        html = resp.text or ""
         final_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "js_count": 0}
@@ -13726,7 +13726,7 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
         proxy = proxy_manager.get_proxy()
         resp  = requests.get(url, headers=HEADERS, proxies=proxy,
                              timeout=TIMEOUT, verify=False, allow_redirects=True)
-        html      = resp.text
+        html = resp.text or ""
         final_url = resp.url
         http_hdrs = dict(resp.headers)
     except Exception as e:
@@ -14287,7 +14287,7 @@ def _deobfuscate_sync(url: str, progress_cb=None) -> dict:
     try:
         proxy = proxy_manager.get_proxy()
         resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
-        html  = resp.text
+        html = resp.text or ""
         final_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "js_count": 0}
@@ -19747,8 +19747,7 @@ def _scan_service_worker(url: str) -> list:
             )
             if r.status_code != 200 or len(r.text) < 100:
                 continue
-            text = r.text
-
+            text = r.text or ""
             # Standard token/CSRF pattern scan
             for key_type, pat in _CSRF_PATTERNS:
                 for m in pat.finditer(text):
@@ -19982,7 +19981,7 @@ def _fetch_next_routes(base_url: str) -> list:
             headers=_get_headers(), proxies=proxy_manager.get_proxy()
         )
         manifest_urls = re.findall(
-            r'/_next/static/[^"\']+/_buildManifest\.js', r.text
+            r'/_next/static/[^"\']+/_buildManifest\.js', (r.text or "")
         )
         for mu in manifest_urls[:2]:
             try:
@@ -23198,7 +23197,7 @@ def fetch_sitemap(base_url: str) -> set:
             r = requests.get(url, headers=_get_headers(), timeout=15, verify=False, proxies=proxy_manager.get_proxy())
             if r.status_code != 200:
                 return
-            text = r.text
+            text = r.text or ""
             # Sitemap index → recurse
             if '<sitemapindex' in text:
                 for m in re.finditer(r'<loc>\s*(https?://[^<]+)\s*</loc>', text):
@@ -26539,6 +26538,8 @@ def _detect_dynamic_pricing(html: str, js_text: str) -> dict:
     (quantity selectors, tiered pricing, custom amount inputs,
     coupon/promo code discount application).
     """
+    html = html or ''
+    js_text = js_text or ''
     signals: list[dict] = []
     amount_fields: list[str] = []
     min_amount: str | None = None
@@ -26662,6 +26663,8 @@ def _detect_waf_fingerprint(
     cookies, HTML/JS content, and script URLs.
     Returns list of {vendor, confidence, signals, bypass_note}
     """
+    html = html or ''
+    js_text = js_text or ''
     combined  = html + js_text
     headers   = {k.lower(): v for k, v in (headers or {}).items()}
     cookies   = {k.lower(): v for k, v in (cookies or {}).items()}
@@ -27258,7 +27261,7 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                         return
                     if _KEY_RE.search(response.url):
                         return          # skip CDN/external JS
-                    body = response.body().decode("utf-8", errors="replace")[:12_000]
+                    body = response.body().decode("utf-8", errors="replace") or ""[:12_000]
                     if _KEY_RE.search(body):
                         _resp_bodies[response.url] = body
                 except Exception:
@@ -27600,7 +27603,7 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
                         _r = requests.get(_full, timeout=6, verify=False,
                                           headers=_get_headers())
                         if _r.status_code == 200:
-                            _chunk = _r.text[:500_000]   # FIX 7: was 50_000
+                            _chunk = (_r.text or "")[:500_000]   # FIX 7: was 50_000
                             js_text += _chunk
                             _js_budget += len(_chunk)
                     except Exception:
@@ -27913,6 +27916,8 @@ def _extract_recaptcha_info(html: str, js_text: str, page_url: str) -> dict | No
     HTML + JS မှ reCAPTCHA / hCaptcha / Turnstile site key ဖမ်းသည်။
     Returns {site_key, page_url, base_url, captcha_type} or None
     """
+    html = html or ''
+    js_text = js_text or ''
     combined = html + js_text
 
     # Detect captcha type
@@ -29073,6 +29078,7 @@ def _extract_gateway_error_codes(
 
     Severity: 'hard' | 'soft' | 'info'
     """
+    html = html or ''
     sources = [(html or '', 'static_html'), (js_text or '', 'js_source')]
     for body in (live_bodies or []):
         if isinstance(body, str) and body:
@@ -29970,6 +29976,8 @@ def _check_api_schema(origin: str) -> dict | None:
 
 def _detect_frameworks(html: str, js_text: str, script_urls: list = None) -> list:
     """Detect JS frameworks — affects how form fields and requests work."""
+    html = html or ''
+    js_text = js_text or ''
     # ADD: include script_urls in combined
     combined = html + js_text + ' '.join(script_urls or [])
     _SIGS = [
@@ -30519,6 +30527,8 @@ def _detect_rate_limit_headers(resp_headers: dict, endpoint: str = None,
 
 def _detect_multistep(html: str, js_text: str, url: str) -> dict | None:
     """Detect multi-step / wizard checkout forms."""
+    html = html or ''
+    js_text = js_text or ''
     from concurrent.futures import ThreadPoolExecutor
     combined = html + js_text
 
@@ -31013,6 +31023,8 @@ def _detect_anti_fraud_layers(html: str, js_text: str,
         risk_impact  – human-readable note on what breaks when absent
         confidence   – 'high' | 'medium' | 'low'
     """
+    html = html or ''
+    js_text = js_text or ''
     combined   = (html or '') + (js_text or '') + ' '.join(script_urls or [])
     resp_hdrs  = {k.lower(): v for k, v in (resp_headers or {}).items()}
     form_fields = {
@@ -31436,6 +31448,8 @@ def _detect_device_fingerprints(html: str, js_text: str,
         confidence    – 'high' | 'medium' | 'low'
         note          – human-readable payload impact note
     """
+    html = html or ''
+    js_text = js_text or ''
     combined    = (html or '') + (js_text or '') + ' '.join(script_urls or [])
     resp_hdrs   = {k.lower(): v for k, v in (resp_headers or {}).items()}
 
@@ -31676,6 +31690,8 @@ def _detect_payment_sdks(html: str, js_text: str) -> list:
     Detect payment SDK scripts and version from HTML script tags and JS.
     PATCHED
     """
+    html = html or ''
+    js_text = js_text or ''
     combined = (html or '') + (js_text or '')
     sdks = []
     _SDK_PATTERNS = [
@@ -31727,6 +31743,8 @@ def _detect_hosted_fields_endpoint(
     Stripe Elements / PaymentElement / Braintree / Adyen WebComponents
     all hide the real submit endpoint behind JS. This reconstructs it.
     """
+    html = html or ''
+    js_text = js_text or ''
     result = {
         'gateway':        None,
         'submit_endpoint': None,
@@ -31856,6 +31874,8 @@ def _detect_braintree_hosted_fields(html: str, js_text: str) -> dict | None:
     Detect Braintree hosted-fields pattern from iframe src and JS config.
     Returns detection dict or None.
     """
+    html = html or ''
+    js_text = js_text or ''
     # PATCHED
     _BT_IFRAME = re.compile(
         r'https://assets\.braintreegateway\.com/web/[^"\']+/html/'
@@ -32068,6 +32088,7 @@ def _detect_velocity_checks(
           'summary':  str,
         }
     """
+    html = html or ''
     combined    = (html or '') + (js_text or '')
     hdrs        = {k.lower(): v for k, v in (resp_headers or {}).items()}
     af_vendors  = {af['vendor'] for af in (anti_fraud_layers or [])}
@@ -32781,6 +32802,8 @@ def _detect_webauthn_passkey(html: str, js_text: str) -> list:
     Detect WebAuthn / Passkey / FIDO2 signals.
     Returns list of finding dicts.
     """
+    html = html or ''
+    js_text = js_text or ''
     _WA_PATTERNS = [
         (re.compile(r'navigator\.credentials\.(?:create|get)', re.I),
          'WebAuthn credentials API call'),
@@ -37098,7 +37121,7 @@ def _run_payload_flow_sync(
 
     try:
         init_resp    = engine.get(page_url)
-        init_html    = init_resp.text
+        init_html = init_resp.text or ""
         init_cookies = engine.cookies
 
         # FIX: extract inline JS from init_html so token sources catch pk_ keys
@@ -41115,7 +41138,7 @@ def _fire_post_classify_sync(data: dict, progress_cb=None) -> dict:
     resolved = dict(data.get('resolved_tokens', {}))
     try:
         _init_resp = _engine.get(page_url)
-        _init_html = _init_resp.text
+        _init_html = _init_resp.text or ""
         _init_js   = '\n'.join(re.findall(r'<script[^>]*>(.+?)</script>',
                                           _init_html, re.S | re.I))
         _fresh_ts  = _find_token_sources(_init_html, _init_js)
@@ -45407,7 +45430,7 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
         result["status"]  = resp.status_code
         result["cookies"] = {c.name: c.value for c in sess.cookies}
 
-        html_text = resp.text
+        html_text = resp.text or ""
         base_url  = url
 
         # ── Collect JS URLs ──────────────────────────────────────
@@ -45497,7 +45520,7 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
                     # Accept JS and also text/plain (some CDNs serve it wrong)
                     if any(x in ct for x in ("javascript", "text/plain", "application/"))\
                             or js_url.endswith(".js"):
-                        text = r.text
+                        text = r.text or ""
                         if len(text) > 10:   # Skip empty/1-line files
                             return (js_url, text[:3_000_000])  # cap 3MB
             except Exception:
@@ -46639,6 +46662,7 @@ def _extract_framework_globals(html: str) -> str:
     __REDUX_STATE__, __APP_STATE__, _env_, ENV, config, APP_CONFIG.
     Returns all found JSON/value strings joined into one string.
     """
+    html = html or ''
     parts = []
     patterns = [
         # __NEXT_DATA__ script tag
@@ -46671,6 +46695,7 @@ def _extract_html_comments(html: str) -> str:
     Extract all HTML comments <!-- ... --> with content length > 10.
     Useful for finding dev notes, debug info, API keys left in comments.
     """
+    html = html or ''
     comments = re.findall(r'<!--([\s\S]*?)-->', html)
     return "\n".join(c.strip() for c in comments if len(c.strip()) > 10)
 
