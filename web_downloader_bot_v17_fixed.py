@@ -26419,6 +26419,46 @@ def _extract_requests_playwright(url: str, progress_cb=None) -> list:
 
                     extractFrom(document, 'main');
 
+                    // ── A: Shadow DOM traversal ──────────────────────────────
+                    function extractShadowRoots(root) {
+                        root.querySelectorAll('*').forEach(el => {
+                            if (el.shadowRoot) {
+                                extractFrom(el.shadowRoot, 'shadow_' + (el.id || el.tagName.toLowerCase()));
+                                extractShadowRoots(el.shadowRoot);
+                            }
+                        });
+                    }
+                    extractShadowRoots(document);
+
+                    // ── A: Stripe Elements mount point → reconstruct synthetic fields ─
+                    const stripeContainers = document.querySelectorAll(
+                        '[id*="card-element"],[id*="card-number"],[id*="card-expiry"],' +
+                        '[id*="card-cvc"],[class*="StripeElement"],[data-elements-stable-field-name],' +
+                        '[id*="payment-element"],[class*="stripe-element"]'
+                    );
+                    if (stripeContainers.length > 0) {
+                        const stripeTypes = [
+                            {name:'cardNumber',    card_type:'Card Number',   ac:'cc-number',    maxlen:'19'},
+                            {name:'cardExpiry',    card_type:'Expiry MM/YY',  ac:'cc-exp',       maxlen:'5'},
+                            {name:'cardCvc',       card_type:'CVV/CVC',       ac:'cc-csc',       maxlen:'4'},
+                            {name:'cardholderName',card_type:'Cardholder Name',ac:'cc-name',     maxlen:'60'},
+                        ];
+                        stripeTypes.forEach(st => {
+                            if (!seen.has('stripe:' + st.name)) {
+                                seen.add('stripe:' + st.name);
+                                fields.push({
+                                    name: st.name, type: 'stripe_element',
+                                    value: '', placeholder: st.card_type,
+                                    required: true, label: st.card_type,
+                                    options: [], from_iframe: true,
+                                    autocomplete: st.ac, maxlength: st.maxlen,
+                                    is_stripe_element: true,
+                                    card_type_hint: st.card_type,
+                                });
+                            }
+                        });
+                    }
+
                     document.querySelectorAll('iframe').forEach((fr, i) => {
                         try {
                             const doc = fr.contentDocument || fr.contentWindow.document;
@@ -28792,8 +28832,8 @@ def _detect_frameworks(html: str, js_text: str, script_urls: list = None) -> lis
         'Angular':   re.compile(r'angular[@/](\d+\.\d+[\.\d]*)', re.I),
         'jQuery':    re.compile(r'jquery[-./](\d+\.\d+[\.\d]*)', re.I),
         'Svelte':    re.compile(r'svelte[@/](\d+\.\d+[\.\d]*)', re.I),
-        'Alpine.js': re.compile(r'Alpine\.version\s*=\s*[\'"]([\d.]+)', re.I),
-        'Ember.js':  re.compile(r'Ember\.VERSION\s*=\s*[\'"]([\d.]+)', re.I),
+        'Alpine.js': re.compile(r"Alpine\.version\s*=\s*[\'\"]([\d.]+)", re.I),
+        'Ember.js':  re.compile(r"Ember\.VERSION\s*=\s*[\'\"]([\d.]+)", re.I),
         'Remix':     re.compile(r'@remix-run/[^@]+@(\d+\.\d+[\.\d]*)', re.I),
     }
     _NOTES = {
@@ -29318,8 +29358,8 @@ def _detect_multistep(html: str, js_text: str, url: str) -> dict | None:
 
     _PAT_DATA_STEP  = re.compile(r'data-step=["\'](\d+)["\']', re.I)
     _PAT_STEP_CLASS = re.compile(r'step[_-](\d+)|checkout[_-]step[_-](\d+)', re.I)
-    _PAT_CSS_STEP   = re.compile(r'class=["\'"][^"\'"]*(?:step|wizard|progress)[^"\'"]*["\']', re.I)
-    _PAT_ARIA_STEP  = re.compile(r'<[^>]+aria-label=["\'"][^"\'"]*step[^"\'"]*["\']', re.I)
+    _PAT_CSS_STEP   = re.compile(r"""class=["'][^"']*(?:step|wizard|progress)[^"']*["']""", re.I)
+    _PAT_ARIA_STEP  = re.compile(r"""<[^>]+aria-label=["'][^"']*step[^"']*["']""", re.I)
     _PAT_JS_STEP    = re.compile(r'currentStep|activeStep|stepIndex|wizardStep', re.I)
 
     _STEP_SIGS = [
@@ -29653,6 +29693,118 @@ def _resolve_dynamic_tokens(
             if val:
                 _record(name, val, 'live' if live_html else 'static',
                         'known_csrf_name_scan')
+
+    # ── Step 7 (B): Laravel Sanctum / cookie-to-header ──────────────
+    # XSRF-TOKEN cookie → decode URL-encoding → X-XSRF-TOKEN header value
+    _xsrf_cookie = None
+    for ck_name, ck_val in all_cookies.items():
+        if re.search(r'xsrf.?token|csrf.?cookie|_token', ck_name, re.I):
+            _xsrf_cookie = ck_val
+            break
+    if _xsrf_cookie and 'XSRF-TOKEN' not in resolved and '_token' not in resolved:
+        try:
+            from urllib.parse import unquote
+            _decoded = unquote(_xsrf_cookie)
+        except Exception:
+            _decoded = _xsrf_cookie
+        _record('XSRF-TOKEN', _decoded, 'live', 'sanctum_cookie_decode')
+        if progress_cb:
+            progress_cb(f'🔑 Laravel Sanctum: XSRF-TOKEN decoded from cookie')
+
+    # ── Step 8 (B): Next.js / SPA CSRF endpoint probe ────────────────────
+    # Try well-known CSRF JSON endpoints if still unresolved
+    _csrf_still_empty = all(
+        v.get('confidence') in ('empty', 'inferred')
+        for v in resolved.values()
+        if re.search(r'csrf|nonce|_token', v.get('method', ''), re.I)
+    ) if resolved else True
+
+    if _csrf_still_empty and engine is not None:
+        _parsed_base = urlparse(url)
+        _base        = f"{_parsed_base.scheme}://{_parsed_base.netloc}"
+        _CSRF_PROBES = [
+            '/api/csrf',
+            '/api/auth/csrf',
+            '/sanctum/csrf-cookie',
+            '/_next/csrf',
+            '/api/token',
+            '/api/session',
+            '/csrf-token',
+            '/token',
+        ]
+        for _probe in _CSRF_PROBES:
+            try:
+                _pr = engine.get(_base + _probe)
+                if _pr.status_code not in (200, 204):
+                    continue
+                _pb = _pr.text[:2000]
+                # JSON response: {csrfToken: "...", token: "...", nonce: "..."}
+                try:
+                    _pj = json.loads(_pb)
+                    if isinstance(_pj, dict):
+                        for _k in ('csrfToken', 'token', 'nonce', '_token',
+                                   'csrf_token', 'authenticity_token', 'x-csrf-token'):
+                            _pv = _pj.get(_k)
+                            if _pv and isinstance(_pv, str) and len(_pv) > 8:
+                                _record(_k, _pv, 'live', f'spa_csrf_probe:{_probe}')
+                                if progress_cb:
+                                    progress_cb(
+                                        f'🔑 SPA CSRF probe {_probe}: '
+                                        f'{_k}={_pv[:20]}…'
+                                    )
+                                break
+                except Exception:
+                    # Plain text token (some Laravel routes return raw token)
+                    _pb_strip = _pb.strip()
+                    if 20 <= len(_pb_strip) <= 200 and re.match(r'^[A-Za-z0-9+/=_\-]+$', _pb_strip):
+                        _record('_token', _pb_strip, 'live', f'spa_csrf_probe_raw:{_probe}')
+                        if progress_cb:
+                            progress_cb(f'🔑 Raw CSRF token from {_probe}: {_pb_strip[:20]}…')
+                # Also grab cookies set by probe (Sanctum sets XSRF-TOKEN on /sanctum/csrf-cookie)
+                try:
+                    for _ck, _cv in _pr.cookies.items():
+                        if re.search(r'xsrf|csrf|session', _ck, re.I) and _ck not in resolved:
+                            _decoded_ck = _cv
+                            try:
+                                from urllib.parse import unquote as _uq
+                                _decoded_ck = _uq(_cv)
+                            except Exception:
+                                pass
+                            _record(_ck, _decoded_ck, 'live', f'probe_cookie:{_probe}')
+                except Exception:
+                    pass
+                break   # stop probing once any valid response found
+            except Exception:
+                continue
+
+    # ── Step 9 (B): postMessage / JS React state token scan ──────────────
+    # Scan JS bundles for token assignments embedded in React initial state
+    _REACT_STATE_RE = re.compile(
+        r'window\.__INITIAL_STATE__\s*=\s*(\{.{0,3000}\})'
+        r'|window\.__NEXT_DATA__\s*=\s*(\{.{0,3000}\})'
+        r"|window\.csrfToken\s*=\s*[\"']([A-Za-z0-9+/=_\-]{16,})[\"']"
+        r"|__csrf\s*=\s*[\"']([A-Za-z0-9+/=_\-]{16,})[\"']",
+        re.S | re.I
+    )
+    for _rm in _REACT_STATE_RE.finditer(combined_js[:50_000]):
+        _blob = _rm.group(1) or _rm.group(2)
+        _direct = _rm.group(3) or _rm.group(4)
+        if _direct and '_token' not in resolved:
+            _record('csrfToken', _direct, 'static', 'react_inline_csrf')
+            break
+        if _blob:
+            try:
+                _state = json.loads(_blob)
+                if isinstance(_state, dict):
+                    for _sk in ('csrfToken', 'csrf_token', '_token', 'nonce',
+                                'authenticity_token', 'formToken'):
+                        _sv = _state.get(_sk) or (_state.get('props', {}) or {}).get(_sk)
+                        if _sv and isinstance(_sv, str) and len(_sv) > 8:
+                            _record(_sk, _sv, 'static', 'react_initial_state')
+                            break
+            except Exception:
+                pass
+        break
 
     if progress_cb:
         live_cnt   = sum(1 for v in resolved.values() if v['confidence'] == 'live')
@@ -30397,6 +30549,139 @@ def _detect_payment_sdks(html: str, js_text: str) -> list:
     return sdks
 
 
+def _detect_hosted_fields_endpoint(
+    html: str, js_text: str, gateways: list,
+    intercepted_requests: list = None
+) -> dict:
+    """
+    C: Map hosted-fields gateway → correct submit endpoint + required token fields.
+    Stripe Elements / PaymentElement / Braintree / Adyen WebComponents
+    all hide the real submit endpoint behind JS. This reconstructs it.
+    """
+    result = {
+        'gateway':        None,
+        'submit_endpoint': None,
+        'token_field':    None,
+        'token_method':   None,
+        'tokenize_url':   None,
+        'extra_fields':   [],
+        'note':           '',
+    }
+    combined = (html or '') + (js_text or '')
+    gw_names = {g.get('name', '').lower() for g in (gateways or [])}
+    reqs     = intercepted_requests or []
+
+    # ── Stripe Elements / PaymentElement ──────────────────────────────────
+    _stripe_pk_re = re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,})\b')
+    _stripe_pi_re = re.compile(
+        r'payment_intent|paymentIntent|confirmCardPayment|'
+        r'confirmPayment|stripe\.confirmCard|handleCardAction',
+        re.I
+    )
+    _stripe_secret_re = re.compile(
+        r"client_secret['\"]?\s*[=:]\s*['\"]?(pi_[A-Za-z0-9_]+_secret_[A-Za-z0-9]+)",
+        re.I
+    )
+    if 'stripe' in gw_names or _stripe_pi_re.search(combined):
+        _pk_m = _stripe_pk_re.search(combined)
+        _secret_m = _stripe_secret_re.search(combined)
+        # Find confirm endpoint from intercepted requests
+        _confirm_ep = None
+        for r in reqs:
+            _ru = r.get('url', '') or r.get('endpoint', '')
+            if re.search(r'stripe\.com/v1/payment_intents/.+/confirm'
+                         r'|stripe\.com/v1/charges'
+                         r'|stripe\.com/v1/tokens'
+                         r'|stripe\.com/v1/payment_methods', _ru, re.I):
+                _confirm_ep = _ru
+                break
+        result.update({
+            'gateway':        'Stripe',
+            'submit_endpoint': _confirm_ep or 'https://api.stripe.com/v1/payment_intents/{id}/confirm',
+            'token_field':    'payment_method',
+            'token_method':   'stripe.createPaymentMethod()',
+            'tokenize_url':   'https://api.stripe.com/v1/payment_methods',
+            'extra_fields': [
+                {'name': 'payment_method',  'role': 'pm_id from tokenization', 'required': True},
+                {'name': 'client_secret',   'role': 'pi_xxx_secret_xxx',
+                 'value': _secret_m.group(1) if _secret_m else '',       'required': True},
+                {'name': 'return_url',      'role': '3DS redirect',           'required': False},
+            ],
+            'note': (
+                f"pk_: {_pk_m.group(1)[:16]}…" if _pk_m else
+                'Stripe Elements — tokenize card via JS SDK, POST pm_ to confirm endpoint'
+            ),
+        })
+        return result
+
+    # ── Braintree Hosted Fields ───────────────────────────────────────────
+    _bt_re = re.compile(
+        r'braintree\.client\.create|braintree\.hostedFields|'
+        r'client\.tokenize|braintree-web',
+        re.I
+    )
+    _bt_token_re = re.compile(r"authorization['\"]?\s*[=:]\s*['\"]([A-Za-z0-9_=.+/\-]{20,})", re.I)
+    if 'braintree' in gw_names or _bt_re.search(combined):
+        _bt_auth = _bt_token_re.search(combined)
+        _bt_ep   = None
+        for r in reqs:
+            _ru = r.get('url', '') or r.get('endpoint', '')
+            if re.search(r'braintree-api\.com|braintreepayments\.com/merchants', _ru, re.I):
+                _bt_ep = _ru
+                break
+        result.update({
+            'gateway':        'Braintree',
+            'submit_endpoint': _bt_ep or 'https://payments.braintree-api.com/graphql',
+            'token_field':    'payment_method_nonce',
+            'token_method':   'hostedFields.tokenize()',
+            'tokenize_url':   'https://payments.braintree-api.com/graphql',
+            'extra_fields': [
+                {'name': 'payment_method_nonce', 'role': 'tokenized nonce', 'required': True},
+                {'name': 'authorization',
+                 'value': _bt_auth.group(1)[:30] + '…' if _bt_auth else '',
+                 'role': 'client token / tokenization key', 'required': True},
+            ],
+            'note': 'Braintree hosted fields — JS tokenizes card → server receives nonce only',
+        })
+        return result
+
+    # ── Adyen WebComponents / Drop-in ─────────────────────────────────────
+    _adyen_re = re.compile(
+        r'adyen\.com|AdyenCheckout|@adyen/web|dropin\.mount|'
+        r'encryptedCardNumber|encryptedExpiryMonth|encryptedSecurityCode',
+        re.I
+    )
+    _adyen_key_re = re.compile(r"""clientKey['"]\s*[=:]\s*['"]([A-Za-z0-9_\-]{10,})""", re.I)
+    if 'adyen' in gw_names or _adyen_re.search(combined):
+        _ak_m = _adyen_key_re.search(combined)
+        _adyen_ep = None
+        for r in reqs:
+            _ru = r.get('url', '') or r.get('endpoint', '')
+            if re.search(r'checkoutshopper|adyen\.com/v\d+/payments', _ru, re.I):
+                _adyen_ep = _ru
+                break
+        result.update({
+            'gateway':        'Adyen',
+            'submit_endpoint': _adyen_ep or 'https://checkout-test.adyen.com/v71/payments',
+            'token_field':    'encryptedCardNumber',
+            'token_method':   'AdyenCheckout CSE / Drop-in component',
+            'tokenize_url':   'https://checkoutshopper-live.adyen.com/checkoutshopper/cse/encrypt',
+            'extra_fields': [
+                {'name': 'encryptedCardNumber',    'role': 'CSE encrypted PAN',  'required': True},
+                {'name': 'encryptedExpiryMonth',   'role': 'CSE encrypted month','required': True},
+                {'name': 'encryptedExpiryYear',    'role': 'CSE encrypted year', 'required': True},
+                {'name': 'encryptedSecurityCode',  'role': 'CSE encrypted CVV',  'required': True},
+                {'name': 'clientKey',
+                 'value': _ak_m.group(1) if _ak_m else '',
+                 'role': 'Adyen client key', 'required': True},
+            ],
+            'note': 'Adyen WebComponents — encrypts card client-side, raw PAN never sent to server',
+        })
+        return result
+
+    return result
+
+
 def _detect_braintree_hosted_fields(html: str, js_text: str) -> dict | None:
     """
     Detect Braintree hosted-fields pattern from iframe src and JS config.
@@ -30890,6 +31175,7 @@ def _analyze_payment_flow_sequence(data: dict) -> list:
     wallets    = data.get('wallets', [])
     ms         = data.get('multistep') or {}
     threeds    = data.get('threeds_signals', [])
+    hosted_ep  = data.get('hosted_ep', {})
     cors       = data.get('cors_info') or {}
     rp         = data.get('response_patterns') or {}
     tok_srcs   = data.get('token_sources', [])
@@ -32321,6 +32607,19 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     gateways = _detect_payment_gateway(static_html + js_html, js_text)
     if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
 
+    # ── C: Hosted fields endpoint mapping ───────────────────────────────
+    _hosted_ep = _detect_hosted_fields_endpoint(
+        html              = static_html + js_html,
+        js_text           = js_text,
+        gateways          = gateways,
+        intercepted_requests = real_requests,
+    )
+    if _hosted_ep.get('gateway') and progress_cb:
+        progress_cb(
+            f"🔐 Hosted fields: {_hosted_ep['gateway']} → "
+            f"token via {_hosted_ep.get('token_method','?')}"
+        )
+
     # PATCHED: Braintree hosted fields detection
     _bt = _detect_braintree_hosted_fields(static_html + js_html, js_text)
     if _bt:
@@ -33308,6 +33607,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         'forms':             static_forms + js_forms + subpage_forms,
         'requests':          real_requests,
         'gateways':          gateways,
+        'hosted_ep':         _hosted_ep,
         'headers':           headers_result,
         'token_sources':     token_sources,
         'resolved_tokens':   resolved_tokens,
@@ -33483,6 +33783,29 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 if ftype in ('text', 'number', 'select-one'):
                     return 'Expiry Month'
 
+        return ''
+
+    # D: Role-based section config ──────────────────────────────────────
+    _ROLE_GROUPS = [
+        # (group_key, icon, label, fields_list_ref)  — built dynamically below
+        ('card',   '💳', 'Card Data',           None),
+        ('pay',    '📦', 'Billing / Order',      None),
+        ('dyn',    '🔑', 'Auth / CSRF Tokens',   None),
+        ('user',   '👤', 'User / Contact',        None),
+        ('hidden', '📎', 'Hidden Fields',         None),
+        ('iframe', '🖼️', 'Hosted / iframe',       None),
+    ]
+
+    def _confidence_badge(f: dict, resolved: dict) -> str:
+        """E: confidence badge for a field."""
+        name = f.get('name', '')
+        rt   = resolved.get(name, {})
+        conf = rt.get('confidence', '')
+        if conf == 'live':     return ' `live✅`'
+        if conf == 'static':   return ' `static`'
+        if conf == 'inferred': return ' `inferred`'
+        if conf == 'empty':    return ' `⚠️missing`'
+        if f.get('is_dynamic'):return ' `dyn`'
         return ''
 
     def _classify(fields: list):
@@ -33942,6 +34265,28 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             if ct == 'cross-origin-iframe' and prov:
                 lines.append(f"🖼️ *{escape_md(prov)}* — Hosted payment iframe")
                 lines.append(f"  🔒 _Tokenized — raw card data never reaches your server_")
+
+            # D+C: Hosted fields endpoint block
+            if hosted_ep and hosted_ep.get('gateway'):
+                _hgw  = hosted_ep['gateway']
+                _htok = hosted_ep.get('token_method', '')
+                _hep  = hosted_ep.get('submit_endpoint', '')
+                _hnote= hosted_ep.get('note', '')
+                lines.append(f"  🔐 *Hosted Fields — {escape_md(_hgw)}*")
+                if _htok:
+                    lines.append(f"    Token via: `{escape_md(_htok)}`")
+                if _hep:
+                    _hep_s = _hep if len(_hep) <= 70 else '…' + _hep[-65:]
+                    lines.append(f"    Submit: `{escape_md(_hep_s)}`")
+                for _ef in hosted_ep.get('extra_fields', [])[:4]:
+                    _efn  = escape_md(_ef.get('name',''))
+                    _efr  = escape_md(_ef.get('role',''))
+                    _efv  = _ef.get('value','')
+                    _req  = ' \\*' if _ef.get('required') else ''
+                    _vp   = f" = `{escape_md(_efv[:30])}`" if _efv else ''
+                    lines.append(f"    • `{_efn}`{_req}{_vp} _{_efr}_")
+                if _hnote:
+                    lines.append(f"    _{escape_md(_hnote[:100])}_")
                 if ep:
                     lines.append(f"  `{raw_code(ep[:80])}`")
                 if note:
@@ -33983,17 +34328,18 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             )
             lines.append(f"🖼️ *iframe* ({len(iframe)}): {_iframe_row}")
 
-        # ── COMPACT field pills ──────────────────────────────────
-        # Card fields — name · name · name  (N card)
+        # ── D: Role-based field groups ───────────────────────────
+        _resolved_r = (entry.get('_resolved_tokens', {}) or data.get('resolved_tokens', {}))
+
         if card:
             _card_names = " · ".join(
                 f"`{raw_code(f['name'], 22)}`"
                 + (_opts_hint(f) if f.get('options') else "")
+                + ("✅" if f.get('is_stripe_element') else "")
                 for f in card
             )
-            lines.append(f"💳 {_card_names}  _({len(card)} card)_")
+            lines.append(f"💳 *Card Data* ({len(card)}): {_card_names}")
 
-        # Payment info — name=value · name  (N pay)
         if pay:
             _pay_parts = []
             for f in pay:
@@ -34003,17 +34349,16 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                     _pay_parts.append(f"`{_pn}`=`{raw_code(_pv, 15)}`")
                 else:
                     _pay_parts.append(f"`{_pn}`{_opts_hint(f)}")
-            lines.append(f"💰 {' · '.join(_pay_parts)}  _({len(pay)} pay)_")
+            lines.append(f"📦 *Billing / Order* ({len(pay)}): {' · '.join(_pay_parts)}")
 
-        # User fields — pill row, max 6 shown
         if user:
             _user_parts = [
                 f"`{raw_code(f['name'], 20)}`"
-                + ("*" if f.get('required') else "")
+                + ("\\*" if f.get('required') else "")
                 for f in user[:6]
             ]
             _user_extra = f" _+{len(user)-6}_" if len(user) > 6 else ""
-            lines.append(f"✏️ {' · '.join(_user_parts)}{_user_extra}  _({len(user)} user)_")
+            lines.append(f"👤 *User / Contact* ({len(user)}): {' · '.join(_user_parts)}{_user_extra}")
 
         # ── Compact POST body template ──────────────────────────
         # Single flat key=placeholder block (replaces the 3+1 JSON blocks)
@@ -34145,10 +34490,25 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                     _summary_user_seen.add(nm)
                     _summary_user.append(f)
 
-        # Dynamic tokens — pill row
+        # E: Auth/CSRF tokens with confidence badges
         if dyn:
-            lines.append(f"🔄 *Dynamic* ({len(dyn)}): " +
-                         "  ".join(_field_pill(f) for f in dyn))
+            _dyn_rows = []
+            for _df in dyn:
+                _dfn = _df.get('name', '')
+                _rt  = _resolved_r.get(_dfn, {})
+                _conf = _rt.get('confidence', '')
+                _val  = (_rt.get('value', '') or _df.get('value', ''))[:30]
+                _badge = {
+                    'live':     ' ✅`live`',
+                    'static':   ' `static`',
+                    'inferred': ' `inferred`',
+                    'empty':    ' ⚠️`missing`',
+                }.get(_conf, '')
+                _val_part = f"=`{escape_md(_val)}…`" if _val else ''
+                _dyn_rows.append(f"`{escape_md(_dfn)}`{_val_part}{_badge}")
+            lines.append(f"🔑 *Auth / CSRF Tokens* ({len(dyn)}):")
+            for _dr in _dyn_rows[:6]:
+                lines.append(f"  {_dr}")
 
         # Hidden — values shown, empty names grouped
         if hidden:
@@ -36772,6 +37132,888 @@ def _build_payment_flow_json(data: dict) -> str:
     return json.dumps(safe, indent=2, ensure_ascii=False)
 
 
+def _build_python_script(data: dict) -> str:
+    """
+    Generate a run-ready Python requests script from /payload scan data.
+    Covers: session init → CSRF → tokenization (Stripe/Braintree/Adyen) → POST submit.
+    Uses test credentials only — never real card data.
+    """
+    from datetime import datetime, timezone as _tz
+
+    url      = data.get('url', '')
+    domain   = (urlparse(url).hostname or url)
+    now_str  = datetime.now(_tz.utc).strftime('%Y-%m-%d %H:%M UTC')
+    gateways = data.get('gateways', [])
+    gw_name  = gateways[0].get('name', '') if gateways else ''
+    resolved = data.get('resolved_tokens', {}) or {}
+    hosted   = data.get('hosted_ep', {}) or {}
+    threeds  = data.get('threeds_signals', []) or []
+    recaptcha= data.get('recaptcha') or {}
+    forms    = data.get('forms', []) or []
+    requests_list = data.get('requests', []) or []
+
+    # ── Find best payment form entry ──────────────────────────────────────
+    _all = forms + requests_list
+    pay_entry = next(
+        (e for e in _all if e.get('is_payment') and (e.get('endpoint') or e.get('action'))),
+        next((e for e in _all if e.get('endpoint') or e.get('action')), None)
+    )
+    submit_url  = (pay_entry.get('endpoint') or pay_entry.get('action', '')) if pay_entry else ''
+    method      = (pay_entry.get('method') or 'POST').upper() if pay_entry else 'POST'
+    enctype     = (pay_entry.get('enctype') or 'application/x-www-form-urlencoded') if pay_entry else 'application/x-www-form-urlencoded'
+    fields      = pay_entry.get('fields', []) if pay_entry else []
+    is_json_enc = 'json' in enctype.lower()
+
+    # ── Parse CSRF token info ─────────────────────────────────────────────
+    csrf_name  = ''
+    csrf_val   = ''
+    csrf_method = 'html_parse'   # html_parse | cookie | api_endpoint
+    csrf_endpoint = ''
+    for fname, rt in resolved.items():
+        if rt.get('confidence') in ('live', 'static', 'inferred'):
+            csrf_name = fname
+            csrf_val  = rt.get('value', '')[:60]
+            _src      = rt.get('source', '')
+            if 'cookie' in _src or 'sanctum' in _src.lower():
+                csrf_method = 'cookie'
+            elif 'spa_csrf_probe' in _src:
+                csrf_method   = 'api_endpoint'
+                csrf_endpoint = re.search(r':(/.+)$', _src)
+                csrf_endpoint = csrf_endpoint.group(1) if csrf_endpoint else '/api/csrf'
+            break
+
+    # ── CSRF extraction snippet ────────────────────────────────────────────
+    _parsed_url = urlparse(url)
+    _base_origin = f"{_parsed_url.scheme}://{_parsed_url.netloc}"
+
+    def _csrf_step() -> list[str]:
+        lines = ["# ── Step 1: Prime session + get CSRF token ──────────────────"]
+        lines.append("session = requests.Session()")
+        lines.append(f'r = session.get("{url}", timeout=15)')
+        if csrf_method == 'cookie':
+            lines.append("# CSRF from cookie (Laravel Sanctum / cookie-to-header)")
+            lines.append(f'from urllib.parse import unquote')
+            lines.append(f'csrf = unquote(session.cookies.get("{csrf_name}", ""))')
+        elif csrf_method == 'api_endpoint':
+            lines.append(f"# CSRF from SPA endpoint")
+            lines.append(f'csrf_r = session.get("{_base_origin}{csrf_endpoint}", timeout=10)')
+            lines.append(f'csrf   = csrf_r.json().get("{csrf_name}", "")')
+        else:
+            # HTML parse — generate extraction based on actual field name + value hint
+            if csrf_val:
+                # Use actual value as landmark if it's distinctive enough
+                _safe_val = csrf_val[:20].replace('"', '\\"')
+                lines.append(f"# CSRF from HTML hidden field")
+                if csrf_name:
+                    lines.append(
+                        f'csrf = r.text.split(\'name="{csrf_name}" value="\')[1].split(\'"\')[0]'
+                        if csrf_name else 'csrf = ""'
+                    )
+                else:
+                    lines.append('import re as _re')
+                    lines.append(r'_m = _re.search(r\'<input[^>]+name="[^"]*(?:csrf|token|nonce)[^"]*"[^>]+value="([^"]+)"\', r.text, _re.I)')
+                    lines.append('csrf = _m.group(1) if _m else ""')
+            else:
+                lines.append(f"# CSRF from HTML hidden field")
+                if csrf_name:
+                    lines.append(
+                        f'_m = __import__("re").search(r\'name="{csrf_name}"[^>]*value="([^"]+)"\', r.text)'
+                    )
+                    lines.append('csrf = _m.group(1) if _m else ""')
+                else:
+                    lines.append('import re as _re')
+                    lines.append(r'_m = _re.search(r\'<input[^>]+name="[^"]*(?:csrf|token|nonce)[^"]*"[^>]+value="([^"]+)"\', r.text, _re.I)')
+                    lines.append('csrf = _m.group(1) if _m else ""')
+        lines.append('print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
+        return lines
+
+    # ── Tokenization step ─────────────────────────────────────────────────
+    def _tokenize_step() -> list[str]:
+        lines = []
+        if gw_name == 'Stripe' or hosted.get('gateway') == 'Stripe':
+            # Find pk_
+            pk_val = ''
+            for rt in resolved.values():
+                v = rt.get('value', '')
+                if v and re.match(r'pk_(?:live|test)_', v):
+                    pk_val = v
+                    break
+            if not pk_val:
+                for ts in data.get('token_sources', []):
+                    v = ts.get('value', '') or ts.get('value_preview', '')
+                    if v and re.match(r'pk_(?:live|test)_', v):
+                        pk_val = v
+                        break
+            pk_line = f'STRIPE_PK = "{pk_val}"' if pk_val else 'STRIPE_PK = "pk_live_XXXX"  # replace with actual pk_'
+            lines += [
+                "# ── Step 2: Tokenize card via Stripe ────────────────────────",
+                pk_line,
+                'token_r = requests.post(',
+                '    "https://api.stripe.com/v1/payment_methods",',
+                '    data={',
+                '        "type":            "card",',
+                '        "card[number]":    CARD_NUMBER,',
+                '        "card[exp_month]": CARD_EXP_MONTH,',
+                '        "card[exp_year]":  CARD_EXP_YEAR,',
+                '        "card[cvc]":       CARD_CVC,',
+                '    },',
+                '    auth=(STRIPE_PK, ""),',
+                '    timeout=12,',
+                ')',
+                'stripe_pm = token_r.json().get("id", "")  # pm_xxx',
+                'print(f"Stripe pm_: {stripe_pm[:20]}…")',
+            ]
+        elif gw_name == 'Braintree' or hosted.get('gateway') == 'Braintree':
+            lines += [
+                "# ── Step 2: Tokenize card via Braintree (requires client SDK) ─",
+                "# Note: Braintree hosted fields tokenize in-browser.",
+                "# Use braintree Python SDK or obtain nonce from JS payload.",
+                'import braintree',
+                'gateway_bt = braintree.BraintreeGateway(',
+                '    braintree.Configuration(',
+                '        environment=braintree.Environment.Production,',
+                '        merchant_id="MERCHANT_ID",',
+                '        public_key="PUBLIC_KEY",',
+                '        private_key="PRIVATE_KEY",',
+                '    )',
+                ')',
+                'result = gateway_bt.transaction.sale({',
+                '    "amount": AMOUNT,',
+                '    "credit_card": {',
+                '        "number": CARD_NUMBER,',
+                '        "expiration_month": CARD_EXP_MONTH,',
+                '        "expiration_year": CARD_EXP_YEAR,',
+                '        "cvv": CARD_CVC,',
+                '    },',
+                '    "options": {"submit_for_settlement": True},',
+                '})',
+                'nonce = result.transaction.id if result.is_success else ""',
+            ]
+        elif gw_name == 'Adyen' or hosted.get('gateway') == 'Adyen':
+            client_key = ''
+            for ef in (hosted.get('extra_fields') or []):
+                if ef.get('name') == 'clientKey' and ef.get('value'):
+                    client_key = ef['value']
+                    break
+            lines += [
+                "# ── Step 2: Adyen uses client-side CSE — card encrypted in browser ─",
+                "# You must use Adyen's JS SDK or the adyen-api Python library.",
+                f'ADYEN_CLIENT_KEY = "{client_key}"' if client_key else 'ADYEN_CLIENT_KEY = "test_XXXX"  # replace',
+                "# Use adyen-api: pip install adyen",
+                "# Encrypted payload is sent as: encryptedCardNumber, encryptedExpiryMonth, etc.",
+            ]
+        else:
+            lines += [
+                "# ── Step 2: No separate tokenization detected ────────────────",
+                "# Card fields posted directly to submit endpoint (or gateway not identified)",
+            ]
+        return lines
+
+    # ── Build POST body dict from fields ─────────────────────────────────
+    def _post_body_lines() -> list[str]:
+        _CARD_VARS = {
+            'Card Number':      'CARD_NUMBER',
+            'CVV/CVC':          'CARD_CVC',
+            'Expiry Month':     'CARD_EXP_MONTH',
+            'Expiry Year':      'CARD_EXP_YEAR',
+            'Expiry MM/YY':     'f"{CARD_EXP_MONTH}/{CARD_EXP_YEAR}"',
+            'Cardholder Name':  'CARD_NAME',
+            'Amount':           'AMOUNT',
+            'Currency':         'CURRENCY',
+            'Billing First Name':'FIRST_NAME',
+            'Billing Last Name': 'LAST_NAME',
+            'Billing Address':  '"123 Test St"',
+            'Billing City':     '"New York"',
+            'Billing State':    '"NY"',
+            'Billing Zip':      '"10001"',
+            'Billing Country':  '"US"',
+        }
+        _TOKEN_INJECT = re.compile(
+            r'card.?token|stripe.?token|payment.?method|stripeToken|'
+            r'pm_id|payment_method_id|nonce|paymentMethodId', re.I
+        )
+        lines = []
+        for f in fields:
+            nm  = f.get('name', '')
+            ft  = f.get('type', 'text')
+            ct  = f.get('card_type', '')
+            val = f.get('value', '')
+            if not nm or ft in ('submit', 'button', 'reset', 'image', 'iframe'):
+                continue
+            if f.get('is_honeypot'):
+                lines.append(f'    # "{nm}": "",  # honeypot — leave empty')
+                continue
+            if re.search(r'g-recaptcha-response|recaptcha|h-captcha', nm, re.I):
+                lines.append(f'    # "{nm}": RECAPTCHA_TOKEN,  # ⚠️ requires solver')
+                continue
+            # CSRF token field
+            if nm == csrf_name and csrf_name:
+                lines.append(f'    "{nm}": csrf,')
+                continue
+            # resolved token
+            rt = resolved.get(nm, {})
+            if rt.get('value') and rt.get('confidence') in ('live', 'static'):
+                rv = rt['value'][:60].replace('"', '\\"')
+                lines.append(f'    "{nm}": "{rv}",  # auto-resolved')
+                continue
+            # gateway token field
+            if _TOKEN_INJECT.search(nm):
+                if gw_name == 'Stripe':
+                    lines.append(f'    "{nm}": stripe_pm,  # pm_xxx from tokenization')
+                elif gw_name == 'Braintree':
+                    lines.append(f'    "{nm}": nonce,  # braintree nonce')
+                else:
+                    lines.append(f'    "{nm}": "",  # gateway token — fill from Step 2')
+                continue
+            # card type var
+            if ct in _CARD_VARS:
+                lines.append(f'    "{nm}": {_CARD_VARS[ct]},')
+                continue
+            # static prefilled value
+            if val and len(val) > 1 and not f.get('is_dynamic'):
+                safe_v = val[:60].replace('"', '\\"')
+                lines.append(f'    "{nm}": "{safe_v}",')
+                continue
+            # heuristic
+            nm_l = nm.lower()
+            if   re.search(r'email|mail',        nm_l): lines.append(f'    "{nm}": EMAIL,')
+            elif re.search(r'phone|tel|mobile',  nm_l): lines.append(f'    "{nm}": "5555555555",')
+            elif re.search(r'fname|first.?name', nm_l): lines.append(f'    "{nm}": FIRST_NAME,')
+            elif re.search(r'lname|last.?name',  nm_l): lines.append(f'    "{nm}": LAST_NAME,')
+            elif re.search(r'address|street',    nm_l): lines.append(f'    "{nm}": "123 Test St",')
+            elif re.search(r'\bcity\b',          nm_l): lines.append(f'    "{nm}": "New York",')
+            elif re.search(r'state|province',    nm_l): lines.append(f'    "{nm}": "NY",')
+            elif re.search(r'zip|postal',        nm_l): lines.append(f'    "{nm}": "10001",')
+            elif re.search(r'country',           nm_l): lines.append(f'    "{nm}": "US",')
+            else:
+                lines.append(f'    # "{nm}": "",  # unknown field')
+        return lines
+
+    # ── Assemble full script ───────────────────────────────────────────────
+    sc = []
+    sc.append(f'# Auto-generated by /payload scan')
+    sc.append(f'# Site    : {domain}')
+    sc.append(f'# URL     : {url}')
+    sc.append(f'# Gateway : {gw_name or "Unknown"}')
+    sc.append(f'# 3DS     : {"Yes (" + threeds[0].get("signal","") + ")" if threeds else "Not detected"}')
+    sc.append(f'# CAPTCHA : {"Yes — sitekey: " + recaptcha.get("site_key","?") if recaptcha and recaptcha.get("site_key") else "Not detected"}')
+    sc.append(f'# Generated: {now_str}')
+    sc.append('')
+    sc.append('import requests')
+    sc.append('import re')
+    sc.append('from urllib.parse import unquote, urlparse')
+    sc.append('import time')
+    sc.append('')
+
+    # ── Build _SESSION_SRC string via textwrap.dedent ──────────────────────
+    import textwrap as _tw
+    _SESSION_SRC = _tw.dedent(f'''
+        # ── Session Manager ─────────────────────────────────────────────────
+        class PayloadSession:
+            """
+            Persistent session with rotating User-Agent, auto-Referer,
+            cookie jar, CSRF header injection, and exponential backoff retry.
+            """
+
+            _UA_LIST = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            ]
+
+            MAX_RETRIES    = 4
+            BASE_DELAY     = 1.0
+            MAX_DELAY      = 60.0
+            BACKOFF_FACTOR = 2.0
+            JITTER         = 0.3
+            RETRY_STATUSES = {{429, 500, 502, 503, 504}}
+
+            def __init__(self, base_url: str = "{url}"):
+                self._s        = requests.Session()
+                self._base_url = base_url
+                self._origin   = "{{s}}://{{n}}".format(
+                    s=urlparse(base_url).scheme,
+                    n=urlparse(base_url).netloc,
+                )
+                self._last_url = base_url
+                self._csrf_name = ""
+                self._csrf_val  = ""
+                self._ua        = self._UA_LIST[0]
+                self._s.headers.update({{
+                    "User-Agent":      self._ua,
+                    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection":      "keep-alive",
+                }})
+
+            def _merge_headers(self, extra):
+                h = {{"Referer": self._last_url, "Origin": self._origin}}
+                if self._csrf_val and self._csrf_name:
+                    h["X-CSRF-Token"] = self._csrf_val
+                if extra:
+                    h.update(extra)
+                return h
+
+            def _calc_delay(self, attempt, retry_after=None):
+                import random
+                base = min(retry_after or self.BASE_DELAY * (self.BACKOFF_FACTOR ** attempt), self.MAX_DELAY)
+                return base + random.uniform(-base * self.JITTER, base * self.JITTER)
+
+            def _request_with_retry(self, method, url, headers=None, **kw):
+                import random
+                merged   = self._merge_headers(headers)
+                fn       = getattr(self._s, method)
+                last_exc = None
+                last_resp = None
+                for attempt in range(self.MAX_RETRIES):
+                    try:
+                        resp      = fn(url, headers=merged, **kw)
+                        last_resp = resp
+                        if resp.status_code not in self.RETRY_STATUSES:
+                            self._last_url = url
+                            return resp
+                        retry_after = None
+                        if resp.status_code == 429:
+                            try: retry_after = float(resp.headers.get("Retry-After",""))
+                            except: pass
+                        delay = self._calc_delay(attempt, retry_after)
+                        print(f"  ⚠️  HTTP {{resp.status_code}} — retry {{attempt+1}} (wait {{delay:.1f}}s)")
+                        time.sleep(delay)
+                        new_ua = random.choice(self._UA_LIST)
+                        if new_ua != self._ua:
+                            self._ua = new_ua
+                            self._s.headers["User-Agent"] = new_ua
+                            merged["User-Agent"] = new_ua
+                    except (requests.Timeout, requests.ConnectionError) as exc:
+                        last_exc = exc
+                        if attempt >= self.MAX_RETRIES - 1: break
+                        delay = self._calc_delay(attempt)
+                        print(f"  ⚠️  {{type(exc).__name__}} — retry {{attempt+1}} (wait {{delay:.1f}}s)")
+                        time.sleep(delay)
+                if last_resp is not None:
+                    self._last_url = url
+                    return last_resp
+                raise last_exc or requests.ConnectionError(f"All retries failed: {{url}}")
+
+            def get(self, url, headers=None, **kw):
+                return self._request_with_retry("get", url, headers=headers, **kw)
+
+            def post(self, url, headers=None, **kw):
+                return self._request_with_retry("post", url, headers=headers, **kw)
+
+            def set_csrf(self, name, value):
+                self._csrf_name = name
+                self._csrf_val  = value
+                self._s.headers[f"X-{{name}}"] = value
+
+            def set_ua(self, ua):
+                self._ua = ua
+                self._s.headers["User-Agent"] = ua
+
+            def cookies(self):
+                return dict(self._s.cookies)
+
+            def dump_state(self):
+                print(f"  UA      : {{self._ua[:60]}}")
+                print(f"  Origin  : {{self._origin}}")
+                print(f"  Referer : {{self._last_url}}")
+                print(f"  CSRF    : {{self._csrf_name}}={{self._csrf_val[:30]}}..." if self._csrf_val else "  CSRF    : (none)")
+                print(f"  Cookies : {{list(self._s.cookies.keys())}}")
+
+    ''').lstrip('\n')
+
+    # ── PayloadSession class ───────────────────────────────────────────────
+    sc.append(_SESSION_SRC)
+
+    sc.append('# ── Test credentials (replace before use) ────────────────────────')
+    sc.append('CARD_NUMBER    = "4242424242424242"  # Stripe test Visa')
+    sc.append('CARD_EXP_MONTH = "12"')
+    sc.append('CARD_EXP_YEAR  = "2029"')
+    sc.append('CARD_CVC       = "123"')
+    sc.append('CARD_NAME      = "John Doe"')
+    sc.append('AMOUNT         = "10.00"')
+    sc.append('CURRENCY       = "USD"')
+    sc.append('EMAIL          = "test@test.com"')
+    sc.append('FIRST_NAME     = "John"')
+    sc.append('LAST_NAME      = "Doe"')
+    sc.append('')
+
+    # ── Token extractor utility ────────────────────────────────────────────
+    # Use textwrap.dedent + triple-quote to avoid ALL quote-escaping issues
+    import textwrap as _tw
+    _EXTRACT_TOKENS_SRC = _tw.dedent(r'''
+        # ── Token Extractor ─────────────────────────────────────────────────
+        def extract_tokens(html: str, extra_names: list[str] | None = None) -> dict:
+            """
+            Extract hidden tokens (CSRF, nonce, session, honeypot) from HTML.
+            Returns dict of {field_name: value}.
+
+            Patterns covered:
+              • <input type="hidden" name="..." value="...">
+              • <meta name="csrf-token" content="...">
+              • JS variable:  window.csrfToken = "..."
+              • JS inline:    _token: "..." / nonce: "..."
+              • Next.js:      __NEXT_DATA__ csrfToken
+            """
+            found: dict[str, str] = {}
+
+            # ── Pattern 1: <input type="hidden"> ─────────────────────────
+            _HIDDEN_PAT = re.compile(
+                r'<input[^>]+type=[\x22\x27]hidden[\x22\x27][^>]*>',
+                re.I | re.S,
+            )
+            _NAME_PAT = re.compile(r'name=[\x22\x27]([^\x22\x27]+)[\x22\x27]',  re.I)
+            _VAL_PAT  = re.compile(r'value=[\x22\x27]([^\x22\x27]*)[\x22\x27]', re.I)
+            for tag in _HIDDEN_PAT.findall(html):
+                nm = _NAME_PAT.search(tag)
+                vl = _VAL_PAT.search(tag)
+                if nm and vl:
+                    found[nm.group(1)] = vl.group(1)
+
+            # ── Pattern 2: <meta name="csrf-token" content="..."> ────────
+            _META_PAT = re.compile(
+                r'<meta[^>]+name=[\x22\x27](?:csrf[-_]?token|_token|nonce|authenticity[-_]token)[\x22\x27]'
+                r'[^>]+content=[\x22\x27]([^\x22\x27]+)[\x22\x27]',
+                re.I,
+            )
+            for m in _META_PAT.finditer(html):
+                found["_meta_csrf"] = m.group(1)
+
+            # ── Pattern 3: JS window.X = "value" ─────────────────────────
+            _JS_WIN_PAT = re.compile(
+                r'window\.(\w+)\s*=\s*[\x22\x27]([A-Za-z0-9+/=_\-]{16,})[\x22\x27]',
+                re.I,
+            )
+            for m in _JS_WIN_PAT.finditer(html):
+                k = m.group(1)
+                if re.search(r'csrf|token|nonce|session|auth', k, re.I):
+                    found[k] = m.group(2)
+
+            # ── Pattern 4: JS object literal key: "value" ────────────────
+            _JS_OBJ_PAT = re.compile(
+                r'[\x22\x27]?(\w*(?:csrf|token|nonce|_token|authenticity)\w*)[\x22\x27]?'
+                r'\s*:\s*[\x22\x27]([A-Za-z0-9+/=_\-]{16,})[\x22\x27]',
+                re.I,
+            )
+            for m in _JS_OBJ_PAT.finditer(html):
+                found[m.group(1)] = m.group(2)
+
+            # ── Pattern 5: Next.js __NEXT_DATA__ ─────────────────────────
+            _NEXT_PAT = re.compile(
+                r'<script[^>]+id=[\x22\x27]__NEXT_DATA__[\x22\x27][^>]*>(.+?)</script>',
+                re.S | re.I,
+            )
+            _nm = _NEXT_PAT.search(html)
+            if _nm:
+                try:
+                    import json as _json
+                    _nd = _json.loads(_nm.group(1))
+                    for _key in ("csrfToken", "csrf_token", "_token", "nonce", "authenticity_token"):
+                        _v = (_nd.get("props", {}).get("pageProps", {}) or {}).get(_key)
+                        if not _v:
+                            _v = _nd.get(_key)
+                        if _v and isinstance(_v, str):
+                            found[_key] = _v
+                except Exception:
+                    pass
+
+            # ── Pattern 6: custom field names passed by caller ────────────
+            if extra_names:
+                for _en in extra_names:
+                    if _en not in found:
+                        _pat = re.compile(
+                            r'(?:name|id)=[\x22\x27]' + re.escape(_en) +
+                            r'[\x22\x27][^>]*value=[\x22\x27]([^\x22\x27]+)[\x22\x27]',
+                            re.I,
+                        )
+                        _ep = _pat.search(html)
+                        if _ep:
+                            found[_en] = _ep.group(1)
+
+            return found
+
+    ''').lstrip('\n')
+    sc.append(_EXTRACT_TOKENS_SRC)
+
+
+    # Step 1
+    sc.append('')
+    sc.append('# ── Step 1: Prime session + get CSRF token ──────────────────────')
+    sc.append(f'session = PayloadSession("{url}")')
+    sc.append(f'r = session.get("{url}", timeout=15)')
+    sc.append('')
+    sc.append('# extract_tokens() scans ALL hidden fields + meta + JS vars at once')
+    sc.append('tokens = extract_tokens(r.text)')
+    sc.append('print(f"Extracted tokens: {list(tokens.keys())}")')
+
+    if csrf_method == 'cookie':
+        sc.append('# CSRF from cookie (Laravel Sanctum / cookie-to-header)')
+        sc.append(f'csrf = unquote(session.cookies().get("{csrf_name}", ""))')
+        sc.append(f'csrf = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
+    elif csrf_method == 'api_endpoint':
+        sc.append('# CSRF from SPA endpoint')
+        sc.append(f'csrf_r = session.get("{_base_origin}{csrf_endpoint}", timeout=10)')
+        sc.append(f'csrf   = csrf_r.json().get("{csrf_name}", "")')
+        sc.append(f'csrf   = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
+    else:
+        sc.append('# CSRF from extracted tokens (hidden field / meta / JS)')
+        if csrf_name:
+            sc.append(f'csrf = tokens.get("{csrf_name}", "")')
+            sc.append('if not csrf:')
+            sc.append(f'    _m = re.search(r\'name="{csrf_name}"[^>]*value="([^"]+)"\', r.text)')
+            sc.append('    csrf = _m.group(1) if _m else ""')
+        else:
+            sc.append('csrf = next((tokens[k] for k in')
+            sc.append('    ("_token","csrf_token","csrfToken","authenticity_token","nonce","_meta_csrf")')
+            sc.append('    if k in tokens), "")')
+
+    sc.append(f'session.set_csrf("{csrf_name or "_token"}", csrf)  # auto-injected from here on')
+    sc.append('print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
+    sc.append('session.dump_state()')
+
+    # Step 2
+    if gw_name in ('Stripe', 'Braintree', 'Adyen') or hosted.get('gateway'):
+        sc.append('')
+        sc.extend(_tokenize_step())
+
+    # Step 3
+    sc.append('')
+    sc.append('# ── Step 3: Submit payment ───────────────────────────────────────')
+    post_lines = _post_body_lines()
+    _ct_header = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
+
+    if submit_url:
+        sc.append(f'resp = session.{method.lower()}(')
+        sc.append(f'    "{submit_url}",')
+        if is_json_enc:
+            sc.append('    json={')
+        else:
+            sc.append('    data={')
+        sc.extend(post_lines if post_lines else ['        # no fields detected'])
+        sc.append('    },')
+        sc.append('    headers={')
+        sc.append(f'        "Content-Type": "{_ct_header}",')
+        sc.append('        # Referer, Origin, X-CSRF-Token auto-set by PayloadSession')
+        sc.append('    },')
+        sc.append('    timeout=20,')
+        sc.append('    allow_redirects=True,')
+        sc.append(')')
+    else:
+        sc.append('# ⚠️ Submit endpoint not detected — check scan results')
+        sc.append('resp = None')
+
+    # ── ResponseAnalysisEngine class ──────────────────────────────────────
+    sc += [
+        '',
+        '# ── Response Analysis Engine ─────────────────────────────────────────',
+        'class ResponseAnalysisEngine:',
+        '    """',
+        '    Parses JSON and HTML responses and categorises the outcome into',
+        '    one of four Transaction States:',
+        '',
+        '      SUCCESS          — payment approved / order confirmed',
+        '      FAILURE          — card declined / error / invalid',
+        '      ACTION_REQUIRED  — 3DS challenge / OTP / redirect needed',
+        '      UNKNOWN          — cannot determine from response alone',
+        '',
+        '    Scoring strategy',
+        '    ────────────────',
+        '    Every keyword or pattern match adds a signed score to a state.',
+        '    The state with the highest positive score wins.',
+        '    HTTP status code sets a strong prior; body keywords refine it.',
+        '    """',
+        '',
+        '    # ── State constants ──────────────────────────────────────────',
+        '    SUCCESS         = "SUCCESS"',
+        '    FAILURE         = "FAILURE"',
+        '    ACTION_REQUIRED = "ACTION_REQUIRED"',
+        '    UNKNOWN         = "UNKNOWN"',
+        '',
+        '    # ── Keyword tables  {state: [(pattern, score, label), ...]} ──',
+        '    _KW: dict = {',
+        '        "SUCCESS": [',
+        '            (re.compile(r"\\bapproved\\b",                          re.I), 10, "approved"),',
+        '            (re.compile(r"\\bpayment.{0,15}success(?:ful)?\\b",     re.I),  9, "payment successful"),',
+        '            (re.compile(r"\\btransaction.{0,15}(?:success|complete|approved)", re.I), 9, "transaction complete"),',
+        '            (re.compile(r"\\border.{0,10}(?:confirmed|placed|complete)", re.I), 8, "order confirmed"),',
+        '            (re.compile(r"\\bthank\\s+you\\s+for\\s+your\\s+(?:order|payment|purchase)", re.I), 8, "thank you"),',
+        '            (re.compile(r"\\bcharge(?:d|\\s+success)",              re.I),  7, "charged"),',
+        '            (re.compile(r"\\bpaid\\b",                              re.I),  6, "paid"),',
+        '            (re.compile(r\'\\x22status\\x22\\s*:\\s*\\x22(?:succeeded|success|approved|paid|complete)\\x22\', re.I), 10, "json:status=success"),',
+        '            (re.compile(r\'\\x22paid\\x22\\s*:\\s*true\',            re.I),  9, "json:paid=true"),',
+        '            (re.compile(r\'\\x22captured\\x22\\s*:\\s*true\',        re.I),  8, "json:captured=true"),',
+        '            (re.compile(r\'\\x22network_status\\x22\\s*:\\s*\\x22approved_by_network\\x22\', re.I), 10, "stripe:network_approved"),',
+        '        ],',
+        '        "FAILURE": [',
+        '            (re.compile(r"\\bdeclin(?:ed|e)",                       re.I), 10, "declined"),',
+        '            (re.compile(r"\\bcard\\s+(?:was\\s+)?declined",         re.I), 10, "card declined"),',
+        '            (re.compile(r"\\binvalid\\s+card",                      re.I),  9, "invalid card"),',
+        '            (re.compile(r"\\binsufficient\\s+funds?",               re.I),  9, "insufficient funds"),',
+        '            (re.compile(r"\\btransaction\\s+(?:failed|declined|rejected|refused)", re.I), 9, "transaction failed"),',
+        '            (re.compile(r"\\bpayment\\s+(?:failed|declined|refused|rejected)", re.I), 9, "payment failed"),',
+        '            (re.compile(r"\\bdo\\s+not\\s+honor",                   re.I),  8, "do not honor"),',
+        '            (re.compile(r"\\bstolen\\s+card",                       re.I),  8, "stolen card"),',
+        '            (re.compile(r"\\bexpir(?:ed|ation)",                    re.I),  7, "expired card"),',
+        '            (re.compile(r"\\bcvv?\\s+(?:mismatch|failed|invalid|incorrect)", re.I), 8, "cvv mismatch"),',
+        '            (re.compile(r"\\bavs\\s+(?:mismatch|failed)",           re.I),  7, "avs mismatch"),',
+        '            (re.compile(r\'\\x22status\\x22\\s*:\\s*\\x22(?:failed|failure|declined|rejected|error)\\x22\', re.I), 10, "json:status=failed"),',
+        '            (re.compile(r\'\\x22decline_code\\x22\\s*:\\s*\\x22\', re.I),  9, "stripe:decline_code"),',
+        '            (re.compile(r\'\\x22error\\x22\\s*:\\s*\\{[^}]*\\x22code\\x22\', re.I), 7, "json:error.code"),',
+        '            (re.compile(r"\\berror\\s+code\\s*[:\\-]?\\s*\\d+",     re.I),  6, "error code"),',
+        '            (re.compile(r"\\bpick\\s+up\\s+card",                   re.I),  8, "pick up card"),',
+        '            (re.compile(r"\\blost\\s+card",                         re.I),  8, "lost card"),',
+        '        ],',
+        '        "ACTION_REQUIRED": [',
+        '            (re.compile(r"\\brequires?_?action\\b",                 re.I), 10, "requires_action"),',
+        '            (re.compile(r"\\b3[Dd]\\s*[Ss]ecure\\b",               re.I),  9, "3DS"),',
+        '            (re.compile(r"\\bthree.?d\\s*secure\\b",               re.I),  9, "3DS"),',
+        '            (re.compile(r"\\b3ds\\s+(?:challenge|auth)",            re.I),  9, "3DS challenge"),',
+        '            (re.compile(r"\\bacs\\s*url\\b",                        re.I),  9, "ACS URL"),',
+        '            (re.compile(r"\\bauthentication\\s+required\\b",        re.I),  8, "auth required"),',
+        '            (re.compile(r"\\bstrongCustomerAuthentication\\b",      re.I),  8, "SCA"),',
+        '            (re.compile(r"\\bverif(?:y|ication)\\s+(?:your\\s+)?(?:card|payment|identity)", re.I), 7, "verify"),',
+        '            (re.compile(r"\\bchallenge_url\\b",                     re.I),  8, "challenge_url"),',
+        '            (re.compile(r"\\bredirect(?:ing)?\\s+to\\s+(?:bank|issuer|acs|3ds)", re.I), 8, "redirect to bank"),',
+        '            (re.compile(r"\\botp\\b|one.?time\\s+password",         re.I),  7, "OTP"),',
+        '            (re.compile(r"\\x22next_action\\x22\\s*:\\s*\\x7B",    re.I),  9, "stripe:next_action"),',
+        '            (re.compile(r"\\x22action\\x22\\s*:\\s*\\x22redirect\\x22", re.I), 7, "json:action=redirect"),',
+        '            (re.compile(r"\\x22enrolled\\x22\\s*:\\s*\\x22Y\\x22", re.I),  8, "3DS enrolled"),',
+        '            (re.compile(r"\\x22liability_shift\\x22",               re.I),  6, "liability_shift"),',
+        '        ],',
+        '    }',
+        '',
+        '    # ── HTTP status prior weights ─────────────────────────────────',
+        '    _HTTP_PRIORS: dict = {',
+        '        # (min_code, max_code): {state: score}',
+        '        (200, 201): {SUCCESS: 4},',
+        '        (202, 202): {ACTION_REQUIRED: 3, SUCCESS: 2},',
+        '        (301, 302): {SUCCESS: 2, ACTION_REQUIRED: 3},',
+        '        (303, 307): {ACTION_REQUIRED: 4},',
+        '        (400, 400): {FAILURE: 6},',
+        '        (401, 401): {FAILURE: 5, ACTION_REQUIRED: 3},',
+        '        (402, 402): {FAILURE: 8},          # Payment Required',
+        '        (403, 403): {FAILURE: 4},',
+        '        (404, 404): {FAILURE: 3},',
+        '        (422, 422): {FAILURE: 7},          # Unprocessable Entity',
+        '        (429, 429): {FAILURE: 3},',
+        '        (500, 599): {UNKNOWN: 2, FAILURE: 2},',
+        '    }',
+        '',
+        '    def analyse(self, resp: "requests.Response") -> dict:',
+        '        """',
+        '        Analyse a requests.Response and return a result dict:',
+        '        {',
+        '            "state":       "SUCCESS" | "FAILURE" | "ACTION_REQUIRED" | "UNKNOWN",',
+        '            "score":       int,           # winning score',
+        '            "http_code":   int,',
+        '            "content_type": str,',
+        '            "matched":     [str, ...],    # matched keyword labels',
+        '            "json":        dict | None,   # parsed JSON if available',
+        '            "summary":     str,           # human-readable one-liner',
+        '            "extra":       dict,          # gateway-specific extras',
+        '        }',
+        '        """',
+        '        result = {',
+        '            "state":       self.UNKNOWN,',
+        '            "score":       0,',
+        '            "http_code":   resp.status_code,',
+        '            "content_type": resp.headers.get("content-type", "")[:60],',
+        '            "matched":     [],',
+        '            "json":        None,',
+        '            "summary":     "",',
+        '            "extra":       {},',
+        '        }',
+        '',
+        '        # ── Parse JSON body if available ─────────────────────────',
+        '        body_json: dict | None = None',
+        '        ct = (resp.headers.get("content-type") or "").lower()',
+        '        if "json" in ct or resp.text.lstrip().startswith((\'{\', \'[\')):',
+        '            try:',
+        '                body_json = resp.json()',
+        '                result["json"] = body_json',
+        '            except Exception:',
+        '                pass',
+        '',
+        '        body_text = resp.text',
+        '',
+        '        # ── Apply HTTP status priors ──────────────────────────────',
+        '        scores: dict = {self.SUCCESS: 0, self.FAILURE: 0,',
+        '                        self.ACTION_REQUIRED: 0, self.UNKNOWN: 0}',
+        '        for (lo, hi), prior in self._HTTP_PRIORS.items():',
+        '            if lo <= resp.status_code <= hi:',
+        '                for st, w in prior.items():',
+        '                    scores[st] += w',
+        '                break',
+        '',
+        '        # ── Score keywords against body ───────────────────────────',
+        '        matched_labels: list[str] = []',
+        '        for state, patterns in self._KW.items():',
+        '            for pat, weight, label in patterns:',
+        '                if pat.search(body_text):',
+        '                    scores[state] += weight',
+        '                    matched_labels.append(f"{state}:{label}(+{weight})")',
+        '',
+        '        # ── Deep JSON field inspection ────────────────────────────',
+        '        if body_json and isinstance(body_json, dict):',
+        '            extras = self._inspect_json(body_json)',
+        '            for st, delta, label in extras:',
+        '                scores[st] += delta',
+        '                matched_labels.append(label)',
+        '                result["extra"].update({label: True})',
+        '',
+        '        # ── Determine winner ─────────────────────────────────────',
+        '        best_state = max(scores, key=lambda s: scores[s])',
+        '        best_score = scores[best_state]',
+        '        if best_score == 0:',
+        '            best_state = self.UNKNOWN',
+        '',
+        '        result["state"]   = best_state',
+        '        result["score"]   = best_score',
+        '        result["matched"] = matched_labels',
+        '        result["summary"] = self._summary(best_state, resp.status_code, matched_labels, body_json)',
+        '        return result',
+        '',
+        '    def _inspect_json(self, j: dict, _depth: int = 0) -> list:',
+        '        """Walk JSON tree (max 3 levels) for gateway-specific fields."""',
+        '        if _depth > 3:',
+        '            return []',
+        '        hits = []',
+        '        for k, v in j.items():',
+        '            kl = str(k).lower()',
+        '            vl = str(v).lower() if not isinstance(v, (dict, list)) else ""',
+        '            # status field',
+        '            if kl in ("status", "result", "outcome", "state", "code"):',
+        '                if vl in ("succeeded", "success", "approved", "paid", "complete", "captured"):',
+        '                    hits.append((self.SUCCESS, 8, f"json:{k}={v}"))',
+        '                elif vl in ("failed", "failure", "declined", "rejected", "error", "cancelled"):',
+        '                    hits.append((self.FAILURE, 8, f"json:{k}={v}"))',
+        '                elif vl in ("requires_action", "pending", "processing", "redirected", "challenged"):',
+        '                    hits.append((self.ACTION_REQUIRED, 7, f"json:{k}={v}"))',
+        '            # boolean flags',
+        '            if kl in ("approved", "success", "paid", "captured") and v is True:',
+        '                hits.append((self.SUCCESS, 7, f"json:{k}=true"))',
+        '            if kl in ("declined", "failed", "error") and v is True:',
+        '                hits.append((self.FAILURE, 7, f"json:{k}=true"))',
+        '            # 3DS / action fields',
+        '            if kl in ("next_action", "redirect_url", "challenge_url", "acs_url") and v:',
+        '                hits.append((self.ACTION_REQUIRED, 8, f"json:{k} present"))',
+        '            # error object',
+        '            if kl == "error" and isinstance(v, dict):',
+        '                ec = str(v.get("code", "") or v.get("type", "")).lower()',
+        '                if ec:',
+        '                    hits.append((self.FAILURE, 9, f"json:error.code={ec}"))',
+        '            # Stripe decline_code',
+        '            if kl == "decline_code" and vl:',
+        '                hits.append((self.FAILURE, 9, f"stripe:decline_code={v}"))',
+        '            # Amount charged',
+        '            if kl == "amount_received" and isinstance(v, (int, float)) and v > 0:',
+        '                hits.append((self.SUCCESS, 5, f"stripe:amount_received={v}"))',
+        '            # Recurse',
+        '            if isinstance(v, dict):',
+        '                hits.extend(self._inspect_json(v, _depth + 1))',
+        '        return hits',
+        '',
+        '    def _summary(self, state: str, code: int, matched: list, j: dict | None) -> str:',
+        '        _icons = {',
+        '            self.SUCCESS:         "✅ SUCCESS",',
+        '            self.FAILURE:         "🔴 FAILURE",',
+        '            self.ACTION_REQUIRED: "🔐 ACTION REQUIRED",',
+        '            self.UNKNOWN:         "⚪ UNKNOWN",',
+        '        }',
+        '        base = f"{_icons.get(state, state)}  [HTTP {code}]"',
+        '        # top 2 evidence labels',
+        '        top = [m.split("(")[0] for m in matched[:2]]',
+        '        if top:',
+        '            base += f"  ← {", ".join(top)}"',
+        '        # gateway-specific detail from JSON',
+        '        if j and isinstance(j, dict):',
+        '            for key in ("decline_code", "error", "next_action", "redirect_url"):',
+        '                if key in j:',
+        '                    val_preview = str(j[key])[:60]',
+        '                    base += f"\\n    {key}: {val_preview}"',
+        '                    break',
+        '        return base',
+        '',
+        '    def print_result(self, result: dict):',
+        '        """Pretty-print analysis result."""',
+        '        print("\\n" + "═" * 50)',
+        '        print(f"  TRANSACTION STATE: {result[\'state\']}")',
+        '        print(f"  HTTP CODE        : {result[\'http_code\']}")',
+        '        print(f"  SCORE            : {result[\'score\']}")',
+        '        print(f"  CONTENT-TYPE     : {result[\'content_type\']}")',
+        '        if result["matched"]:',
+        '            print(f"  EVIDENCE         :")',
+        '            for m in result["matched"][:10]:',
+        '                print(f"    • {m}")',
+        '        if result["extra"]:',
+        '            print(f"  GATEWAY EXTRAS   : {list(result[\'extra\'].keys())}")',
+        '        if result["json"] and isinstance(result["json"], dict):',
+        '            import json as _json',
+        '            _preview = _json.dumps(result["json"], indent=2)[:400]',
+        '            print(f"  JSON PREVIEW     :\\n{_preview}")',
+        '        print(f"\\n  {result[\'summary\']}")',
+        '        print("═" * 50)',
+        '',
+        '',
+    ]
+
+    # Step 4
+    sc.append('')
+    sc.append('# ── Step 4: Analyse response ─────────────────────────────────────────')
+    sc.append('engine = ResponseAnalysisEngine()')
+    sc.append('if resp is not None:')
+    sc.append('    print(f"\\nHTTP {resp.status_code}  →  {resp.url}")')
+    sc.append('    analysis = engine.analyse(resp)')
+    sc.append('    engine.print_result(analysis)')
+    sc.append('')
+    sc.append('    # ── Act on state ──────────────────────────────────────────────')
+    sc.append('    if analysis["state"] == ResponseAnalysisEngine.SUCCESS:')
+    sc.append('        order_id = ""')
+    sc.append('        if analysis["json"]:')
+    sc.append('            _j = analysis["json"]')
+    sc.append('            order_id = str(_j.get("id") or _j.get("order_id") or')
+    sc.append('                           _j.get("transaction_id") or _j.get("charge_id") or "")')
+    sc.append('        print(f"  Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
+    sc.append('')
+    sc.append('    elif analysis["state"] == ResponseAnalysisEngine.ACTION_REQUIRED:')
+    sc.append('        redirect_url = ""')
+    sc.append('        if analysis["json"]:')
+    sc.append('            _j = analysis["json"]')
+    sc.append('            # Stripe next_action')
+    sc.append('            na = _j.get("next_action") or {}')
+    sc.append('            redirect_url = (na.get("redirect_to_url", {}) or {}).get("url", "")')
+    sc.append('            # Generic redirect / ACS URL')
+    sc.append('            redirect_url = redirect_url or str(')
+    sc.append('                _j.get("redirect_url") or _j.get("acs_url") or')
+    sc.append('                _j.get("challenge_url") or "")')
+    sc.append('        print(f"  ⚠️  Redirect/3DS URL: {redirect_url or \'(check JSON above)\'}")')
+    if threeds:
+        sc.append('        # ⚠️  3DS signals detected during scan — browser redirect required')
+    sc.append('')
+    sc.append('    elif analysis["state"] == ResponseAnalysisEngine.FAILURE:')
+    sc.append('        decline_code = ""')
+    sc.append('        if analysis["json"]:')
+    sc.append('            _j = analysis["json"]')
+    sc.append('            decline_code = str(_j.get("decline_code") or')
+    sc.append('                (_j.get("error") or {}).get("code") or')
+    sc.append('                (_j.get("error") or {}).get("decline_code") or "")')
+    sc.append('        print(f"  Decline code: {decline_code or \'(check JSON above)\'}")')
+    sc.append('')
+    sc.append('    else:  # UNKNOWN')
+    sc.append('        print("  ⚪ Could not classify — raw body:")')
+    sc.append('        print(resp.text[:600])')
+    if recaptcha and recaptcha.get('site_key'):
+        sc.append('')
+        sc.append(f'    # ⚠️ CAPTCHA detected (sitekey: {recaptcha["site_key"][:30]}…)')
+        sc.append('    # Solve recaptcha token before Step 3 and add:')
+        sc.append('    #   "g-recaptcha-response": RECAPTCHA_TOKEN')
+    sc.append('else:')
+    sc.append('    print("⚠️  No response — check submit endpoint detection.")')
+
+    return '\n'.join(sc) + '\n'
+
+
 def _build_json_export(data: dict) -> str:
     # PATCHED: replaced nested forms[]/xhr_requests[] with 3-layer flat
     # post_body + field_map; kept captcha/security/tokens/snippets unchanged
@@ -37912,22 +39154,7 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     editor_task = asyncio.create_task(progress_editor())
 
     try:
-        SCAN_TIMEOUT = 300  # 5 minutes max
-        try:
-            data = await asyncio.wait_for(
-                run_scan(uid, _payload_sync, url, progress_cb),
-                timeout=SCAN_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            loop.call_soon_threadsafe(progress_queue.put_nowait, None)
-            editor_task.cancel()
-            await msg.edit_text(
-                f"⏱️ *Scan timed out* ({SCAN_TIMEOUT}s)\n"
-                f"`{escape_md(domain)}` — Server responses too slow\n"
-                f"_Partial results may be in the JSON export_",
-                parse_mode='Markdown'
-            )
-            return
+        data = await run_scan(uid, _payload_sync, url, progress_cb)
     except asyncio.CancelledError:
         loop.call_soon_threadsafe(progress_queue.put_nowait, None)   # stop editor
         editor_task.cancel()
@@ -38062,10 +39289,12 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔄 Re-scan",   callback_data=f"pla_rescan_{_url_hash}"),
             InlineKeyboardButton("📋 curl",      callback_data=f"pla_curl_{_url_hash}"),
             InlineKeyboardButton("📄 JSON",      callback_data=f"pla_json_{_url_hash}"),
+            InlineKeyboardButton("📜 Script",    callback_data=f"pla_script_{_url_hash}"),
         ],
         [
             InlineKeyboardButton("🔴 Live Intercept", callback_data=f"pla_live_{_url_hash}"),
             InlineKeyboardButton("💳 Flow",           callback_data=f"pla_flow_{_url_hash}"),
+            InlineKeyboardButton("🔥 Fire POST",      callback_data=f"pla_fire_{_url_hash}"),
         ],
     ])
     await update.effective_message.reply_text(
@@ -38254,6 +39483,372 @@ def _format_live_entry(idx: int, endpoint: str, method: str, ct: str,
         lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hid_names}{escape_md(extra)}")
 
     return '\n'.join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+# 🔥 _fire_post_classify_sync — Live POST fire + response classifier
+# ══════════════════════════════════════════════════════════════
+
+def _fire_post_classify_sync(data: dict, progress_cb=None) -> dict:
+    """
+    Fire the payment form POST using cached /payload scan data.
+    GET → CSRF prime → POST → classify (pattern + JSON + 3DS).
+    Uses Stripe test cards only. Never touches real card data.
+    """
+    all_entries = data.get('forms', []) + data.get('requests', [])
+    pay_entry   = next(
+        (e for e in all_entries
+         if e.get('is_payment') and (e.get('endpoint') or e.get('action'))),
+        next((e for e in all_entries
+              if e.get('endpoint') or e.get('action')), None)
+    )
+    if not pay_entry:
+        return {'error': 'No form endpoint found in cached data', 'verdict': 'error'}
+
+    submit_url = pay_entry.get('endpoint') or pay_entry.get('action', '')
+    method     = (pay_entry.get('method') or 'POST').upper()
+    enctype    = pay_entry.get('enctype', 'application/x-www-form-urlencoded')
+    fields     = pay_entry.get('fields', [])
+    page_url   = data.get('url', submit_url)
+    gateways   = data.get('gateways', [])
+    gw_name    = gateways[0].get('name', '') if gateways else ''
+
+    if not submit_url:
+        return {'error': 'Submit URL empty', 'verdict': 'error'}
+
+    if progress_cb:
+        progress_cb(f"🔥 Fire POST: {method} {submit_url[:60]}")
+
+    _parsed_pg = urlparse(page_url)
+    _origin    = f"{_parsed_pg.scheme}://{_parsed_pg.netloc}"
+    _engine    = _make_engine("chrome")
+
+    # ── Step 1: GET — prime session + fresh CSRF ──────────────────────────
+    if progress_cb:
+        progress_cb("⬇️ Step 1: Priming session (GET)…")
+    resolved = dict(data.get('resolved_tokens', {}))
+    try:
+        _init_resp = _engine.get(page_url)
+        _init_html = _init_resp.text
+        _init_js   = '\n'.join(re.findall(r'<script[^>]*>(.+?)</script>',
+                                          _init_html, re.S | re.I))
+        _fresh_ts  = _find_token_sources(_init_html, _init_js)
+        _fresh_rt  = _resolve_dynamic_tokens(
+            url=page_url, token_sources=_fresh_ts, engine=_engine,
+            html=_init_html, js_text=_init_js, progress_cb=progress_cb,
+        )
+        resolved.update(_fresh_rt)
+        _live_n = sum(1 for v in resolved.values() if v.get('confidence') == 'live')
+        if progress_cb:
+            progress_cb(f"✅ Step 1 done — {_live_n} live token(s), "
+                        f"{len(_engine.cookies)} cookie(s)")
+    except Exception as _e1:
+        if progress_cb:
+            progress_cb(f"⚠️ Step 1 partial: {str(_e1)[:60]}")
+
+    # ── Step 2: Stripe tokenization (test card only) ──────────────────────
+    _stripe_pm_id = None
+    _stripe_tok   = None
+    _stripe_pk    = None
+    _tok_type     = 'direct'
+    _pk_re        = re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,})\b')
+
+    for _src in [
+        *[rt.get('value', '') for rt in resolved.values()],
+        *[ts.get('value', '') or ts.get('value_preview', '')
+          for ts in data.get('token_sources', [])],
+    ]:
+        _m = _pk_re.search(_src or '')
+        if _m:
+            _stripe_pk = _m.group(1)
+            break
+
+    if gw_name == 'Stripe' and _stripe_pk:
+        _env_tag = 'LIVE 🔴' if 'pk_live_' in _stripe_pk else 'TEST 🟡'
+        if progress_cb:
+            progress_cb(f"🔑 pk_ [{_env_tag}]: {_stripe_pk[:16]}…{_stripe_pk[-4:]}")
+        _sh = {
+            'Authorization':  f'Bearer {_stripe_pk}',
+            'Content-Type':   'application/x-www-form-urlencoded',
+            'Stripe-Version': '2024-06-20',
+        }
+        try:
+            _pm_r = requests.post(
+                'https://api.stripe.com/v1/payment_methods',
+                data={'type': 'card', 'card[number]': '4242424242424242',
+                      'card[exp_month]': '12', 'card[exp_year]': '2029',
+                      'card[cvc]': '123'},
+                headers=_sh, timeout=12, verify=True,
+            )
+            _pm_b = _pm_r.json()
+            if _pm_r.status_code == 200 and _pm_b.get('id', '').startswith('pm_'):
+                _stripe_pm_id = _pm_b['id']
+                _tok_type     = 'pm'
+                _cc           = _pm_b.get('card', {})
+                if progress_cb:
+                    progress_cb(
+                        f"✅ pm_ obtained: {_stripe_pm_id[:16]}…  "
+                        f"brand:{_cc.get('brand','?')}  "
+                        f"3ds:{_cc.get('three_d_secure_usage',{}).get('supported','?')}"
+                    )
+        except Exception as _pme:
+            if progress_cb:
+                progress_cb(f"⚠️ pm_ failed: {str(_pme)[:50]}")
+
+        if not _stripe_pm_id:
+            try:
+                _tk_r = requests.post(
+                    'https://api.stripe.com/v1/tokens',
+                    data={'card[number]': '4242424242424242', 'card[exp_month]': '12',
+                          'card[exp_year]': '2029', 'card[cvc]': '123'},
+                    headers=_sh, timeout=12, verify=True,
+                )
+                _tk_b = _tk_r.json()
+                if _tk_r.status_code == 200 and _tk_b.get('id', '').startswith('tok_'):
+                    _stripe_tok = _tk_b['id']
+                    _tok_type   = 'tok'
+                    if progress_cb:
+                        progress_cb(f"✅ tok_ fallback: {_stripe_tok[:12]}…")
+            except Exception:
+                pass
+
+    # ── Build POST body ───────────────────────────────────────────────────
+    _CARD_TEST = {
+        'Card Number': '4242424242424242', 'CVV/CVC': '123',
+        'Expiry Month': '12', 'Expiry Year': '2029', 'Expiry MM/YY': '12/29',
+        'Cardholder Name': 'John Doe', 'Amount': '1.00', 'Currency': 'USD',
+        'Billing First Name': 'John', 'Billing Last Name': 'Doe',
+        'Billing Address': '123 Test St', 'Billing City': 'New York',
+        'Billing State': 'NY', 'Billing Zip': '10001', 'Billing Country': 'US',
+    }
+    _best_token = _stripe_pm_id or _stripe_tok
+    post_body: dict = {}
+
+    for f in fields:
+        nm  = f.get('name', '')
+        ft  = f.get('type', 'text')
+        ct  = f.get('card_type', '')
+        val = f.get('value', '')
+        if not nm or ft in ('submit', 'button', 'reset', 'image', 'iframe'):
+            continue
+        if f.get('is_honeypot'):
+            continue
+        rt = resolved.get(nm, {})
+        if rt.get('value') and rt.get('confidence') in ('live', 'static', 'inferred'):
+            post_body[nm] = rt['value']
+            continue
+        if _best_token and re.search(
+            r'card.?token|stripe.?token|payment.?method|token.?card|'
+            r'pm_id|payment_method_id|nonce|stripeToken|paymentMethodId', nm, re.I
+        ):
+            post_body[nm] = _best_token
+            continue
+        if re.search(r'g-recaptcha-response|recaptcha|h-captcha', nm, re.I):
+            post_body[nm] = ''
+            continue
+        if ct in _CARD_TEST:
+            post_body[nm] = _CARD_TEST[ct]
+            continue
+        if val and len(val) > 1 and not f.get('is_dynamic'):
+            post_body[nm] = val
+            continue
+        nm_l = nm.lower()
+        if   re.search(r'email|mail',        nm_l): post_body[nm] = 'test@test.com'
+        elif re.search(r'phone|tel|mobile',  nm_l): post_body[nm] = '5555555555'
+        elif re.search(r'fname|first.?name', nm_l): post_body[nm] = 'John'
+        elif re.search(r'lname|last.?name',  nm_l): post_body[nm] = 'Doe'
+        elif re.search(r'address|street',    nm_l): post_body[nm] = '123 Test St'
+        elif re.search(r'\bcity\b',          nm_l): post_body[nm] = 'New York'
+        elif re.search(r'state|province',    nm_l): post_body[nm] = 'NY'
+        elif re.search(r'zip|postal',        nm_l): post_body[nm] = '10001'
+        elif re.search(r'country',           nm_l): post_body[nm] = 'US'
+        elif val:
+            post_body[nm] = val
+
+    # ── Step 3: Fire POST ─────────────────────────────────────────────────
+    if progress_cb:
+        progress_cb(f"🟠 Step 3: Firing {method} → {submit_url[:55]}…")
+
+    submit_headers: dict = {
+        **_get_headers(),
+        'Referer': page_url,
+        'Origin':  _origin,
+    }
+    for _tn, _rt in resolved.items():
+        _hk = _rt.get('header_key')
+        if _hk and _rt.get('value'):
+            submit_headers[_hk] = _rt['value']
+    if gw_name == 'Stripe':
+        import hashlib as _hl3
+        submit_headers['Idempotency-Key'] = _hl3.md5(
+            f"fire-{page_url}-{time.time()}".encode()
+        ).hexdigest()
+
+    submit_status = 0
+    submit_body   = ''
+    submit_ct     = ''
+    redirect_loc  = ''
+    resp_json     = None
+    resp_json_keys: dict = {}
+
+    try:
+        _is_json_enc = 'json' in enctype.lower()
+        if method == 'POST':
+            _sr = _engine.post(
+                submit_url,
+                **(dict(json_body=post_body,
+                        headers={**submit_headers, 'Content-Type': 'application/json'})
+                   if _is_json_enc else
+                   dict(data=post_body, headers=submit_headers))
+            )
+        else:
+            _qs = '&'.join(f"{k}={v}" for k, v in post_body.items())
+            _sr = _engine.get(f"{submit_url}?{_qs}", headers=submit_headers)
+
+        submit_status = _sr.status_code
+        submit_body   = _sr.text[:20_000]
+        try:
+            submit_ct    = _sr.headers.get('Content-Type', '')
+            redirect_loc = _sr.headers.get('Location', '')
+        except Exception:
+            pass
+
+        if 'json' in submit_ct or submit_body.lstrip().startswith(('{', '[')):
+            try:
+                resp_json = json.loads(submit_body)
+                _JSON_KEYS = (
+                    'status', 'message', 'error', 'code', 'success', 'paid',
+                    'declined', 'result', 'response_code', 'auth_code', 'approved',
+                    'transaction_id', 'order_id', 'reference', 'description',
+                    'next_action', 'client_secret', 'payment_intent',
+                    'respstat', 'respcode', 'resptext', 'retref', 'setlstat',
+                    'resultCode', 'pspReference', 'refusalReason',
+                    'redirect', 'messages',
+                )
+                if isinstance(resp_json, dict):
+                    for _rk in _JSON_KEYS:
+                        _rv = resp_json.get(_rk)
+                        if _rv is not None:
+                            resp_json_keys[_rk] = str(_rv)[:100]
+            except Exception:
+                pass
+
+        if progress_cb:
+            progress_cb(
+                f"📡 Step 3 response — HTTP {submit_status} "
+                f"({len(submit_body)} chars)"
+                + (f" → {redirect_loc[:60]}" if redirect_loc else '')
+                + (' [JSON]' if resp_json is not None else '')
+            )
+    except Exception as _e3:
+        if progress_cb:
+            progress_cb(f"❌ Step 3 error: {str(_e3)[:80]}")
+        _engine.close()
+        return {'error': f'POST failed: {str(_e3)[:100]}', 'verdict': 'error',
+                'post_body': post_body, 'endpoint': submit_url, 'method': method}
+
+    # ── Step 4: Classify ──────────────────────────────────────────────────
+    if progress_cb:
+        progress_cb("🔎 Step 4: Classifying response…")
+
+    patterns = _scan_response_patterns(
+        html=submit_body, js_text='', url=submit_url,
+        live_bodies=[submit_body],
+    )
+
+    _3ds_triggered = False
+    _3ds_signals: list[str] = []
+    for _pat, _lbl in [
+        (r'requires_action|next_action|authentication_required', 'Stripe requires_action'),
+        (r'3ds|3d.secure|acs.?url|pareq|threeDSMethodData|creq|cres', '3DS ACS challenge'),
+        (r'ChallengeShopper|IdentifyShopper', 'Adyen 3DS challenge'),
+        (r'"enrolled"\s*:\s*"Y"', '3DS enrolled=Y'),
+        (r'redirect.*acs|acs.*redirect', 'ACS redirect'),
+    ]:
+        if re.search(_pat, submit_body, re.I | re.S):
+            _3ds_triggered = True
+            _3ds_signals.append(_lbl)
+    if resp_json and isinstance(resp_json, dict):
+        if resp_json.get('status') == 'requires_action':
+            _3ds_triggered = True
+            _3ds_signals.append('Stripe JSON requires_action')
+        if resp_json.get('resultCode') in ('ChallengeShopper', 'IdentifyShopper'):
+            _3ds_triggered = True
+            _3ds_signals.append(f"Adyen {resp_json['resultCode']}")
+
+    # HTTP verdict
+    if submit_status in (200, 201):
+        http_verdict = 'possible_success'
+    elif submit_status in (400, 402, 422):
+        http_verdict = 'validation_or_decline'
+    elif submit_status == 403:
+        http_verdict = 'blocked_csrf_or_auth'
+    elif submit_status == 429:
+        http_verdict = 'rate_limited'
+    elif submit_status in (301, 302, 303, 307, 308):
+        if re.search(r'success|confirm|thank|complete|approved', redirect_loc, re.I):
+            http_verdict = 'redirect_success'
+        elif re.search(r'fail|error|decline|reject', redirect_loc, re.I):
+            http_verdict = 'redirect_decline'
+        else:
+            http_verdict = 'redirect_unknown'
+    elif submit_status >= 500:
+        http_verdict = 'server_error'
+    else:
+        http_verdict = f'http_{submit_status}'
+
+    # JSON override
+    if resp_json and isinstance(resp_json, dict):
+        _js  = str(resp_json.get('status', '')).lower()
+        _jok = resp_json.get('success')
+        _jap = resp_json.get('approved')
+        if _js in ('success', 'approved', 'ok', 'captured', 'authorized') \
+                or _jok is True or _jap is True:
+            http_verdict = 'json_success'
+        elif _js in ('failed', 'declined', 'error', 'refused') \
+                or _jok is False or _jap is False:
+            http_verdict = 'json_decline'
+
+    # Merge final verdict
+    pat_verdict = patterns.get('verdict', 'unknown')
+    if pat_verdict in ('success', 'decline'):
+        final_verdict = pat_verdict
+    elif _3ds_triggered:
+        final_verdict = '3ds_challenge'
+    elif http_verdict in ('redirect_success', 'json_success'):
+        final_verdict = 'success'
+    elif http_verdict in ('redirect_decline', 'json_decline', 'validation_or_decline'):
+        final_verdict = 'decline'
+    elif http_verdict == 'blocked_csrf_or_auth':
+        final_verdict = 'blocked'
+    elif http_verdict == 'rate_limited':
+        final_verdict = 'rate_limited'
+    elif http_verdict == 'server_error':
+        final_verdict = 'server_error'
+    else:
+        final_verdict = pat_verdict or 'unknown'
+
+    _VI = {
+        'success': '✅', 'decline': '🔴', '3ds_challenge': '🔐',
+        'blocked': '🚫', 'rate_limited': '⏳', 'server_error': '💥', 'unknown': '⚪',
+    }
+    if progress_cb:
+        progress_cb(f"{_VI.get(final_verdict,'⚪')} Verdict: {final_verdict.upper()}")
+
+    _engine.close()
+    return {
+        'verdict': final_verdict, 'http_status': submit_status,
+        'http_verdict': http_verdict, 'pat_verdict': pat_verdict,
+        'patterns': patterns, 'resp_json_keys': resp_json_keys,
+        'resp_body': submit_body[:2000], 'resp_body_full': submit_body[:8000],
+        'redirect_loc': redirect_loc, '3ds_triggered': _3ds_triggered,
+        '3ds_signals': _3ds_signals, 'endpoint': submit_url,
+        'method': method, 'enctype': enctype, 'post_body': post_body,
+        'token_type': _tok_type, 'stripe_pm_id': _stripe_pm_id,
+        'stripe_tok': _stripe_tok, 'gateway': gw_name,
+    }
+
+
 
 
 def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 180):
@@ -41686,28 +43281,28 @@ _APP_URL_PATTERNS = [
     # API paths
     re.compile(r'[\'"/]((?:api|rest|graphql|v\d+)/[^\s\'"<>]{3,120})[\'"/]'),
     # Base URLs
-    re.compile(r'(?:BASE_URL|baseUrl|base_url|API_URL|apiUrl|HOST|ENDPOINT)\s*[=:]\s*[\'"]([^\'"]{8,150})[\'"]', re.I),
+    re.compile(r"""(?:BASE_URL|baseUrl|base_url|API_URL|apiUrl|HOST|ENDPOINT)\s*[=:]\s*['"]([^'"]{8,150})['"]""", re.I),
     # WebSocket
     re.compile(r'wss?://[^\s\'"<>{}\[\]\\]{8,150}'),
 ]
 
 _APP_SECRET_PATTERNS = {
-    'API Key':        re.compile(r'(?:api[_-]?key|apikey)\s*[=:]\s*[\'"]([A-Za-z0-9_\-]{16,80})[\'"]', re.I),
-    'Secret Key':     re.compile(r'(?:secret[_-]?key|client_secret)\s*[=:]\s*[\'"]([A-Za-z0-9_\-]{16,80})[\'"]', re.I),
-    'Bearer Token':   re.compile(r'[Bb]earer\s+([A-Za-z0-9\-_\.]{20,200})'),
+    'API Key':        re.compile(r'(?:api[_-]?key|apikey)\s*[=:]\s*[\x27\x22]([A-Za-z0-9_-]{16,80})[\x27\x22]', re.I),
+    'Secret Key':     re.compile(r'(?:secret[_-]?key|client_secret)\s*[=:]\s*[\x27\x22]([A-Za-z0-9_-]{16,80})[\x27\x22]', re.I),
+    'Bearer Token':   re.compile(r'[Bb]earer\s+([A-Za-z0-9_.-]{20,200})'),
     'AWS Key':        re.compile(r'AKIA[0-9A-Z]{16}'),
-    'AWS Secret':     re.compile(r'(?:aws_secret|AWS_SECRET)[^\'"]{0,10}[\'"]([A-Za-z0-9/+=]{40})[\'"]', re.I),
-    'Google API':     re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
-    'Firebase URL':   re.compile(r'https://[a-z0-9\-]+\.firebaseio\.com'),
-    'Firebase Key':   re.compile(r'[\'"]([A-Za-z0-9_\-]{39}):APA91b[A-Za-z0-9_\-]{134}[\'"]'),
+    'AWS Secret':     re.compile(r'(?:aws_secret|AWS_SECRET)[^\x27\x22]{0,10}[\x27\x22]([A-Za-z0-9/+=]{40})[\x27\x22]', re.I),
+    'Google API':     re.compile(r'AIza[0-9A-Za-z_-]{35}'),
+    'Firebase URL':   re.compile(r'https://[a-z0-9-]+\.firebaseio\.com'),
+    'Firebase Key':   re.compile(r'[\x27\x22]([A-Za-z0-9_-]{39}):APA91b[A-Za-z0-9_-]{134}[\x27\x22]'),
     'Stripe Key':     re.compile(r'(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{24,}'),
     'Twilio SID':     re.compile(r'AC[0-9a-fA-F]{32}'),
     'Private Key':    re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----'),
-    'JWT Token':      re.compile(r'eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}'),
-    'MongoDB URI':    re.compile(r'mongodb(?:\+srv)?://[^\s\'"<>]{10,150}'),
-    'MySQL URI':      re.compile(r'mysql://[^\s\'"<>]{10,150}'),
-    'Postgres URI':   re.compile(r'postgres(?:ql)?://[^\s\'"<>]{10,150}'),
-    'Hardcoded Pass': re.compile(r'(?:password|passwd|pwd)\s*[=:]\s*[\'"]([^\'"]{6,60})[\'"]', re.I),
+    'JWT Token':      re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'),
+    'MongoDB URI':    re.compile(r'mongodb(?:\+srv)?://[^\s\x27\x22<>]{10,150}'),
+    'MySQL URI':      re.compile(r'mysql://[^\s\x27\x22<>]{10,150}'),
+    'Postgres URI':   re.compile(r'postgres(?:ql)?://[^\s\x27\x22<>]{10,150}'),
+    'Hardcoded Pass': re.compile(r'(?:password|passwd|pwd)\s*[=:]\s*[\x27\x22]([^\x27\x22]{6,60})[\x27\x22]', re.I),
 }
 
 # ── File types to scan inside archive ───────────
@@ -45232,6 +46827,32 @@ async def payload_action_callback(
                 f"❌ `{escape_md(str(e)[:100])}`",
                 parse_mode='Markdown')
 
+    elif action == 'script':
+        # ── 📜 Script: send run-ready Python requests script as .py file ──
+        try:
+            domain   = urlparse(url).hostname or url
+            safe_dom = re.sub(r'[^\w\-]', '_', domain)[:40]
+            fname    = f"payload_{safe_dom}.py"
+            py_str   = _build_python_script(data)
+            import tempfile, os as _os
+            tmp = _os.path.join(tempfile.gettempdir(), fname)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(py_str)
+            with open(tmp, 'rb') as f:
+                await query.message.reply_document(
+                    document=f, filename=fname,
+                    caption=(
+                        f"📜 *{escape_md(domain)}* — Run-ready Python script\n"
+                        f"_pip install requests · then python {escape_md(fname)}_"
+                    ),
+                    parse_mode='Markdown'
+                )
+            _os.unlink(tmp)
+        except Exception as e:
+            await query.message.reply_text(
+                f"❌ Script build error: `{escape_md(str(e)[:120])}`",
+                parse_mode='Markdown')
+
     elif action == 'live':
         # ── 🔴 Live Intercept: run _stream_intercept_sync, report real POST endpoints ──
         domain = urlparse(url).hostname or url
@@ -45504,6 +47125,150 @@ async def payload_action_callback(
             await query.message.reply_text(flow_text[:4000], parse_mode='Markdown')
         except Exception:
             await query.message.reply_text(flow_text[:4000])
+
+    elif action == 'fire':
+        # ── 🔥 Fire POST: GET→CSRF→POST→classify (approve/decline/3DS) ──
+        domain = urlparse(url).hostname or url
+        uid    = query.from_user.id
+
+        _allowed, _wait = check_rate_limit(uid)
+        if not _allowed:
+            await query.message.reply_text(
+                f"⏳ `{_wait}s` စောင့်ပါ", parse_mode='Markdown')
+            return
+
+        wait_msg    = await query.message.reply_text(
+            f"🔥 *Fire POST — `{escape_md(domain)}`*\n\n"
+            f"⏳ _Step 1 GET → Step 3 POST → Step 4 Classify…_ _(~20s)_",
+            parse_mode='Markdown'
+        )
+        _prog_lines = []
+        loop        = asyncio.get_event_loop()
+
+        async def _silent_edit(m, txt):
+            try:
+                await m.edit_text(txt, parse_mode='Markdown')
+            except Exception:
+                pass
+
+        def _fire_progress(txt: str):
+            _prog_lines.append(txt)
+            loop.call_soon_threadsafe(
+                asyncio.ensure_future,
+                _silent_edit(
+                    wait_msg,
+                    f"🔥 *Fire POST — `{escape_md(domain)}`*\n\n"
+                    + '\n'.join(f"  `{escape_md(l[:70])}`"
+                                for l in _prog_lines[-4:])
+                )
+            )
+
+        try:
+            result = await run_scan(uid, _fire_post_classify_sync, data,
+                                    _fire_progress)
+        except Exception as _fe:
+            await wait_msg.edit_text(
+                f"❌ Fire error: `{escape_md(str(_fe)[:120])}`",
+                parse_mode='Markdown')
+            return
+
+        # ── Format result ────────────────────────────────────────────
+        v        = result.get('verdict', 'unknown')
+        http_st  = result.get('http_status', 0)
+        patterns = result.get('patterns', {})
+        j_keys   = result.get('resp_json_keys', {})
+        body_pre = result.get('resp_body', '')[:400]
+        redir    = result.get('redirect_loc', '')
+        is_3ds   = result.get('3ds_triggered', False)
+        sigs_3ds = result.get('3ds_signals', [])
+        err      = result.get('error', '')
+        ep       = result.get('endpoint', '')
+        method_r = result.get('method', 'POST')
+        gw       = result.get('gateway', '')
+        pm_id    = result.get('stripe_pm_id', '') or ''
+        tok_id   = result.get('stripe_tok', '') or ''
+
+        _ICONS = {
+            'success':       '✅ APPROVED',
+            'likely_success':'🟢 LIKELY APPROVED',
+            'decline':       '🔴 DECLINED',
+            '3ds_challenge': '🔐 3DS CHALLENGE',
+            'mixed':         '🟡 MIXED SIGNALS',
+            'blocked':       '🚫 BLOCKED',
+            'rate_limited':  '⏳ RATE LIMITED',
+            'server_error':  '💥 SERVER ERROR',
+            'unknown':       '⚪ UNKNOWN',
+            'error':         '❌ ERROR',
+        }
+        v_display = _ICONS.get(v, f'⚪ {v.upper()}')
+
+        out = [
+            f"🔥 *Fire POST Result — `{escape_md(domain)}`*",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"",
+            f"*Verdict: {escape_md(v_display)}*",
+            f"",
+            f"`{method_r}` `{escape_md(ep[:70])}`",
+            f"HTTP `{http_st}`",
+        ]
+        if gw:
+            _tok_tag = (f" · pm\\_ `{escape_md(pm_id[:16])}…`" if pm_id
+                        else (f" · tok\\_ `{escape_md(tok_id[:12])}…`" if tok_id else ''))
+            out.append(f"Gateway: *{escape_md(gw)}*{_tok_tag}")
+        if redir:
+            out.append(f"↪ `{escape_md(redir[:80])}`")
+
+        if is_3ds:
+            out += ["", "🔐 *3DS / SCA Challenge*"]
+            for s in sigs_3ds[:4]:
+                out.append(f"  • {escape_md(s)}")
+
+        succ_pats = patterns.get('success', [])
+        decl_pats = patterns.get('decline', [])
+        code_pats = patterns.get('response_codes', [])
+        str_codes = patterns.get('stripe_codes', [])
+        if succ_pats or decl_pats or code_pats or str_codes:
+            out += ["", "🔍 *Pattern Matches*"]
+        for p in succ_pats[:4]:
+            out.append(f"  ✅ `{escape_md(p['label'][:60])}`")
+        for p in decl_pats[:4]:
+            _extra = (f" — `{escape_md(p.get('stripe_decline_code',''))}` "
+                      f"_{escape_md(p.get('stripe_meaning','')[:40])}_"
+                      if p.get('stripe_decline_code') else '')
+            out.append(f"  🔴 `{escape_md(p['label'][:60])}`{_extra}")
+        for c in code_pats[:3]:
+            out.append(f"  # code `{escape_md(c['code'])}` — {escape_md(c['meaning'][:40])}")
+        for s in str_codes[:2]:
+            out.append(f"  🔴 Stripe `{escape_md(s['code'])}` — {escape_md(s['description'][:50])}")
+
+        if j_keys:
+            out += ["", "📦 *JSON Keys*"]
+            _KI = {'status':'⚙️','approved':'✅','success':'✅','error':'❌',
+                   'message':'💬','transaction_id':'🆔','order_id':'🆔',
+                   'auth_code':'🔑','next_action':'🔐','resultCode':'⚙️','redirect':'↪'}
+            for k, kv in list(j_keys.items())[:10]:
+                out.append(f"  {_KI.get(k,'  ')} `{escape_md(k)}`: `{escape_md(kv[:60])}`")
+
+        if body_pre and not j_keys:
+            out += ["", "📄 *Response Body*"]
+            _bp = body_pre[:300].replace('`',"'").replace('*','').replace('_','')
+            out.append(f"```\n{_bp}\n```")
+
+        if err:
+            out += ["", f"⚠️ _{escape_md(err[:120])}_"]
+
+        out += ["", "_⚠️ Test card only — authorized testing_"]
+
+        report = '\n'.join(out)
+        try:
+            await wait_msg.edit_text(report[:4000], parse_mode='Markdown')
+        except Exception:
+            try:
+                await wait_msg.edit_text(report[:4000])
+            except Exception:
+                await query.message.reply_text(report[:4000])
+# ══════════════════════════════════════════════════
+
 
 
 # 🛡️  MISSING COMMAND HANDLERS
