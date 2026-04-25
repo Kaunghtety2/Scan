@@ -1222,7 +1222,7 @@ def fetch_sitemap(base_url: str) -> set:
                          timeout=8, verify=False,
                          proxies=proxy_manager.get_proxy())
         if r.status_code == 200:
-            for m in re.finditer(r'(?i)sitemap:\s*(https?://\S+)', r.text):
+            for m in re.finditer(r'(?i)sitemap:\s*(https?://\S+)', r.text or ''):
                 _fetch_one_sitemap(m.group(1).strip())
     except Exception:
         pass
@@ -1416,7 +1416,11 @@ _JS_API_PATTERNS = [
 
 def _extract_api_urls_from_js(js_text: str, base_root: str) -> list:
     """JS bundle/source ထဲက API URL တွေ mine လုပ်"""
+    if not js_text or not isinstance(js_text, str):
+        return []
     found = set()
+    if not js_text or not isinstance(js_text, str):
+        return []
     for pat in _JS_API_PATTERNS:
         for m in pat.findall(js_text):
             url = m.strip()
@@ -3661,6 +3665,8 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seen_keys = set()
 
         for fname, content in sources.items():
+            if not content or not isinstance(content, str):
+                continue
             file_findings = []
             for stype, (pattern, risk) in _SECRET_PATTERNS.items():
                 for match in re.finditer(pattern, content):
@@ -3790,7 +3796,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         # Source files
         for fname, content in sources.items():
-            zf.writestr(f"sources/{fname}", content.encode('utf-8', errors='replace'))
+            zf.writestr(f"sources/{fname}", (content or '').encode('utf-8', errors='replace'))
         # Reports
         zf.writestr("report.txt",  report_txt.encode('utf-8'))
         zf.writestr("report.json", report_json.encode('utf-8'))
@@ -5993,6 +5999,8 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
     seen_keys = set()   # dedup by (key_value) — key is unique regardless of type
 
     def _scan_text(text: str, source_label: str):
+        if not text or not isinstance(text, str):
+            return
         # Iterate in priority order so hCaptcha/Turnstile claim keys before
         # the generic reCAPTCHA data-sitekey fallback can misattribute them.
         for cap_type in _CAPTCHA_SCAN_ORDER:
@@ -6086,6 +6094,8 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
     # ── 3. Scan external JS sources if provided ───────────────────────────────
     if js_sources:
         for js_url, js_text in js_sources.items():
+            if not js_text or not isinstance(js_text, str):
+                continue
             is_obf, obf_reason = _is_obfuscated(js_text)
             if is_obf:
                 logger.debug("sitekey: skip obfuscated JS %s (%s)", js_url[:60], obf_reason)
@@ -6724,6 +6734,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
             })
 
     def _scan_url(req_url):
+        if not req_url or not isinstance(req_url, str):
+            return
         for pat, cap_type in _NET_PATTERNS:
             m = pat.search(req_url)
             if m:
@@ -6735,6 +6747,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 _add(cap_type, key, f"Network URL: {req_url[:120]}")
 
     def _scan_text(text, source):
+        if not text or not isinstance(text, str):
+            return
         for pat, label in _BODY_PATTERNS:
             for m in pat.finditer(text):
                 key = m.group(1)
@@ -7037,7 +7051,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                             (re.compile(r'"hcaptchaSiteKey"\s*:\s*"([0-9a-f\-]{36})"', re.I), "hCaptcha (Next.js config)"),
                         ]
                         for pat, ktype in _ND_PATTERNS:
-                            for m in pat.finditer(next_data):
+                            for m in pat.finditer(next_data or ''):
                                 _add(ktype, m.group(1), "Next.js __NEXT_DATA__")
                 except Exception:
                     pass
@@ -7055,7 +7069,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                             (re.compile(r'"sitekey"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"', re.I), "hCaptcha (Nuxt)"),
                             (re.compile(r'"siteKey"\s*:\s*"([01]x[A-Za-z0-9_\-]{20,60})"', re.I), "Turnstile (Nuxt)"),
                         ]:
-                            for m in pat.finditer(nuxt_str):
+                            for m in pat.finditer(nuxt_str or ''):
                                 _add(ktype, m.group(1), "Nuxt __nuxt__ global")
                 except Exception:
                     pass
@@ -7941,9 +7955,9 @@ def _postmessage_sitekey(url: str, progress_cb=None) -> list:
         browser.close()
 
     for entry in pm_log:
-        data_str = entry.get("data", "")
+        data_str = entry.get("data", "") or ""
         origin   = entry.get("origin", "unknown")
-        if not data_str:
+        if not data_str or not isinstance(data_str, str):
             continue
         for pat in _PM_SITEKEY_PATTERNS:
             for m in pat.finditer(data_str):
@@ -8269,7 +8283,7 @@ def _interact_trigger_captcha(url: str, progress_cb=None) -> list:
 
         before_html = ""
         try:
-            before_html = page.content()
+            before_html = page.content() or ''
             for pat in _POST_TRIGGER_SITEKEY_PATTERNS:
                 for m in pat.finditer(before_html):
                     seen_keys.add(m.group(1))
@@ -8320,7 +8334,7 @@ def _interact_trigger_captcha(url: str, progress_cb=None) -> list:
 
         after_html = ""
         try:
-            after_html = page.content()
+            after_html = page.content() or ''
         except Exception:
             pass
         browser.close()
@@ -8463,7 +8477,8 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     new_assets   = _deep_asset_fetch(url, existing_log, progress_cb)
 
     if new_assets:
-        all_js = {a["url"]: a["response_body"] for a in new_assets}
+        all_js = {a["url"]: a["response_body"] for a in new_assets
+                  if a.get("response_body") and isinstance(a["response_body"], str)}
         html_  = ""
         extra  = _extract_captcha_info(html_, url, all_js)
         for f in extra:
@@ -8533,8 +8548,8 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
         ("Captcha key (response header)", re.compile(r'(?i)x-(?:captcha|recaptcha|hcaptcha)-key:\s*([A-Za-z0-9_\-]{20,})')),
     ]
     for entry in _sk_net_log:
-        body = entry.get("response_body", "")
-        if not body:
+        body = entry.get("response_body", "") or ""
+        if not body or not isinstance(body, str):
             continue
         for ktype, pat in _sk_patterns:
             for m in pat.finditer(body):
@@ -8552,7 +8567,8 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     # ── LIVE ENHANCEMENTS: CSP + well-known + advanced params + postMessage + interact ──
     if progress_cb: progress_cb("🔑 Live sitekey enhancements (CSP/postMsg/interact)...")
     _enh_html     = result.get("html", "")
-    _enh_js       = {a["url"]: a["response_body"] for a in new_assets} if new_assets else {}
+    _enh_js = {a["url"]: a["response_body"] for a in new_assets
+               if a.get("response_body") and isinstance(a["response_body"], str)} if new_assets else {}
     live_enh      = run_live_sitekey_enhancements(url, _enh_html, _enh_js, progress_cb)
     for f in live_enh["all_findings"]:
         sk = f.get("site_key", "")
@@ -17826,6 +17842,8 @@ def _cartscan_run_sync(product_url: str, product_name: str,
     ]
 
     def _scan_text(text: str, source: str):
+        if not text or not isinstance(text, str):
+            return
         for pat, ktype in _SK_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1).strip()
@@ -23199,7 +23217,7 @@ def fetch_sitemap(base_url: str) -> set:
                          timeout=8, verify=False,
                          proxies=proxy_manager.get_proxy())
         if r.status_code == 200:
-            for m in re.finditer(r'(?i)sitemap:\s*(https?://\S+)', r.text):
+            for m in re.finditer(r'(?i)sitemap:\s*(https?://\S+)', r.text or ''):
                 _fetch_one_sitemap(m.group(1).strip())
     except Exception:
         pass
@@ -23392,6 +23410,8 @@ _JS_API_PATTERNS = [
 
 def _extract_api_urls_from_js(js_text: str, base_root: str) -> list:
     """JS bundle/source ထဲက API URL တွေ mine လုပ်"""
+    if not js_text or not isinstance(js_text, str):
+        return []
     found = set()
     for pat in _JS_API_PATTERNS:
         for m in pat.findall(js_text):
@@ -25107,6 +25127,8 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seen_keys = set()
 
         for fname, content in sources.items():
+            if not content or not isinstance(content, str):
+                continue
             file_findings = []
             for stype, (pattern, risk) in _SECRET_PATTERNS.items():
                 for match in re.finditer(pattern, content):
@@ -25236,7 +25258,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         # Source files
         for fname, content in sources.items():
-            zf.writestr(f"sources/{fname}", content.encode('utf-8', errors='replace'))
+            zf.writestr(f"sources/{fname}", (content or '').encode('utf-8', errors='replace'))
         # Reports
         zf.writestr("report.txt",  report_txt.encode('utf-8'))
         zf.writestr("report.json", report_json.encode('utf-8'))
@@ -33882,7 +33904,9 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     if progress_cb: progress_cb("🔎 Locating token sources...")
     # FIX 3d: Include GET response bodies in token source scan
     # Stripe pk_, CSRF meta tokens, session tokens appear in GET responses
-    _resp_body_text = ' '.join(_pw_resp_bodies.values())[:500_000]
+    _resp_body_text = ' '.join(
+        v for v in _pw_resp_bodies.values() if v and isinstance(v, str)
+    )[:500_000]
     token_sources = _find_token_sources(
         static_html + js_html + _resp_body_text, js_text
     )
@@ -34050,7 +34074,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                 # Accept 200 OR a redirect that landed on HTML
                 _ct = _sr.headers.get('content-type', '')
                 if _sr.status_code == 200 and 'text/html' in _ct:
-                    _html      = _sr.text
+                    _html      = _sr.text or ''
                     # Skip redirect-to-login pages (no payment content)
                     _is_login  = bool(re.search(
                         r'<form[^>]*action[^>]*/(?:login|signin|auth)',
@@ -46748,9 +46772,9 @@ def _run_keydump_sync(url: str) -> dict:
     fw_globals    = _extract_framework_globals(data["html"])
     html_comments = _extract_html_comments(data["html"])
     corpus_parts  = (
-        [data["html"]]
-        + inline_scripts
-        + [js for _, js in data["js_sources"]]
+        [data["html"] or ""]
+        + [s for s in inline_scripts if s and isinstance(s, str)]
+        + [js for _, js in data["js_sources"] if js and isinstance(js, str)]
     )
     if fw_globals:
         corpus_parts.append(fw_globals)
@@ -46765,6 +46789,8 @@ def _run_keydump_sync(url: str) -> dict:
 
     def _kd_pattern_scan(text_corpus: str, source_tag: str = "") -> None:
         """Scan corpus through all _KD_PATTERNS, add to out with dedup."""
+        if not text_corpus or not isinstance(text_corpus, str):
+            return
         for label, (pat, cat_icon) in _KD_PATTERNS.items():
             try:
                 raw = re.findall(pat, text_corpus, re.IGNORECASE)
@@ -46795,7 +46821,7 @@ def _run_keydump_sync(url: str) -> dict:
     # ── 2b. Deobfuscation pass — decode atob/hex/unicode/join/fromCharCode ────
     _deob_hits = 0
     for _js_text in ([data["html"]] + [_js for _, _js in data["js_sources"]] + inline_scripts):
-        if len(_js_text) < 50:
+        if not _js_text or not isinstance(_js_text, str) or len(_js_text) < 50:
             continue
         _extra = _deobfuscate_text(_js_text)
         if _extra:
@@ -49085,7 +49111,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 r = requests.get(url, timeout=10, verify=False, headers=_get_headers(),
                                  proxies=proxy_manager.get_proxy())
-                words = list(dict.fromkeys(re.findall(r'/([a-zA-Z0-9_\-]{3,30})', r.text)))[:200]
+                words = list(dict.fromkeys(re.findall(r'/([a-zA-Z0-9_\-]{3,30})', r.text or '')))[:200]
             except Exception:
                 words = ["api", "admin", "login", "user", "config", "static", "assets"]
             progress_q.append(f"🧠 Wordlist built: `{len(words)}` words — probing...")
