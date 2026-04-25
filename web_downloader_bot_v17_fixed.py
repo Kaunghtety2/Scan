@@ -25670,13 +25670,16 @@ def _classify_field(name: str, value: str,
     """Returns: (label, icon, is_dynamic, card_type_or_None)
     ENH: Now uses placeholder + aria-label + visible label for better detection.
     """
+    # Guard against None inputs
+    name        = str(name        or '')
+    value       = str(value       or '')
+    ftype       = str(ftype       or 'text').lower()
+    placeholder = str(placeholder or '')
+    aria_label  = str(aria_label  or '')
+    label_text  = str(label_text  or '')
+
     # Combined hint text for matching
-    hint = ' '.join(filter(None, [
-        str(name       or ''),
-        str(placeholder or ''),
-        str(aria_label  or ''),
-        str(label_text  or ''),
-    ]))
+    hint = ' '.join(filter(None, [name, placeholder, aria_label, label_text]))
 
     for pattern, label, icon, sensitive in _CARD_FIELDS:
         if pattern.search(hint):
@@ -26854,7 +26857,7 @@ def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
 
 def _detect_payment_gateway(html: str, js_sources: str = '') -> list:
     """HTML + JS မှ payment gateway detect လုပ်သည်။"""
-    combined   = html + js_sources
+    combined   = (html or '') + (js_sources or '')
     tokenized  = bool(re.search(
         r'createToken|createPaymentMethod|tokenize|\.token\b|paymentIntent|'
         r'stripe\.js|braintree\.js|accept\.js', combined, re.I))
@@ -33574,7 +33577,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
 
     try:
         _initial_resp = _engine.get(url)
-        static_html   = _initial_resp.text
+        static_html   = _initial_resp.text or ''
         _resp_headers = dict(_initial_resp.headers)
         if _engine.csrf_token and progress_cb:
             progress_cb(f"🔑 CSRF token found: {_engine.csrf_token[:24]}…")
@@ -33583,7 +33586,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         try:
             _initial_resp = requests.get(url, headers=_get_headers(),
                                 timeout=TIMEOUT, verify=False, allow_redirects=True)
-            static_html   = _initial_resp.text
+            static_html   = _initial_resp.text or ''
             _resp_headers = dict(_initial_resp.headers)
         except Exception:
             pass
@@ -33630,6 +33633,10 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     pw_requests = _extract_requests_playwright(url, progress_cb)
 
     js_html = fetch_with_playwright(url) or ''
+
+    # ── Safety: ensure strings are never None before any concatenation ──
+    static_html = static_html or ''
+    js_html     = js_html     or ''
     js_forms = []
     if js_html and js_html != static_html:
         # Re-run embed detection on JS-rendered HTML (catches lazily injected iframes)
@@ -33677,17 +33684,17 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     _pw_resp_bodies: dict = {}   # url → body — from FIX 3 response capture
     for r in pw_requests:
         if r.pop('_js_only', False):
-            js_text = r.pop('_js_text', '')
+            js_text = r.pop('_js_text', '') or ''
             # FIX 3c: collect response bodies from js_only entries
-            _pw_resp_bodies.update(r.pop('_resp_bodies', {}))
+            _pw_resp_bodies.update(r.pop('_resp_bodies', {}) or {})
             continue
         if r.pop('_storage_dump', False):
             client_storage['localStorage'].update(r.get('localStorage', {}))
             client_storage['sessionStorage'].update(r.get('sessionStorage', {}))
             continue
-        js_text += r.pop('_js_text', '')
+        js_text += r.pop('_js_text', '') or ''
         # FIX 3c: collect response bodies from normal entries too
-        _pw_resp_bodies.update(r.pop('_resp_bodies', {}))
+        _pw_resp_bodies.update(r.pop('_resp_bodies', {}) or {})
         if r.get('source') == 'playwright_dom':
             dom_forms.append(r)
         else:
@@ -33736,7 +33743,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             tot = sum(len(f.get('fields', [])) for f in dom_forms)
             progress_cb(f"✅ DOM merge: {tot} fields total (incl. iframes)")
 
-    gateways = _detect_payment_gateway(static_html + js_html, js_text)
+    gateways = _detect_payment_gateway((static_html or '') + (js_html or ''), js_text or '')
     if progress_cb: progress_cb(f"💳 {len(gateways)} gateway(s) detected...")
 
     # ── A: Multi-page checkout step tracker ──────────────────────────────
