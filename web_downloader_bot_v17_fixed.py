@@ -25671,7 +25671,12 @@ def _classify_field(name: str, value: str,
     ENH: Now uses placeholder + aria-label + visible label for better detection.
     """
     # Combined hint text for matching
-    hint = ' '.join(filter(None, [name, placeholder, aria_label, label_text]))
+    hint = ' '.join(filter(None, [
+        str(name       or ''),
+        str(placeholder or ''),
+        str(aria_label  or ''),
+        str(label_text  or ''),
+    ]))
 
     for pattern, label, icon, sensitive in _CARD_FIELDS:
         if pattern.search(hint):
@@ -26948,11 +26953,11 @@ def _extract_forms_static(html: str, page_url: str) -> list:
         name  = inp.get('name') or inp.get('id') or ''
         if not name:
             return None
-        ftype        = inp.get('type', 'text').lower()
-        value        = inp.get('value', '')
-        placeholder  = inp.get('placeholder', '')
-        aria_label   = inp.get('aria-label', '') or inp.get('title', '')
-        label_text   = label_override or _get_label(inp)
+        ftype        = str(inp.get('type',        'text') or 'text').lower()
+        value        = str(inp.get('value',        '')    or '')
+        placeholder  = str(inp.get('placeholder',  '')    or '')
+        aria_label   = str(inp.get('aria-label',   '')    or inp.get('title', '') or '')
+        label_text   = str(label_override or _get_label(inp) or '')
         req          = inp.has_attr('required') or inp.get('required') == 'required'
         autocomplete = inp.get('autocomplete', '')
         pattern      = inp.get('pattern', '')
@@ -28715,8 +28720,8 @@ def _scan_response_patterns(
         }
     """
     sources: list[tuple[str, str]] = [
-        (html,    'static_html'),
-        (js_text, 'js_source'),
+        (html    or '', 'static_html'),
+        (js_text or '', 'js_source'),
     ]
     for body in (live_bodies or []):
         if isinstance(body, str) and body:
@@ -34929,11 +34934,11 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
         Returns card_type string or empty string.
         """
         idx       = all_fields.index(f) if f in all_fields else -1
-        ftype     = f.get('type', 'text')
-        maxlen    = str(f.get('maxlength', ''))
-        ac        = f.get('autocomplete', '').lower()
-        ph        = (f.get('placeholder') or '').lower()
-        label     = (f.get('field_label') or f.get('label', '')).lower()
+        ftype     = str(f.get('type',         'text') or 'text')
+        maxlen    = str(f.get('maxlength',     '')    or '')
+        ac        = str(f.get('autocomplete',  '')    or '').lower()
+        ph        = str(f.get('placeholder')   or '').lower()
+        label     = str(f.get('field_label')   or f.get('label', '') or '').lower()
 
         # autocomplete hint is the most reliable signal
         _AC_MAP = {
