@@ -15080,6 +15080,7 @@ def _scan_sourcemaps(base_url: str, html_text: str, progress_cb=None) -> list:
     sourceMappingURL=bundle.js.map  — often contains unminified source with secrets.
     Returns list of (text, label) tuples.
     """
+    html_text = html_text if isinstance(html_text, str) else ""
     results = []
     map_urls = set()
     # Find //# sourceMappingURL= references in HTML
@@ -15109,6 +15110,7 @@ def _scan_service_workers(base_url: str, html_text: str, progress_cb=None) -> li
     Find and scan Service Worker JS files (sw.js, service-worker.js, etc.).
     SWs often cache payment config inline.
     """
+    html_text = html_text if isinstance(html_text, str) else ""
     results = []
     sw_candidates = set()
     # Explicit registration: navigator.serviceWorker.register('sw.js')
@@ -16330,7 +16332,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         }
 
     # ── v19: extra scan passes ─────────────────────────────────────────────
-    html_text = data.get("html", "")
+    html_text = (data.get("html") or "")
 
     if progress_cb: progress_cb("🗺️ v19: Scanning source maps...")
     sourcemap_texts = _scan_sourcemaps(url, html_text, progress_cb)
@@ -16518,7 +16520,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         if sdk_pat.search(combined_for_sdk):
             sdk_hints.append(sdk_name)
     # Also scan raw HTML <script src> tags
-    _html_for_sdk = data.get("html", "")
+    _html_for_sdk = (data.get("html") or "")
     for sdk_name, sdk_pat in _PAY_SDK_LOAD_SIGNALS:
         if sdk_name not in sdk_hints and sdk_pat.search(_html_for_sdk):
             sdk_hints.append(sdk_name)
@@ -16537,7 +16539,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     # ── Sitekey extraction (Captcha API response capture) ─────────────────────
     if progress_cb: progress_cb("🔑 Extracting captcha sitekeys from API responses...")
     try:
-        _pk_html   = data.get("html", "")
+        _pk_html   = (data.get("html") or "")
         _pk_all_js = {
             e["url"]: e.get("response_body", "")
             for e in data.get("network_log", [])
@@ -19988,7 +19990,7 @@ def _fetch_next_routes(base_url: str) -> list:
                     origin + mu, timeout=6, verify=False,
                     headers=_get_headers(), proxies=proxy_manager.get_proxy()
                 )
-                found = re.findall(r'"(/[^"]+)"', mr.text)
+                found = re.findall(r'"(/[^"]+)"', mr.text or "")
                 routes.extend([f for f in found if f.startswith("/") and len(f) > 1])
             except Exception:
                 pass
@@ -26793,6 +26795,8 @@ def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
         'source':        'iframe_embed' | 'script_embed',
       }
     """
+    html    = html    if isinstance(html,    str) else ""
+    js_text = js_text if isinstance(js_text, str) else ""
     combined = html + js_text
     detected = []
     seen_providers: set = set()
@@ -26818,7 +26822,7 @@ def _detect_embedded_payment_platforms(html: str, js_text: str = "") -> list:
         # Check against collected URLs first
         for url_candidate in all_urls:
             for pat in patterns:
-                if re.search(pat, url_candidate, re.I):
+                if re.search(pat, url_candidate or "", re.I):
                     matched_src = url_candidate
                     matched_source = (
                         'iframe_embed' if url_candidate in iframe_srcs
@@ -41488,7 +41492,7 @@ def _payloadlive_sync(url: str, on_request_cb, stop_event, timeout_sec: int = 18
                 if content_len > 500_000:   # skip > 500KB
                     return
                 try:
-                    body_text = response.text()
+                    body_text = response.text() or ""
                     if len(body_text) > 500_000:
                         body_text = body_text[:500_000]
                 except Exception:
@@ -44948,6 +44952,7 @@ def _extract_strings_from_binary(data: bytes) -> list:
 
 def _parse_android_manifest(xml_text: str) -> dict:
     """AndroidManifest.xml ထဲမှာ package, permissions, activities ရှာ"""
+    xml_text = xml_text if isinstance(xml_text, str) else ""
     info = {"package": "", "permissions": [], "activities": [],
             "services": [], "receivers": [], "meta_data": {}}
     try:
@@ -44978,6 +44983,7 @@ def _parse_android_manifest(xml_text: str) -> dict:
 
 def _parse_ios_info_plist(plist_text: str) -> dict:
     """iOS Info.plist ထဲမှာ bundle ID, keys ရှာ"""
+    plist_text = plist_text if isinstance(plist_text, str) else ""
     info = {"bundle_id": "", "permissions": [], "url_schemes": [], "keys": {}}
     try:
         m = re.search(r'<key>CFBundleIdentifier</key>\s*<string>([^<]+)</string>', plist_text)
@@ -45074,12 +45080,12 @@ def analyze_app_file(filepath: str, progress_cb=None) -> dict:
 
                         # AndroidManifest.xml
                         if name == 'AndroidManifest.xml' and '<manifest' in text:
-                            result["app_info"] = _parse_android_manifest(text)
+                            result["app_info"] = _parse_android_manifest(text or "")
                             result["app_info"]["platform"] = "Android"
 
                         # iOS Info.plist
                         if name.endswith('Info.plist') and 'CFBundle' in text:
-                            result["app_info"] = _parse_ios_info_plist(text)
+                            result["app_info"] = _parse_ios_info_plist(text or "")
                             result["app_info"]["platform"] = "iOS"
 
                         text_count += 1
@@ -46568,6 +46574,11 @@ def _run_playwright_keydump(url: str) -> dict:
                             for store_name, values_str in stores.items():
                                 if not values_str:
                                     continue
+                                if not isinstance(values_str, str):
+                                    try:
+                                        values_str = str(values_str)
+                                    except Exception:
+                                        continue
                                 kd_hits = {}
                                 for label, (pat, cat_icon) in _KD_PATTERNS.items():
                                     try:
@@ -47034,7 +47045,7 @@ def _run_keydump_sync(url: str) -> dict:
     # ── Sitekey extraction from API responses ─────────────────────────────────
     try:
         _kd_live_r  = out.get("live_result") or {}
-        _kd_html    = data.get("html", "")
+        _kd_html    = (data.get("html") or "")
         _kd_all_js  = {js_url: js_text for js_url, js_text in data.get("js_sources", [])}
         out["sitekeys"] = _extract_sitekeys_from_data(_kd_html, _kd_all_js, _kd_live_r, url)
     except Exception as _sk_e:
