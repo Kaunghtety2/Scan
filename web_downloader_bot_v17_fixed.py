@@ -26312,6 +26312,8 @@ def _detect_checkout_steps(html: str, js_text: str, url: str) -> dict:
     Detect multi-step checkout flow: how many steps exist,
     which step is currently active, and step labels.
     """
+    html    = html    or ''
+    js_text = js_text or ''
     combined = html + js_text
     steps_found: list[dict] = []
     current_step: int | None = None
@@ -26406,6 +26408,8 @@ def _detect_sdk_versions(html: str, js_text: str) -> list:
     Detect loaded gateway SDK versions and variants.
     Returns list of {gateway, sdk, version, variant, note}
     """
+    html     = html    or ''
+    js_text  = js_text or ''
     combined = html + js_text
     results: list[dict] = []
 
@@ -27671,6 +27675,8 @@ def _find_token_sources(html: str, js_text: str) -> list:
     Returns list of dicts:
       name, value_preview, source_type, location, label
     """
+    html    = html    or ''
+    js_text = js_text or ''
     results = []
     seen    = set()
 
@@ -30663,6 +30669,9 @@ def _resolve_dynamic_tokens(
     js_text:       str = '',
     progress_cb=None,
 ) -> dict:
+    # Ensure inputs are always strings
+    html    = html    or ''
+    js_text = js_text or ''
     """
     Extract live values for each dynamic token found in token_sources.
 
@@ -30731,8 +30740,8 @@ def _resolve_dynamic_tokens(
             progress_cb('🔑 Fetching live page for fresh token values…')
         try:
             if engine is not None:
-                resp     = engine.get(url)
-                live_html    = resp.text
+                resp         = engine.get(url)
+                live_html    = resp.text or ''
                 live_cookies = dict(getattr(resp, 'cookies', {}) or {})
                 # also pull from engine session jar
                 if hasattr(engine, '_session'):
@@ -30744,15 +30753,15 @@ def _resolve_dynamic_tokens(
                     url, headers=_get_headers(),
                     timeout=TIMEOUT, verify=False, allow_redirects=True,
                 )
-                live_html    = resp.text
+                live_html    = resp.text or ''
                 live_cookies = dict(resp.cookies)
         except Exception as _e:
             if progress_cb:
                 progress_cb(f'⚠️ Live fetch failed: {str(_e)[:60]}')
             live_html = html   # fall back to cached
 
-    combined_html = live_html or html
-    combined_js   = combined_html + '\n' + js_text
+    combined_html = (live_html or html or '')
+    combined_js   = combined_html + '\n' + (js_text or '')
 
     # ── Step 2: hidden_input extraction ───────────────────────
     hidden_map: dict = {}
