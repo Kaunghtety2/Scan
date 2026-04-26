@@ -40202,6 +40202,9 @@ def _build_python_script(data: dict) -> str:
             for _pk in _wc_pay_keys[:6]:
                 _pvn = re.sub(r'[^A-Za-z0-9_]', '_',
                               _pk['label'].upper().replace(' ', '_'))[:40]
+                if _pvn in _seen_wc_vars:   # ← skip if already defined above
+                    continue
+                _seen_wc_vars.add(_pvn)
                 _pv  = str(_pk.get('value', '')).replace('"', '\\"')[:120]
                 _pe  = f'  # [{_pk["env"].upper()}]' if _pk.get('env', 'unknown') != 'unknown' else ''
                 sc.append(f'{_pvn} = "{_pv}"{_pe}')
@@ -40642,7 +40645,7 @@ def _build_python_script(data: dict) -> str:
                 (re.compile(r"\bfirst[-_]?name|fname|given[-_]?name\b",       re.I), "first_name"),
                 (re.compile(r"\blast[-_]?name|lname|family[-_]?name|surname\b",re.I),"last_name"),
                 (re.compile(r"\bfull[-_]?name|your[-_]?name\b",               re.I), "full_name"),
-                (re.compile(r"\bcard(?:holder)?[-_]?name|name[-_]?on[-_]?card\b",re.I),"full_name"),
+                (re.compile(r"\bcard(?:holder)?[-_]?name|name[-_]?on[-_]?card|cc[-_]?name\b",re.I),"full_name"),
                 (re.compile(r"\bcompany|organisation|organization|business\b", re.I), "company"),
                 # phone
                 (re.compile(r"\bphone|telephone|tel(?:ephone)?|mobile|cell\b", re.I),"phone"),
@@ -40653,11 +40656,21 @@ def _build_python_script(data: dict) -> str:
                 (re.compile(r"\bstate|province|region\b",                      re.I), "state"),
                 (re.compile(r"\bzip|post(?:al)?[-_]?code|eircode\b",          re.I), "zip"),
                 (re.compile(r"\bcountry\b",                                    re.I), "country"),
-                # card
+                # card number — name, placeholder, autocomplete
                 (re.compile(r"\bcard[-_]?(?:number|num|no)|cc[-_]?num(?:ber)?|account(?:no|number)?\b",re.I),"card_number"),
+                (re.compile(r"\bcc[-_]?number\b",                              re.I), "card_number"),
+                # expiry — combined MM/YY  (cc-exp autocomplete + Stripe Element placeholder)
+                (re.compile(r"\bcc[-_]?exp\b(?![-_](?:month|year|mon|yr|mm|yy))",re.I),"card_exp_mmyy"),
+                (re.compile(r"expiry\s+mm[/\-]yy|mm\s*/\s*yy|mm\s*yy",       re.I), "card_exp_mmyy"),
+                (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:date|mmyy|mmyyyy)\b",re.I),"card_exp_mmyy"),
+                (re.compile(r"\bcardexpiry\b",                                 re.I), "card_exp_mmyy"),
+                # expiry month/year split
+                (re.compile(r"\bcc[-_]?exp[-_]?(?:month|mon|mm)\b",           re.I), "card_exp_month"),
+                (re.compile(r"\bcc[-_]?exp[-_]?(?:year|yr|yy)\b",             re.I), "card_exp_year"),
                 (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:month|mon|mm)\b",  re.I), "card_exp_month"),
                 (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:year|yr|yy)\b",    re.I), "card_exp_year"),
-                (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:date|mmyy|mmyyyy)\b",re.I),"card_exp_mmyy"),
+                # CVV — cc-csc autocomplete
+                (re.compile(r"\bcc[-_]?csc\b",                                 re.I), "card_cvc"),
                 (re.compile(r"\bcvc|cvv|csc|security[-_]?code|card[-_]?code\b",re.I),"card_cvc"),
                 # bank
                 (re.compile(r"\brouting[-_]?(?:number|num|no)\b",             re.I), "routing"),
@@ -40756,12 +40769,15 @@ def _build_python_script(data: dict) -> str:
 
             def _fingerprint(self, field: dict) -> str:
                 return " ".join(filter(None, [
-                    field.get("name",        ""),
-                    field.get("id",          ""),
-                    field.get("placeholder", ""),
-                    field.get("autocomplete",""),
-                    field.get("aria_label",  ""),
-                    field.get("label",       ""),
+                    field.get("name",           ""),
+                    field.get("id",             ""),
+                    field.get("placeholder",    ""),
+                    field.get("autocomplete",   ""),
+                    field.get("aria_label",     ""),
+                    field.get("label",          ""),
+                    field.get("field_label",    ""),   # ← classify_field label
+                    field.get("card_type",      ""),   # ← e.g. "Expiry MM/YY"
+                    field.get("card_type_hint", ""),   # ← Stripe Elements hint
                 ])).lower()
 
             def map_field(self, field: dict,
