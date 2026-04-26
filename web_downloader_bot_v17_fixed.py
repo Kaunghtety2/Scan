@@ -34294,6 +34294,259 @@ def _trace_event_flow(html: str, js_text: str, forms: list) -> dict:
     }
 
 
+
+def _extract_client_config(html: str, js_text: str, page_url: str = '') -> dict:
+    """
+    Client-Side Config Extraction.
+
+    Scans:
+      1. All <script> tag bodies (inline JS)
+      2. Combined HTML + JS text
+      3. window.* / globalThis.* global object patterns
+      4. __NEXT_DATA__ / __NUXT__ / __remixContext / Gatsby state blobs
+      5. data-* HTML attributes carrying config values
+
+    Extracts:
+      - Public API keys   (Stripe pk_, Google Maps, Firebase, Pusher, Segment,
+                           Intercom, Algolia, Sentry DSN, Mixpanel, Amplitude …)
+      - Merchant IDs      (PayPal client_id, Braintree merchant, Square appId …)
+      - Config objects    (window.__CONFIG__, window.appConfig, window.ENV …)
+      - Feature flags     (window.featureFlags, window.__FF__ …)
+      - Build / version   (APP_VERSION, BUILD_ID, COMMIT_HASH …)
+      - CDN / origin URLs (API_BASE_URL, STATIC_URL, CDN_URL …)
+
+    Returns dict:
+      {
+        "api_keys":      [{key, value, category, source}],
+        "merchant_ids":  [{key, value, category, source}],
+        "config_objects":[{key, value_preview, source}],
+        "env_vars":      [{key, value, source}],
+        "data_attrs":    [{key, value, source}],
+        "raw_window":    {key: value},   # window.* globals found
+      }
+    """
+    html    = html    or ''
+    js_text = js_text or ''
+    combined = html + '\n' + js_text
+
+    out: dict = {
+        'api_keys':       [],
+        'merchant_ids':   [],
+        'config_objects': [],
+        'env_vars':       [],
+        'data_attrs':     [],
+        'raw_window':     {},
+    }
+    _seen: set = set()
+
+    def _add(bucket: str, key: str, value: str, category: str, source: str):
+        dedup = f"{bucket}:{key}:{value[:40]}"
+        if dedup in _seen or not value or len(value) < 3:
+            return
+        _seen.add(dedup)
+        entry = {'key': key, 'value': value[:300], 'category': category, 'source': source}
+        out[bucket].append(entry)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pattern bank  {label: (pattern, bucket, category)}
+    # ──────────────────────────────────────────────────────────────────────
+    _PATTERNS = [
+        # ── Public payment / merchant keys ───────────────────────────────
+        ('Stripe pk_',        re.compile(r'["\']?(pk_(?:live|test)_[A-Za-z0-9]{20,})["\']?', re.I),
+         'api_keys', 'stripe_publishable_key'),
+        ('PayPal client_id',  re.compile(r'["\']?client[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{10,80})["\']', re.I),
+         'merchant_ids', 'paypal_client_id'),
+        ('Braintree merchant', re.compile(r'["\']?(?:braintree[-_]?)?merchant[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_]{6,40})["\']', re.I),
+         'merchant_ids', 'braintree_merchant_id'),
+        ('Square appId',      re.compile(r'["\']?(?:square[-_]?)?app(?:lication)?[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{10,60})["\']', re.I),
+         'merchant_ids', 'square_app_id'),
+        ('Adyen clientKey',   re.compile(r'["\']?(?:adyen[-_]?)?client[-_]?key["\']\s*[=:]\s*["\']([A-Za-z0-9_]{20,100})["\']', re.I),
+         'api_keys', 'adyen_client_key'),
+        ('Razorpay key_id',   re.compile(r'["\']?(?:razorpay[-_]?)?key[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_]{14,30})["\']', re.I),
+         'api_keys', 'razorpay_key_id'),
+        # ── Maps / geo ───────────────────────────────────────────────────
+        ('Google Maps key',   re.compile(r'["\']?(AIza[A-Za-z0-9_\-]{35})["\']?', re.I),
+         'api_keys', 'google_maps_api_key'),
+        ('Mapbox token',      re.compile(r'["\']?(pk\.eyJ1[A-Za-z0-9._\-]{30,})["\']?', re.I),
+         'api_keys', 'mapbox_token'),
+        # ── Firebase ─────────────────────────────────────────────────────
+        ('Firebase apiKey',   re.compile(r'["\']?apiKey["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{30,})["\']', re.I),
+         'api_keys', 'firebase_api_key'),
+        ('Firebase projectId',re.compile(r'["\']?projectId["\']\s*[=:]\s*["\']([a-z0-9\-]{4,40})["\']', re.I),
+         'config_objects', 'firebase_project_id'),
+        ('Firebase authDomain',re.compile(r'["\']?authDomain["\']\s*[=:]\s*["\']([a-z0-9\-]+\.firebaseapp\.com)["\']', re.I),
+         'config_objects', 'firebase_auth_domain'),
+        # ── Analytics / tracking ─────────────────────────────────────────
+        ('Segment writeKey',  re.compile(r'["\']?(?:write[-_]?key|segmentKey)["\']\s*[=:]\s*["\']([A-Za-z0-9]{20,50})["\']', re.I),
+         'api_keys', 'segment_write_key'),
+        ('Mixpanel token',    re.compile(r'["\']?(?:mixpanel[-_]?)?token["\']\s*[=:]\s*["\']([A-Za-z0-9]{20,50})["\']', re.I),
+         'api_keys', 'mixpanel_token'),
+        ('Amplitude key',     re.compile(r'["\']?(?:amplitude[-_]?)?api[-_]?key["\']\s*[=:]\s*["\']([A-Za-z0-9]{10,40})["\']', re.I),
+         'api_keys', 'amplitude_api_key'),
+        ('GA Measurement ID', re.compile(r'["\']?(G-[A-Z0-9]{8,12})["\']?', re.I),
+         'api_keys', 'google_analytics_id'),
+        ('GTM ID',            re.compile(r'["\']?(GTM-[A-Z0-9]{4,10})["\']?', re.I),
+         'api_keys', 'gtm_id'),
+        ('Facebook Pixel',    re.compile(r'["\']?(?:fb[-_]?)?pixel[-_]?id["\']\s*[=:]\s*["\']?(\d{10,20})["\']?', re.I),
+         'api_keys', 'facebook_pixel_id'),
+        # ── Error tracking ───────────────────────────────────────────────
+        ('Sentry DSN',        re.compile(r'["\']?(https://[a-f0-9]{32}@(?:o\d+\.)?ingest\.sentry\.io/\d+)["\']?', re.I),
+         'api_keys', 'sentry_dsn'),
+        ('Sentry DSN (us)',   re.compile(r'["\']?(https://[a-f0-9]{32}@(?:sentry\.io|us\.sentry\.io)/\d+)["\']?', re.I),
+         'api_keys', 'sentry_dsn'),
+        # ── Realtime / messaging ─────────────────────────────────────────
+        ('Pusher app key',    re.compile(r'["\']?(?:pusher[-_]?)?app[-_]?key["\']\s*[=:]\s*["\']([A-Za-z0-9]{10,30})["\']', re.I),
+         'api_keys', 'pusher_app_key'),
+        ('Pusher cluster',    re.compile(r'["\']?(?:pusher[-_]?)?cluster["\']\s*[=:]\s*["\']([a-z0-9\-]{2,10})["\']', re.I),
+         'config_objects', 'pusher_cluster'),
+        ('Intercom app_id',   re.compile(r'["\']?(?:intercom[-_]?)?app[-_]?id["\']\s*[=:]\s*["\']([a-z0-9]{6,16})["\']', re.I),
+         'merchant_ids', 'intercom_app_id'),
+        ('Algolia appId',     re.compile(r'["\']?(?:algolia[-_]?)?app(?:lication)?[-_]?id["\']\s*[=:]\s*["\']([A-Z0-9]{10})["\']', re.I),
+         'merchant_ids', 'algolia_app_id'),
+        ('Algolia searchKey', re.compile(r'["\']?(?:search|public)[-_]?(?:api[-_]?)?key["\']\s*[=:]\s*["\']([a-f0-9]{32})["\']', re.I),
+         'api_keys', 'algolia_search_key'),
+        # ── Config / env / build ─────────────────────────────────────────
+        ('API base URL',      re.compile(r'["\']?(?:API|api)[-_]?(?:BASE|BASE_URL|URL|ENDPOINT|ROOT)["\']\s*[=:]\s*["\']?(https?://[^\s"\'<>]{8,100})["\']?', re.I),
+         'env_vars', 'api_base_url'),
+        ('App version',       re.compile(r'["\']?(?:APP_VERSION|appVersion|BUILD_VERSION|version)["\']\s*[=:]\s*["\']([0-9a-zA-Z._\-]{3,30})["\']', re.I),
+         'env_vars', 'app_version'),
+        ('Build ID',          re.compile(r'["\']?(?:BUILD_ID|buildId|COMMIT_HASH|GIT_SHA)["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{6,64})["\']', re.I),
+         'env_vars', 'build_id'),
+        ('CDN URL',           re.compile(r'["\']?(?:CDN_URL|STATIC_URL|ASSETS_URL|staticUrl)["\']\s*[=:]\s*["\']?(https?://[^\s"\'<>]{8,100})["\']?', re.I),
+         'env_vars', 'cdn_url'),
+        ('Env mode',          re.compile(r'["\']?(?:NODE_ENV|APP_ENV|ENVIRONMENT)["\']\s*[=:]\s*["\']([a-z]{3,15})["\']', re.I),
+         'env_vars', 'environment'),
+        # ── window.* config object assignments ───────────────────────────
+        ('window.__CONFIG__', re.compile(r'window\.__CONFIG__\s*=\s*(\{[^;]{0,2000})', re.S),
+         'config_objects', 'window.__CONFIG__'),
+        ('window.appConfig',  re.compile(r'window\.(?:appConfig|APP_CONFIG|siteConfig|pageConfig)\s*=\s*(\{[^;]{0,2000})', re.S),
+         'config_objects', 'window.appConfig'),
+        ('window.ENV',        re.compile(r'window\.(?:ENV|_env_|__env__)\s*=\s*(\{[^;]{0,1000})', re.S),
+         'config_objects', 'window.ENV'),
+        ('window.Shopify',    re.compile(r'window\.Shopify\s*=\s*(?:window\.Shopify\s*\|\|\s*)?\{([^;]{0,500})', re.S),
+         'config_objects', 'window.Shopify'),
+        ('globalThis config', re.compile(r'globalThis\.(?:config|CONFIG|appConfig)\s*=\s*(\{[^;]{0,1000})', re.S),
+         'config_objects', 'globalThis.config'),
+    ]
+
+    # ── 1. Regex scan over combined HTML+JS ───────────────────────────────
+    for label, pat, bucket, category in _PATTERNS:
+        try:
+            for m in pat.finditer(combined):
+                val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                if val:
+                    _add(bucket, label, val, category, 'html+js_scan')
+        except Exception:
+            pass
+
+    # ── 2. Inline <script> tags — individual scan for precision ───────────
+    try:
+        from bs4 import BeautifulSoup as _BS
+        _soup = _BS(html, 'html.parser')
+        for _i, _tag in enumerate(_soup.find_all('script', src=False)):
+            _body = _tag.string or ''
+            if not _body or not isinstance(_body, str):
+                continue
+            _src_label = f'<script>[{_i}]'
+            for label, pat, bucket, category in _PATTERNS:
+                try:
+                    for m in pat.finditer(_body):
+                        val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                        if val:
+                            _add(bucket, label, val, category, _src_label)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # ── 3. __NEXT_DATA__ / __NUXT__ / __remixContext blob extraction ───────
+    _STATE_PATS = [
+        re.compile(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.+?)</script>', re.S | re.I),
+        re.compile(r'window\.__NUXT__\s*=\s*(\{.+?\});?\s*</script>', re.S),
+        re.compile(r'window\.__remixContext\s*=\s*(\{.+?\});?\s*</script>', re.S),
+        re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});?\s*</script>', re.S),
+        re.compile(r'window\.__APP_STATE__\s*=\s*(\{.+?\});?\s*</script>', re.S),
+        re.compile(r'window\.__PRELOADED_STATE__\s*=\s*(\{.+?\});?\s*</script>', re.S),
+    ]
+    _CONFIG_KEYS = {
+        'stripePublishableKey', 'stripe_pk', 'stripePk', 'publicKey',
+        'paypalClientId', 'googleMapsKey', 'sentryDsn', 'segmentKey',
+        'intercomAppId', 'pusherKey', 'firebaseApiKey', 'apiBaseUrl',
+        'apiUrl', 'baseUrl', 'cdnUrl', 'appVersion', 'buildId', 'env',
+    }
+    for _sp in _STATE_PATS:
+        try:
+            _m = _sp.search(html)
+            if not _m:
+                continue
+            _blob = _m.group(1)[:8000]
+            _label = _sp.pattern[:30] + '…'
+            # Try JSON parse for structured extraction
+            try:
+                import json as _json
+                _j = _json.loads(_blob)
+                def _walk(obj, depth=0):
+                    if depth > 5 or not isinstance(obj, dict):
+                        return
+                    for k, v in obj.items():
+                        if k in _CONFIG_KEYS and isinstance(v, str) and len(v) > 4:
+                            _add('config_objects', k, v, 'state_blob_key', _label)
+                        elif isinstance(v, dict):
+                            _walk(v, depth+1)
+                _walk(_j)
+            except Exception:
+                pass
+            # Regex scan on raw blob
+            for label, pat, bucket, category in _PATTERNS:
+                try:
+                    for m in pat.finditer(_blob):
+                        val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                        if val:
+                            _add(bucket, label, val, category, f'state_blob:{_label[:20]}')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ── 4. data-* HTML attributes with config values ──────────────────────
+    try:
+        _DATA_ATTR_PAT = re.compile(
+            r'data-(?:key|api[-_]?key|config|merchant[-_]?id|client[-_]?id|'
+            r'site[-_]?key|pub(?:lishable)?[-_]?key|app[-_]?id|token|'
+            r'publishable[-_]?key)\s*=\s*["\']([A-Za-z0-9+/=_.\-]{8,200})["\']',
+            re.I,
+        )
+        for m in _DATA_ATTR_PAT.finditer(html):
+            attr_name = re.search(r'data-([\w\-]+)', m.group(0), re.I)
+            k = attr_name.group(1) if attr_name else 'data-attr'
+            _add('data_attrs', k, m.group(1), 'html_data_attr', '<html data-*>')
+    except Exception:
+        pass
+
+    # ── 5. window.* global key scan (broad) ──────────────────────────────
+    _WIN_BROAD = re.compile(
+        r'window\.((?:__)?[A-Z_][A-Z0-9_]{2,40}(?:__)?)\s*=\s*["\']([A-Za-z0-9+/=_.\-]{6,200})["\']',
+        re.I,
+    )
+    _WIN_SKIP = {
+        'onload','onunload','onerror','location','document','navigator',
+        'history','screen','sessionStorage','localStorage','performance',
+    }
+    for m in _WIN_BROAD.finditer(combined):
+        k, v = m.group(1), m.group(2)
+        if k in _WIN_SKIP or len(k) < 3:
+            continue
+        if out['raw_window'].get(k):
+            continue
+        out['raw_window'][k] = v[:200]
+
+    # ── Trim raw_window to 30 entries ─────────────────────────────────────
+    out['raw_window'] = dict(list(out['raw_window'].items())[:30])
+
+    return out
+
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     import traceback as _tb_mod
@@ -35646,6 +35899,11 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                    (static_html or "") + (js_html or ""),
                                    base_url,
                                ),
+        'client_config':       _extract_client_config(
+                                   (static_html or "") + (js_html or ""),
+                                   _combined_text or '',
+                                   url,
+                               ),
         'window_config':     _window_config,
         'state_session':     _state_session,
         'event_flow':        _event_flow,
@@ -36188,6 +36446,152 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 jlines.append(f'  "source": "{raw_code(_sk_src[:80])}",')
             jlines.append("}")
             lines.append("```json\n" + "\n".join(jlines) + "\n```")
+
+    # ── GATEWAY CREDENTIALS ───────────────────────────────────
+    # Consolidated view: all payment gateway public keys/site keys
+    # found across token_sources, window_config, live_findings, authnet_keys
+    _gw_creds: list[dict] = []
+
+    _gw_cred_seen: set = set()
+
+    def _gw_cred_add(gateway, key_type, value, source, tokenization_url=''):
+        _sig = (gateway.lower(), key_type.lower(), (value or '')[:40])
+        if _sig in _gw_cred_seen:
+            return
+        _gw_cred_seen.add(_sig)
+        _gw_creds.append({
+            'gateway':          gateway,
+            'key_type':         key_type,
+            'value':            value or '',
+            'source':           source,
+            'tokenization_url': tokenization_url,
+        })
+
+    # Source 1: window_config payment keys
+    _wc = data.get('window_config') or {}
+    for _pk in (_wc.get('summary', {}).get('payment_keys') or []):
+        _v   = _pk.get('value', '') if isinstance(_pk, dict) else str(_pk)
+        _src = _pk.get('source', 'window/script') if isinstance(_pk, dict) else 'window/script'
+        if re.match(r'pk_(live|test)_', _v):
+            _env = 'LIVE 🔴' if 'pk_live_' in _v else 'TEST 🟡'
+            _gw_cred_add('Stripe', f'Publishable Key ({_env})', _v,
+                         _src, 'https://api.stripe.com/v1/payment_methods')
+        elif re.match(r'(rzp_live_|rzp_test_)', _v):
+            _gw_cred_add('Razorpay', 'Key ID', _v, _src,
+                         'https://api.razorpay.com/v1/orders')
+        elif len(_v) > 20:
+            _gw_cred_add('Unknown', 'Payment Key', _v, _src)
+
+    # Source 2: token_sources — scan value_preview for known key patterns
+    for _ts in (data.get('token_sources') or []):
+        _v = (_ts.get('value_preview') or '').strip()
+        if re.match(r'pk_(live|test)_', _v):
+            _env = 'LIVE 🔴' if 'pk_live_' in _v else 'TEST 🟡'
+            _gw_cred_add('Stripe', f'Publishable Key ({_env})', _v,
+                         _ts.get('source_type', 'token_source'),
+                         'https://api.stripe.com/v1/payment_methods')
+        elif re.match(r'(rzp_live_|rzp_test_)', _v):
+            _gw_cred_add('Razorpay', 'Key ID', _v,
+                         _ts.get('source_type', 'token_source'))
+
+    # Source 3: resolved_tokens — scan values
+    for _rname, _rt in (data.get('resolved_tokens') or {}).items():
+        _v = (_rt.get('value') or '').strip()
+        if re.match(r'pk_(live|test)_', _v):
+            _env = 'LIVE 🔴' if 'pk_live_' in _v else 'TEST 🟡'
+            _gw_cred_add('Stripe', f'Publishable Key ({_env})', _v,
+                         f'resolved:{_rname}',
+                         'https://api.stripe.com/v1/payment_methods')
+
+    # Source 4: live_findings
+    for _lf in (data.get('live_findings') or []):
+        _lv  = (_lf.get('value') or _lf.get('value_preview') or '').strip()
+        _ltp = _lf.get('type', '')
+        if 'Stripe' in _ltp and re.match(r'pk_(live|test)_', _lv):
+            _env = 'LIVE 🔴' if 'pk_live_' in _lv else 'TEST 🟡'
+            _gw_cred_add('Stripe', f'Publishable Key ({_env})', _lv,
+                         'live_intercept',
+                         'https://api.stripe.com/v1/payment_methods')
+        elif 'Braintree' in _ltp and _lv:
+            _gw_cred_add('Braintree', 'Client Token', _lv,
+                         'live_intercept',
+                         'https://payments.braintree-api.com/graphql')
+        elif 'Authorize' in _ltp and _lv:
+            _gw_cred_add('Authorize.Net', 'Public Client Key', _lv,
+                         'live_intercept',
+                         'https://js.authorize.net/v1/request')
+
+    # Source 5: Authorize.Net (already parsed above)
+    if _an_keys and isinstance(_an_keys, tuple):
+        _an_l, _an_c = _an_keys
+        if _an_c:
+            _an_tok_url = (
+                'https://jstest.authorize.net/v1/request'
+                if _an_l and ('test' in _an_l.lower() or len(_an_l) < 8)
+                else 'https://js.authorize.net/v1/request'
+            )
+            _gw_cred_add('Authorize.Net', 'Public Client Key', _an_c,
+                         'html/js scan', _an_tok_url)
+        if _an_l:
+            _gw_cred_add('Authorize.Net', 'API Login ID', _an_l,
+                         'html/js scan')
+
+    # Source 6: CardPointe — scan JS/HTML for site key pattern
+    _cp_key_m = None
+    _combined_cp = (data.get('window_config') or {})
+    _cp_raw = ''
+    for _frm in (data.get('forms') or []):
+        for _fld in (_frm.get('fields') or []):
+            _fn = (_fld.get('name') or '').lower()
+            _fv = _fld.get('value') or ''
+            if 'site' in _fn and 'key' in _fn and _fv and len(_fv) > 6:
+                _cp_raw = _fv
+                break
+    if not _cp_raw:
+        for _ts in (data.get('token_sources') or []):
+            _n = (_ts.get('name') or '').lower()
+            if 'site' in _n and 'key' in _n:
+                _cp_raw = _ts.get('value_preview', '')
+                break
+    if _cp_raw:
+        _gw_cred_add('CardPointe', 'Site Key', _cp_raw,
+                     'html/form scan',
+                     'https://boltgw.cardconnect.com/v3/iframe')
+
+    if _gw_creds:
+        lines.append(_sec(
+            f"Gateway Credentials  ·  {len(_gw_creds)} key(s) found", "🗝️"
+        ))
+        _GW_ICONS = {
+            'Stripe':        '💳',
+            'Braintree':     '🌿',
+            'Authorize.Net': '🏦',
+            'CardPointe':    '🔷',
+            'Razorpay':      '🇮🇳',
+            'PayPal':        '🅿️',
+            'Unknown':       '🔑',
+        }
+        for _cred in _gw_creds:
+            _ic  = _GW_ICONS.get(_cred['gateway'], '🔑')
+            _val = _cred['value']
+            # Truncate long keys safely
+            _val_display = (
+                _val[:32] + f'… _({len(_val)} chars)_'
+                if len(_val) > 32 else _val
+            )
+            lines.append(
+                f"  {_ic} *{escape_md(_cred['gateway'])}*  "
+                f"`{escape_md(_cred['key_type'])}`"
+            )
+            if _val_display:
+                lines.append(f"    `{raw_code(_val_display, 55)}`")
+            if _cred.get('tokenization_url'):
+                lines.append(
+                    f"    🌐 `{raw_code(_cred['tokenization_url'], 55)}`"
+                )
+            lines.append(
+                f"    📍 _{escape_md(_cred['source'][:50])}_"
+            )
 
     # ── LIVE INTERCEPT FINDINGS ───────────────────────────────
     live_findings = data.get('live_findings', [])
@@ -36735,6 +37139,51 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             lines.append("```\n" + "\n".join(
                 f"{k}: {v}" for k, v in hdr_tokens.items()
             ) + "\n```")
+
+    # ── CLIENT-SIDE CONFIG ────────────────────────────────────────────────
+    _cc = data.get('client_config') or {}
+    _cc_api     = _cc.get('api_keys', [])
+    _cc_merch   = _cc.get('merchant_ids', [])
+    _cc_conf    = _cc.get('config_objects', [])
+    _cc_env     = _cc.get('env_vars', [])
+    _cc_data    = _cc.get('data_attrs', [])
+    _cc_win     = _cc.get('raw_window', {})
+    _cc_total   = len(_cc_api) + len(_cc_merch) + len(_cc_conf) + len(_cc_env) + len(_cc_data)
+
+    if _cc_total > 0 or _cc_win:
+        lines.append(_sec(f"Client-Side Config  ·  {_cc_total} vars found", "🔭"))
+
+        _CC_GROUPS = [
+            ("🔑", "API Keys",       _cc_api),
+            ("🏷️", "Merchant IDs",   _cc_merch),
+            ("⚙️", "Config Objects", _cc_conf),
+            ("📦", "Env / Build",    _cc_env),
+            ("🏷️", "data-* attrs",   _cc_data),
+        ]
+        for _gi, _gl, _glist in _CC_GROUPS:
+            if not _glist:
+                continue
+            lines.append(f"\n{SEP_MINOR}")
+            lines.append(f"{_gi} *{_gl}*  `({len(_glist)})`")
+            for _e in _glist[:8]:
+                _val = _e.get('value', '')
+                _preview = _val[:48] + ('…' if len(_val) > 48 else '')
+                _cat = _e.get('category', '')
+                _cat_tag = f"  _({escape_md(_cat)})_" if _cat else ''
+                lines.append(
+                    f"  `{raw_code(_e.get('key',''), 28)}`"
+                    f"  `{raw_code(_preview)}`{_cat_tag}"
+                )
+            if len(_glist) > 8:
+                lines.append(f"  _\\+{len(_glist)-8} more_")
+
+        if _cc_win:
+            lines.append(f"\n{SEP_MINOR}")
+            lines.append(f"🌐 *window\\.*globals*  `({len(_cc_win)})`")
+            for _k, _v in list(_cc_win.items())[:6]:
+                lines.append(f"  `{raw_code(_k, 28)}`  `{raw_code(str(_v)[:60])}`")
+            if len(_cc_win) > 6:
+                lines.append(f"  _\\+{len(_cc_win)-6} more_")
 
     # ── CLIENT STORAGE ────────────────────────────────────────
     cs   = data.get('client_storage', {})
@@ -39616,7 +40065,89 @@ def _build_python_script(data: dict) -> str:
     sc.append('import re')
     sc.append('from urllib.parse import unquote, urlparse')
     sc.append('import time')
+    sc.append('import logging')
+    sc.append('import os')
+    sc.append('from datetime import datetime')
     sc.append('')
+
+    # ── Logging setup block ────────────────────────────────────────────────
+    import textwrap as _tw_log
+    _LOG_SETUP_SRC = _tw_log.dedent(f'''
+        # ── Logging Setup ───────────────────────────────────────────────────
+        _LOG_DIR  = os.path.dirname(os.path.abspath(__file__))
+        _LOG_FILE = os.path.join(_LOG_DIR, "payload_{domain}_{now_str.replace(' ','_').replace(':','-')}.log")
+
+        _fmt = logging.Formatter(
+            fmt     = "%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt = "%Y-%m-%d %H:%M:%S",
+        )
+
+        _fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+        _fh.setLevel(logging.DEBUG)
+        _fh.setFormatter(_fmt)
+
+        _ch = logging.StreamHandler()
+        _ch.setLevel(logging.INFO)
+        _ch.setFormatter(_fmt)
+
+        log = logging.getLogger("payload")
+        log.setLevel(logging.DEBUG)
+        log.addHandler(_fh)
+        log.addHandler(_ch)
+
+        log.info("=" * 60)
+        log.info(f"Payload script started")
+        log.info(f"Target  : {url}")
+        log.info(f"Gateway : {gw_name or 'Unknown'}")
+        log.info(f"Log file: {{_LOG_FILE}}")
+        log.info("=" * 60)
+
+
+        def _log_request(method: str, url: str, **kwargs) -> requests.Response:
+            """Wrapper — logs every request + response with timing."""
+            _t0 = time.perf_counter()
+            log.debug(f">> {{method}} {{url}}")
+            if kwargs.get("data"):
+                _body_keys = list(kwargs["data"].keys())
+                log.debug(f"   Body fields: {{_body_keys}}")
+            if kwargs.get("json"):
+                log.debug(f"   JSON keys  : {{list(kwargs['json'].keys())}}")
+            try:
+                resp = requests.request(method, url, **kwargs)
+                _elapsed = time.perf_counter() - _t0
+                log.info(
+                    f"<< {{method}} {{url[:70]}} → {{resp.status_code}} "
+                    f"({{len(resp.content)}}B, {{_elapsed:.2f}}s)"
+                )
+                if resp.status_code >= 400:
+                    log.warning(f"   HTTP {{resp.status_code}} — snippet: {{resp.text[:120]!r}}")
+                return resp
+            except requests.exceptions.Timeout:
+                log.error(f"   TIMEOUT after {{kwargs.get('timeout','?')}}s — {{url[:70]}}")
+                raise
+            except requests.exceptions.ConnectionError as _ce:
+                log.error(f"   CONNECTION ERROR — {{str(_ce)[:100]}}")
+                raise
+            except Exception as _ex:
+                log.error(f"   REQUEST FAILED — {{type(_ex).__name__}}: {{str(_ex)[:100]}}")
+                raise
+
+
+        def _log_csrf(name: str, value: str, method: str = "html_parse"):
+            if value:
+                log.info(f"CSRF token  : {{name}} = {{value[:30]}}{'…' if len(value) > 30 else ''}")
+                log.debug(f"CSRF method : {{method}}")
+            else:
+                log.warning(f"CSRF token  : NOT FOUND (field: {{name or 'unknown'}})")
+
+
+        def _log_verdict(verdict: str, http_status: int, signals: list):
+            _icon = {{"SUCCESS": "✅", "FAILED": "🔴", "RE_VERIFICATION_REQUIRED": "🔐"}}.get(verdict, "❓")
+            log.info(f"Verdict     : {{_icon}} {{verdict}}  (HTTP {{http_status}})")
+            for sig in signals[:5]:
+                log.debug(f"  signal: {{sig}}")
+    ''').lstrip('\n')
+    sc.extend(_LOG_SETUP_SRC.splitlines())
 
     # ── Window Config block: extracted public keys / merchant IDs ─────────
     if _wc_keys:
@@ -39782,497 +40313,8 @@ def _build_python_script(data: dict) -> str:
     ''').lstrip('\n')
 
     # ── PayloadSession class ───────────────────────────────────────────────
-    sc.extend(_SESSION_SRC.splitlines())
 
-    sc.append('# ── Test credentials (replace before use) ────────────────────────')
-    sc.append('CARD_NUMBER    = "4242424242424242"  # Stripe test Visa')
-    sc.append('CARD_EXP_MONTH = "12"')
-    sc.append('CARD_EXP_YEAR  = "2029"')
-    sc.append('CARD_CVC       = "123"')
-    sc.append('CARD_NAME      = "John Doe"')
-    sc.append('AMOUNT         = "10.00"')
-    sc.append('CURRENCY       = "USD"')
-    sc.append('EMAIL          = "test@test.com"')
-    sc.append('FIRST_NAME     = "John"')
-    sc.append('LAST_NAME      = "Doe"')
-    sc.append('')
-
-    # ── Token extractor utility ────────────────────────────────────────────
-    # Use textwrap.dedent + triple-quote to avoid ALL quote-escaping issues
-    import textwrap as _tw
-    _EXTRACT_TOKENS_SRC = _tw.dedent(r'''
-        # ── Token Extractor ─────────────────────────────────────────────────
-        def extract_tokens(html: str, extra_names: list[str] | None = None) -> dict:
-            """
-            Extract hidden tokens (CSRF, nonce, session, honeypot) from HTML.
-            Returns dict of {field_name: value}.
-
-            Patterns covered:
-              • <input type="hidden" name="..." value="...">
-              • <meta name="csrf-token" content="...">
-              • JS variable:  window.csrfToken = "..."
-              • JS inline:    _token: "..." / nonce: "..."
-              • Next.js:      __NEXT_DATA__ csrfToken
-            """
-            found: dict[str, str] = {}
-
-            # ── Pattern 1: <input type="hidden"> ─────────────────────────
-            _HIDDEN_PAT = re.compile(
-                r'<input[^>]+type=[\x22\x27]hidden[\x22\x27][^>]*>',
-                re.I | re.S,
-            )
-            _NAME_PAT = re.compile(r'name=[\x22\x27]([^\x22\x27]+)[\x22\x27]',  re.I)
-            _VAL_PAT  = re.compile(r'value=[\x22\x27]([^\x22\x27]*)[\x22\x27]', re.I)
-            for tag in _HIDDEN_PAT.findall(html):
-                nm = _NAME_PAT.search(tag)
-                vl = _VAL_PAT.search(tag)
-                if nm and vl:
-                    found[nm.group(1)] = vl.group(1)
-
-            # ── Pattern 2: <meta name="csrf-token" content="..."> ────────
-            _META_PAT = re.compile(
-                r'<meta[^>]+name=[\x22\x27](?:csrf[-_]?token|_token|nonce|authenticity[-_]token)[\x22\x27]'
-                r'[^>]+content=[\x22\x27]([^\x22\x27]+)[\x22\x27]',
-                re.I,
-            )
-            for m in _META_PAT.finditer(html):
-                found["_meta_csrf"] = m.group(1)
-
-            # ── Pattern 3: JS window.X = "value" ─────────────────────────
-            _JS_WIN_PAT = re.compile(
-                r'window\.(\w+)\s*=\s*[\x22\x27]([A-Za-z0-9+/=_\-]{16,})[\x22\x27]',
-                re.I,
-            )
-            for m in _JS_WIN_PAT.finditer(html):
-                k = m.group(1)
-                if re.search(r'csrf|token|nonce|session|auth', k, re.I):
-                    found[k] = m.group(2)
-
-            # ── Pattern 4: JS object literal key: "value" ────────────────
-            _JS_OBJ_PAT = re.compile(
-                r'[\x22\x27]?(\w*(?:csrf|token|nonce|_token|authenticity)\w*)[\x22\x27]?'
-                r'\s*:\s*[\x22\x27]([A-Za-z0-9+/=_\-]{16,})[\x22\x27]',
-                re.I,
-            )
-            for m in _JS_OBJ_PAT.finditer(html):
-                found[m.group(1)] = m.group(2)
-
-            # ── Pattern 5: Next.js __NEXT_DATA__ ─────────────────────────
-            _NEXT_PAT = re.compile(
-                r'<script[^>]+id=[\x22\x27]__NEXT_DATA__[\x22\x27][^>]*>(.+?)</script>',
-                re.S | re.I,
-            )
-            _nm = _NEXT_PAT.search(html)
-            if _nm:
-                try:
-                    import json as _json
-                    _nd = _json.loads(_nm.group(1))
-                    for _key in ("csrfToken", "csrf_token", "_token", "nonce", "authenticity_token"):
-                        _v = (_nd.get("props", {}).get("pageProps", {}) or {}).get(_key)
-                        if not _v:
-                            _v = _nd.get(_key)
-                        if _v and isinstance(_v, str):
-                            found[_key] = _v
-                except Exception:
-                    pass
-
-            # ── Pattern 6: custom field names passed by caller ────────────
-            if extra_names:
-                for _en in extra_names:
-                    if _en not in found:
-                        _pat = re.compile(
-                            r'(?:name|id)=[\x22\x27]' + re.escape(_en) +
-                            r'[\x22\x27][^>]*value=[\x22\x27]([^\x22\x27]+)[\x22\x27]',
-                            re.I,
-                        )
-                        _ep = _pat.search(html)
-                        if _ep:
-                            found[_en] = _ep.group(1)
-
-            return found
-
-    ''').lstrip('\n')
-    sc.extend(_EXTRACT_TOKENS_SRC.splitlines())
-
-
-    # Step 1
-    sc.append('')
-    sc.append('# ── Step 1: Prime session + get CSRF token ──────────────────────')
-    sc.append(f'session = PayloadSession("{url}")')
-    sc.append(f'r = session.get("{url}", timeout=15)')
-    sc.append('')
-    sc.append('# extract_tokens() scans ALL hidden fields + meta + JS vars at once')
-    sc.append('tokens = extract_tokens(r.text)')
-    sc.append('print(f"Extracted tokens: {list(tokens.keys())}")')
-
-    if csrf_method == 'cookie':
-        sc.append('# CSRF from cookie (Laravel Sanctum / cookie-to-header)')
-        sc.append(f'csrf = unquote(session.cookies().get("{csrf_name}", ""))')
-        sc.append(f'csrf = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
-    elif csrf_method == 'api_endpoint':
-        sc.append('# CSRF from SPA endpoint')
-        sc.append(f'csrf_r = session.get("{_base_origin}{csrf_endpoint}", timeout=10)')
-        sc.append(f'csrf   = csrf_r.json().get("{csrf_name}", "")')
-        sc.append(f'csrf   = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
-    else:
-        sc.append('# CSRF from extracted tokens (hidden field / meta / JS)')
-        if csrf_name:
-            sc.append(f'csrf = tokens.get("{csrf_name}", "")')
-            sc.append('if not csrf:')
-            sc.append(f'    _m = re.search(r\'name="{csrf_name}"[^>]*value="([^"]+)"\', r.text)')
-            sc.append('    csrf = _m.group(1) if _m else ""')
-        else:
-            sc.append('csrf = next((tokens[k] for k in')
-            sc.append('    ("_token","csrf_token","csrfToken","authenticity_token","nonce","_meta_csrf")')
-            sc.append('    if k in tokens), "")')
-
-    sc.append(f'session.set_csrf("{csrf_name or "_token"}", csrf)  # auto-injected from here on')
-    sc.append('print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
-    sc.append('session.dump_state()')
-
-    # ── Feature 4: State & Session — inject essential cookies / storage ───
-    # ── Feature 4: State & Session Analysis — full executable block ─────
-    _ss_data        = data.get('state_session') or {}
-    _ess_cookies    = _ss_data.get('essential_cookies') or []
-    _ess_storage    = _ss_data.get('essential_storage') or []
-    _all_cookies_f4 = _ss_data.get('cookies') or []
-    _all_storage_f4 = _ss_data.get('storage') or []
-    sc.append('')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('# 🍪 Feature 4 — State & Session Analysis')
-    sc.append('# Extracted from scan: active cookies + localStorage/sessionStorage')
-    sc.append('# identifies which items are essential to maintain the session state.')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('')
-    # ── 4a: All cookies table (runnable dict) ──────────────────────────────
-    sc.append('# ── 4a. All Active Cookies ─────────────────────────────────────────')
-    sc.append('# Keys: name | value (at scan time) | essential | reason')
-    sc.append('ALL_COOKIES = [')
-    for _ck in _all_cookies_f4[:20]:
-        _ck_n   = _ck.get('name', '').replace('"', '\\"')
-        _ck_v   = str(_ck.get('value', '<server-set>')).replace('"', '\\"')[:60]
-        _ck_ess = _ck.get('essential', False)
-        _ck_rsn = _ck.get('reason', '').replace('"', '\\"')[:80]
-        _ck_src = _ck.get('source', '')
-        sc.append(f'    {{"name": "{_ck_n}", "value": "{_ck_v}", '
-                  f'"essential": {_ck_ess}, "reason": "{_ck_rsn}", "source": "{_ck_src}"}},')
-    sc.append(']')
-    sc.append('')
-    # ── 4b: Essential cookies — pre-seed block ─────────────────────────────
-    if _ess_cookies:
-        sc.append('# ── 4b. Essential Session Cookies ──────────────────────────────────')
-        sc.append('# These cookies maintain the authenticated session.')
-        sc.append('# PayloadSession carries them automatically after the first GET.')
-        sc.append('# Pre-seed below ONLY when replaying a known session (e.g. from DevTools).')
-        sc.append('ESSENTIAL_COOKIES = {')
-        for _ck in _ess_cookies[:10]:
-            _ck_n   = _ck.get('name', '').replace('"', '\\"')
-            _ck_v   = str(_ck.get('value', '<set-by-server>')).replace('"', '\\"')[:60]
-            _ck_rsn = _ck.get('reason', '').replace('"', '\\"')[:80]
-            sc.append(f'    # {_ck_rsn}')
-            sc.append(f'    "{_ck_n}": "{_ck_v}",')
-        sc.append('}')
-        sc.append('')
-        sc.append('def seed_essential_cookies(sess, cookie_dict: dict) -> None:')
-        sc.append('    """Pre-load known session cookies into a PayloadSession."""')
-        sc.append('    for name, value in cookie_dict.items():')
-        sc.append('        sess._s.cookies.set(name, value)')
-        sc.append('        print(f"  🍪 Seeded cookie: {name}={value[:20]}…")')
-        sc.append('')
-        sc.append('# Uncomment to replay a known session:')
-        sc.append('# seed_essential_cookies(session, ESSENTIAL_COOKIES)')
-    else:
-        sc.append('# ── 4b. Essential Session Cookies: none detected at scan time.')
-        sc.append('# Session is likely established automatically via the initial GET.')
-        sc.append('ESSENTIAL_COOKIES = {}')
-    sc.append('')
-    # ── 4c: localStorage / sessionStorage dump ─────────────────────────────
-    sc.append('# ── 4c. localStorage / sessionStorage Items ─────────────────────────')
-    sc.append('# Values captured during Playwright scan. Runnable as a static dict.')
-    sc.append('CLIENT_STORAGE = {')
-    if _all_storage_f4:
-        _ls_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'localStorage']
-        _ss_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'sessionStorage']
-        if _ls_items:
-            sc.append('    "localStorage": {')
-            for _k, _s in _ls_items[:15]:
-                _sv  = str(_s.get('value', '')).replace('"', '\\"').replace('\\', '\\\\')[:80]
-                _ess = '  # ★ ESSENTIAL' if _s.get('essential') else ''
-                _rsn = f' — {_s["reason"]}' if _s.get('reason') else ''
-                sc.append(f'        "{_k}": "{_sv}",{_ess}{_rsn}')
-            sc.append('    },')
-        if _ss_items:
-            sc.append('    "sessionStorage": {')
-            for _k, _s in _ss_items[:10]:
-                _sv  = str(_s.get('value', '')).replace('"', '\\"').replace('\\', '\\\\')[:80]
-                _ess = '  # ★ ESSENTIAL' if _s.get('essential') else ''
-                _rsn = f' — {_s["reason"]}' if _s.get('reason') else ''
-                sc.append(f'        "{_k}": "{_sv}",{_ess}{_rsn}')
-            sc.append('    },')
-    else:
-        sc.append('    "localStorage":   {},  # empty at scan time')
-        sc.append('    "sessionStorage": {},')
-    sc.append('}')
-    sc.append('')
-    # ── 4d: JWT / token injection ──────────────────────────────────────────
-    _jwt_items = [s for s in _ess_storage if
-                  str(s.get('value', '')).startswith('eyJ') or
-                  re.search(r'access.?token|refresh.?token|bearer', s.get('key', ''), re.I)]
-    sc.append('# ── 4d. Token Injection from Storage ───────────────────────────────')
-    sc.append('# Reads access/refresh tokens from CLIENT_STORAGE and injects them')
-    sc.append('# into the session Authorization header automatically.')
-    sc.append('def inject_storage_tokens(sess, storage: dict) -> dict:')
-    sc.append('    """')
-    sc.append('    Scan localStorage and sessionStorage for JWT / access tokens.')
-    sc.append('    Injects the first found token as Authorization: Bearer <token>.')
-    sc.append('    Returns dict of all injected {header: value} pairs.')
-    sc.append('    """')
-    sc.append('    import re as _re')
-    sc.append('    _TOKEN_PAT = _re.compile(')
-    sc.append('        r"access.?token|refresh.?token|bearer|jwt|auth.?token|id.?token", _re.I)')
-    sc.append('    injected = {}')
-    sc.append('    for store_name, store_dict in storage.items():')
-    sc.append('        if not isinstance(store_dict, dict):')
-    sc.append('            continue')
-    sc.append('        for k, v in store_dict.items():')
-    sc.append('            if not isinstance(v, str) or not v:')
-    sc.append('                continue')
-    sc.append('            is_jwt   = v.startswith("eyJ") and v.count(".") >= 2')
-    sc.append('            is_token = bool(_TOKEN_PAT.search(k))')
-    sc.append('            if is_jwt or is_token:')
-    sc.append('                header = "Authorization"')
-    sc.append('                value  = f"Bearer {v}" if not v.lower().startswith("bearer") else v')
-    sc.append('                sess._s.headers[header] = value')
-    sc.append('                injected[header] = value[:40] + "…"')
-    sc.append('                print(f"  💉 Injected [{store_name}][{k}] → {header}: {value[:30]}…")')
-    sc.append('                break  # first valid token wins')
-    sc.append('        if injected:')
-    sc.append('            break')
-    sc.append('    if not injected:')
-    sc.append('        print("  ℹ️  No JWT/access token found in CLIENT_STORAGE")')
-    sc.append('    return injected')
-    sc.append('')
-    if _jwt_items:
-        _jk = _jwt_items[0].get('key', '')
-        sc.append(f'# ★ Token detected at scan time: [{_jwt_items[0].get("store","localStorage")}]["{_jk}"]')
-    sc.append('_injected_tokens = inject_storage_tokens(session, CLIENT_STORAGE)')
-
-    # ── Feature 5: Event Flow Tracing — full executable block ─────────────
-    _ef_data     = data.get('event_flow') or {}
-    _cta         = _ef_data.get('primary_cta') or {}
-    _listeners   = _ef_data.get('event_listeners') or []
-    _form_submit = _ef_data.get('form_submission') or []
-    _all_ctas    = _ef_data.get('cta_candidates') or []
-    sc.append('')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('# ⚡ Feature 5 — Event Flow Tracing')
-    sc.append('# Primary CTA button + JS event listeners + form submission attrs.')
-    sc.append('# Simulate the exact click/submit chain the browser fires.')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('')
-    # ── 5a: CTA identity ──────────────────────────────────────────────────
-    sc.append('# ── 5a. Primary CTA Button ─────────────────────────────────────────')
-    if _cta:
-        _cta_txt = (_cta.get('text') or _cta.get('value') or
-                    _cta.get('id') or '(unknown)')[:60].replace('"', '\\"')
-        _cta_id  = (_cta.get('id') or '').replace('"', '\\"')
-        _cta_cls = ' '.join((_cta.get('class') or '').split()[:6]).replace('"', '\\"')
-        _cta_tp  = (_cta.get('type') or 'button')
-        _cta_nm  = (_cta.get('name') or '').replace('"', '\\"')
-        sc.append('CTA_BUTTON = {')
-        sc.append(f'    "label":   "{_cta_txt}",')
-        sc.append(f'    "type":    "{_cta_tp}",')
-        sc.append(f'    "id":      "{_cta_id}",')
-        sc.append(f'    "name":    "{_cta_nm}",')
-        sc.append(f'    "class":   "{_cta_cls}",')
-        sc.append(f'    "score":   {_cta.get("score", 0)},')
-        sc.append('}')
-        if len(_all_ctas) > 1:
-            sc.append(f'# Other CTA candidates ({len(_all_ctas) - 1} more):')
-            for _alt in _all_ctas[1:4]:
-                _alt_lbl = (_alt.get('text') or _alt.get('id') or '')[:40].replace('"', '\\"')
-                sc.append(f'#   score={_alt.get("score",0)}  label="{_alt_lbl}"  '
-                          f'id="{_alt.get("id","")}"')
-    else:
-        sc.append('CTA_BUTTON = {}  # no CTA button detected — form may auto-submit')
-    sc.append('')
-    # ── 5b: Event listener registry ───────────────────────────────────────
-    sc.append('# ── 5b. JavaScript Event Listeners ─────────────────────────────────')
-    sc.append('# Detected listeners attached to the CTA or form submit chain.')
-    sc.append('EVENT_LISTENERS = [')
-    if _listeners:
-        for _lsn in _listeners[:10]:
-            _et   = _lsn.get('type', '').replace('"', '\\"')
-            _src  = _lsn.get('source', '').replace('"', '\\"')
-            _hndl = str(_lsn.get('handler', '')).replace('"', '\\"').replace('\n', ' ')[:120]
-            sc.append(f'    {{')
-            sc.append(f'        "event_type": "{_et}",')
-            sc.append(f'        "source":     "{_src}",')
-            sc.append(f'        "handler":    "{_hndl}",')
-            sc.append(f'    }},')
-    else:
-        sc.append('    # No explicit JS listeners found — form uses native HTML submit')
-    sc.append(']')
-    sc.append('')
-    # ── 5c: Form submission attributes ────────────────────────────────────
-    sc.append('# ── 5c. Form Submission Attributes ─────────────────────────────────')
-    sc.append('FORM_SUBMIT_ATTRS = [')
-    if _form_submit:
-        for _fa in _form_submit[:8]:
-            _fa_act = _fa.get('action', '').replace('"', '\\"')[:120]
-            _fa_mth = (_fa.get('method') or 'POST').upper()
-            _fa_enc = (_fa.get('enctype') or 'application/x-www-form-urlencoded').replace('"', '\\"')
-            _fa_pay = _fa.get('is_payment', False)
-            _fa_src = _fa.get('source', '').replace('"', '\\"')
-            sc.append(f'    {{')
-            sc.append(f'        "action":     "{_fa_act}",')
-            sc.append(f'        "method":     "{_fa_mth}",')
-            sc.append(f'        "enctype":    "{_fa_enc}",')
-            sc.append(f'        "is_payment": {_fa_pay},')
-            sc.append(f'        "source":     "{_fa_src}",')
-            sc.append(f'    }},')
-    else:
-        sc.append('    # No form submission attributes detected')
-    sc.append(']')
-    sc.append('')
-    # ── 5d: simulate_cta_click() helper ───────────────────────────────────
-    sc.append('# ── 5d. CTA Click Simulator ─────────────────────────────────────────')
-    sc.append('# Replicates the browser event flow:')
-    sc.append('#   mousedown → mouseup → click → [validate] → submit → POST')
-    sc.append('def simulate_cta_click(sess, post_body: dict,')
-    sc.append('                       listeners: list = None,')
-    sc.append('                       form_attrs: list = None) -> "requests.Response | None":')
-    sc.append('    """')
-    sc.append('    Simulate the CTA button click and form submission sequence.')
-    sc.append('')
-    sc.append('    Steps:')
-    sc.append('      1. Fire any pre-submit JS listener side-effects (headers / tokens).')
-    sc.append('      2. Determine submit URL and method from form_attrs.')
-    sc.append('      3. Send the POST with the assembled post_body.')
-    sc.append('      4. Return the raw Response for further analysis.')
-    sc.append('    """')
-    sc.append('    listeners  = listeners  or EVENT_LISTENERS')
-    sc.append('    form_attrs = form_attrs or FORM_SUBMIT_ATTRS')
-    sc.append('')
-    sc.append('    # ── Step 5d-1: Pre-submit listener side-effects ──────────────')
-    sc.append('    _click_headers = {}')
-    sc.append('    for _lsn in listeners:')
-    sc.append('        _et = _lsn.get("event_type", "").lower()')
-    sc.append('        _hd = _lsn.get("handler", "").lower()')
-    sc.append('        # If listener sets X-Requested-With / X-AJAX header:')
-    sc.append('        if "xmlhttprequest" in _hd or "ajax" in _hd or "fetch" in _hd:')
-    sc.append('            _click_headers["X-Requested-With"] = "XMLHttpRequest"')
-    sc.append('        # If listener sets custom content-type to JSON:')
-    sc.append('        if "json" in _hd and "application/json" not in str(sess._s.headers):')
-    sc.append('            _click_headers["Content-Type"] = "application/json"')
-    sc.append('    if _click_headers:')
-    sc.append('        print(f"  ⚡ Listener side-effects → headers: {list(_click_headers.keys())}")')
-    sc.append('')
-    sc.append('    # ── Step 5d-2: Resolve submit endpoint ───────────────────────')
-    sc.append('    _pay_forms  = [f for f in form_attrs if f.get("is_payment") and f.get("action")]')
-    sc.append('    _any_forms  = [f for f in form_attrs if f.get("action")]')
-    sc.append('    _best_form  = (_pay_forms or _any_forms or [{}])[0]')
-    sc.append('    _submit_url = _best_form.get("action", "")')
-    sc.append('    _method     = _best_form.get("method", "POST").upper()')
-    sc.append('    _enctype    = _best_form.get("enctype", "application/x-www-form-urlencoded")')
-    sc.append('')
-    sc.append('    if not _submit_url:')
-    sc.append('        print("  ⚠️  No form action found — cannot simulate submit")')
-    sc.append('        return None')
-    sc.append('')
-    sc.append('    print(f"  ⚡ Simulating CTA click → {_method} {_submit_url}")')
-    sc.append('')
-    sc.append('    # ── Step 5d-3: Send the request ──────────────────────────────')
-    sc.append('    _is_json = "json" in _enctype.lower()')
-    sc.append('    _kw = {"json": post_body} if _is_json else {"data": post_body}')
-    sc.append('    try:')
-    sc.append('        if _method == "POST":')
-    sc.append('            resp = sess.post(_submit_url, headers=_click_headers, **_kw, timeout=20,')
-    sc.append('                             allow_redirects=True)')
-    sc.append('        else:')
-    sc.append('            resp = sess.get(_submit_url, headers=_click_headers,')
-    sc.append('                            params=post_body, timeout=20, allow_redirects=True)')
-    sc.append('        print(f"  ✅ Response: HTTP {resp.status_code}  "')
-    sc.append('              f"({len(resp.content)} bytes)")')
-    sc.append('        return resp')
-    sc.append('    except Exception as _e:')
-    sc.append('        print(f"  ❌ Request failed: {_e}")')
-    sc.append('        return None')
-
-    if gw_name in ('Stripe', 'Braintree', 'Adyen') or hosted.get('gateway'):
-        sc.append('')
-        sc.extend(_tokenize_step())
-
-    # Step 3
-    sc.append('')
-    sc.append('# ── Step 3: Build form body + Submit ────────────────────────────────')
-    sc.append('mapper  = DynamicFieldMapper()')
-    # Build overrides from gateway token if available
-    # Check both gw_name and hosted.get('gateway') so hosted-only detections are covered
-    _eff_gw_step3 = gw_name if gw_name in ('Stripe', 'Braintree', 'Adyen') else hosted.get('gateway', '')
-    # Collect actual target field names from hosted extra_fields (required=True entries)
-    _hosted_req_fields = [
-        ef['name'] for ef in (hosted.get('extra_fields') or [])
-        if ef.get('name') and ef.get('required')
-    ]
-    if _eff_gw_step3 == 'Stripe':
-        sc.append('# Override gateway token field automatically (Stripe pm_xxx → all known token fields)')
-        if _hosted_req_fields:
-            # Build overrides dict from actual detected field names + common fallbacks
-            _all_stripe_fields = list(dict.fromkeys(
-                _hosted_req_fields + ['stripeToken', 'payment_method', 'paymentMethodId']
-            ))
-            _ovr_pairs = ', '.join(f'"{n}": stripe_pm' for n in _all_stripe_fields)
-            sc.append(f'_overrides = {{{_ovr_pairs}}}')
-        else:
-            sc.append('_overrides = {"stripeToken": stripe_pm, "payment_method": stripe_pm,')
-            sc.append('              "paymentMethodId": stripe_pm, "payment_method_nonce": stripe_pm}')
-    elif _eff_gw_step3 == 'Braintree':
-        if _hosted_req_fields:
-            _ovr_pairs = ', '.join(f'"{n}": nonce' for n in _hosted_req_fields)
-            sc.append(f'_overrides = {{{_ovr_pairs}}}')
-        else:
-            sc.append('_overrides = {"payment_method_nonce": nonce}')
-    else:
-        sc.append('_overrides = {}')
-    sc.append('')
-    sc.append('# Build the POST body — auto-typed from field name/type/placeholder')
-    sc.append(f'_raw_fields = {repr(fields)}')
-    sc.append('post_body = mapper.build_form(')
-    sc.append('    fields    = _raw_fields,')
-    sc.append('    overrides = _overrides,')
-    sc.append('    token_map = tokens,   # CSRF/nonce injected automatically')
-    sc.append(')')
-    sc.append('mapper.diff_report(_raw_fields, post_body)')
-    sc.append('print(f"POST body ({len(post_body)} fields): {list(post_body.keys())}")')
-    sc.append('')
-    _ct_header = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
-
-    if submit_url:
-        sc.append('# ── Step 3b: Submit via simulate_cta_click (Feature 5) ───────────────')
-        sc.append('# simulate_cta_click fires pre-submit listener side-effects,')
-        sc.append('# resolves the best form action, then sends the POST — matching')
-        sc.append('# the exact browser event flow captured by Event Flow Tracing.')
-        sc.append('resp = simulate_cta_click(session, post_body)')
-        sc.append('')
-        sc.append('# Fallback: direct POST if simulate_cta_click returns None')
-        sc.append('if resp is None:')
-        sc.append(f'    resp = session.{method.lower()}(')
-        sc.append(f'        "{submit_url}",')
-        sc.append(f'        {"json" if is_json_enc else "data"}=post_body,')
-        sc.append('        headers={')
-        sc.append(f'            "Content-Type": "{_ct_header}",')
-        sc.append('            # Referer, Origin, X-CSRF-Token auto-set by PayloadSession')
-        sc.append('        },')
-        sc.append('        timeout=20,')
-        sc.append('        allow_redirects=True,')
-        sc.append('    )')
-    else:
-        sc.append('# ⚠️ Submit endpoint not detected — running simulate_cta_click with empty form_attrs')
-        sc.append('resp = simulate_cta_click(session, post_body)')
-        sc.append('if resp is None:')
-        sc.append('    print("⚠️ No endpoint found — resp is None, check scan results")')
-
+    # ── ResponseAnalysisEngine class (moved before PayloadSession) ─────
     # ── ResponseAnalysisEngine class ──────────────────────────────────────
     sc += [
         '',
@@ -40516,8 +40558,7 @@ def _build_python_script(data: dict) -> str:
         '',
     ]
 
-    # ── DynamicFieldMapper class ──────────────────────────────────────────
-    import textwrap as _tw
+    # ── DynamicFieldMapper class (moved before PayloadSession) ─────────
     _MAPPER_SRC = _tw.dedent(r'''
         # ── Dynamic Field Mapper ────────────────────────────────────────────
         class DynamicFieldMapper:
@@ -40781,13 +40822,678 @@ def _build_python_script(data: dict) -> str:
     ''').lstrip('\n')
     sc.append(_MAPPER_SRC)
 
+    sc.extend(_SESSION_SRC.splitlines())
+
+    sc.append('# ── Test credentials (replace before use) ────────────────────────')
+    sc.append('CARD_NUMBER    = "4242424242424242"  # Stripe test Visa')
+    sc.append('CARD_EXP_MONTH = "12"')
+    sc.append('CARD_EXP_YEAR  = "2029"')
+    sc.append('CARD_CVC       = "123"')
+    sc.append('CARD_NAME      = "John Doe"')
+    sc.append('AMOUNT         = "10.00"')
+    sc.append('CURRENCY       = "USD"')
+    sc.append('EMAIL          = "test@test.com"')
+    sc.append('FIRST_NAME     = "John"')
+    sc.append('LAST_NAME      = "Doe"')
     sc.append('')
+
+    # ── Gateway credentials — inject discovered keys as constants ──────────
+    sc.append('# ── Gateway credentials (auto-detected from scan) ────────────────────')
+    _script_gw_written = False
+
+    # Stripe pk_
+    _stripe_pk_script = ''
+    for _rt in resolved.values():
+        _v = _rt.get('value', '')
+        if _v and re.match(r'pk_(live|test)_', _v):
+            _stripe_pk_script = _v
+            break
+    if not _stripe_pk_script:
+        for _ts in (data.get('token_sources') or []):
+            _v = (_ts.get('value_preview') or _ts.get('value') or '').strip()
+            if re.match(r'pk_(live|test)_', _v):
+                _stripe_pk_script = _v
+                break
+    if not _stripe_pk_script:
+        for _lf in (data.get('live_findings') or []):
+            _v = (_lf.get('value') or _lf.get('value_preview') or '').strip()
+            if re.match(r'pk_(live|test)_', _v):
+                _stripe_pk_script = _v
+                break
+    if _stripe_pk_script:
+        _env_tag = '# LIVE key' if 'pk_live_' in _stripe_pk_script else '# test key'
+        sc.append(f'STRIPE_PK        = "{_stripe_pk_script}"  {_env_tag}')
+        sc.append('STRIPE_TOKEN_URL  = "https://api.stripe.com/v1/payment_methods"')
+        _script_gw_written = True
+
+    # Authorize.Net
+    if _an_keys and isinstance(_an_keys, tuple) and any(_an_keys):
+        _an_l_s, _an_c_s = _an_keys
+        if _an_l_s:
+            sc.append(f'AUTHNET_LOGIN_ID   = "{_an_l_s}"')
+        if _an_c_s:
+            sc.append(f'AUTHNET_CLIENT_KEY = "{_an_c_s}"')
+        _an_tok_s = (
+            'https://jstest.authorize.net/v1/request'
+            if _an_l_s and ('test' in (_an_l_s or '').lower() or len(_an_l_s or '') < 8)
+            else 'https://js.authorize.net/v1/request'
+        )
+        sc.append(f'AUTHNET_TOKEN_URL  = "{_an_tok_s}"')
+        _script_gw_written = True
+
+    # CardPointe site key
+    _cp_key_script = ''
+    for _frm in (data.get('forms') or []):
+        for _fld in (_frm.get('fields') or []):
+            _fn = (_fld.get('name') or '').lower()
+            _fv = _fld.get('value') or ''
+            if 'site' in _fn and 'key' in _fn and _fv and len(_fv) > 6:
+                _cp_key_script = _fv
+                break
+    if not _cp_key_script:
+        for _ts in (data.get('token_sources') or []):
+            _n = (_ts.get('name') or '').lower()
+            if 'site' in _n and 'key' in _n:
+                _cp_key_script = _ts.get('value_preview', '')
+                break
+    if _cp_key_script:
+        sc.append(f'CARDPOINTE_SITE_KEY  = "{_cp_key_script}"')
+        sc.append('CARDPOINTE_TOKEN_URL  = "https://boltgw.cardconnect.com/v3/iframe"')
+        _script_gw_written = True
+
+    if not _script_gw_written:
+        sc.append('# No gateway keys detected in scan — add manually if needed')
+        sc.append('STRIPE_PK          = "pk_live_XXXX"')
+        sc.append('AUTHNET_LOGIN_ID   = ""')
+        sc.append('AUTHNET_CLIENT_KEY = ""')
+    sc.append('')
+
+    # ── detect_dynamic_token_sources() utility (embedded in generated script) ──
+    import textwrap as _tw_dts
+    _DETECT_DTS_SRC = _tw_dts.dedent(r'''
+        # ── detect_dynamic_token_sources() ──────────────────────────────────
+        def detect_dynamic_token_sources(html: str, js_text: str = '') -> list[dict]:
+            """
+            Scan HTML + JS for payment gateway public credentials and
+            tokenization URLs.
+
+            Detects:
+              Stripe pk_live_/pk_test_  →  api.stripe.com/v1/payment_methods
+              Authorize.Net clientKey + apiLoginID  →  js.authorize.net/v1/request
+              CardPointe site key  →  boltgw.cardconnect.com/v3/iframe
+              Braintree client token  →  payments.braintree-api.com/graphql
+              Razorpay key_live_/key_test_
+              Square application ID
+              PayPal client-id
+              Generic window.PaymentConfig objects
+
+            Returns list[dict]: {gateway, key_type, value, source, tokenization_url}
+            """
+            import re as _re
+            results: list[dict] = []
+            seen: set = set()
+
+            def _add(gw, ktype, val, src, tok_url=''):
+                sig = (gw.lower(), (val or '')[:40])
+                if sig in seen or not val:
+                    return
+                seen.add(sig)
+                results.append({
+                    'gateway':          gw,
+                    'key_type':         ktype,
+                    'value':            val,
+                    'source':           src,
+                    'tokenization_url': tok_url,
+                })
+
+            combined = html + '\n' + js_text
+
+            # Stripe pk_
+            for m in _re.finditer(r'pk_(live|test)_[A-Za-z0-9]{20,}', combined):
+                _env = 'LIVE' if m.group(1) == 'live' else 'TEST'
+                _add('Stripe', f'Publishable Key ({_env})', m.group(0),
+                     'html/js', 'https://api.stripe.com/v1/payment_methods')
+
+            # Authorize.Net clientKey
+            for m in _re.finditer(
+                r'(?:clientKey|publicClientKey)\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,})["\']',
+                combined, _re.I
+            ):
+                _add('Authorize.Net', 'Public Client Key', m.group(1),
+                     'html/js', 'https://js.authorize.net/v1/request')
+
+            # Authorize.Net apiLoginID
+            for m in _re.finditer(
+                r'(?:apiLoginID?|loginId)\s*[=:]\s*["\']([A-Za-z0-9]{4,20})["\']',
+                combined, _re.I
+            ):
+                _add('Authorize.Net', 'API Login ID', m.group(1), 'html/js')
+
+            # CardPointe site key
+            for m in _re.finditer(
+                r'(?:siteKey|site_key|merchantId)\s*[=:]\s*["\']([A-Za-z0-9\-_]{8,})["\']',
+                combined, _re.I
+            ):
+                _add('CardPointe', 'Site Key', m.group(1),
+                     'html/js', 'https://boltgw.cardconnect.com/v3/iframe')
+
+            # Braintree client token
+            for m in _re.finditer(
+                r'(?:clientToken|braintree.*token)\s*[=:]\s*["\']([A-Za-z0-9+/=]{30,})["\']',
+                combined, _re.I
+            ):
+                _add('Braintree', 'Client Token', m.group(1)[:60] + '...',
+                     'html/js', 'https://payments.braintree-api.com/graphql')
+
+            # Razorpay
+            for m in _re.finditer(r'rzp_(live|test)_[A-Za-z0-9]{14,}', combined):
+                _add('Razorpay', 'Key ID', m.group(0),
+                     'html/js', 'https://api.razorpay.com/v1/orders')
+
+            # Square
+            for m in _re.finditer(
+                r'(?:applicationId|appId)\s*[=:]\s*["\']'
+                r'(sq0idp-[A-Za-z0-9\-_]{20,})["\']',
+                combined, _re.I
+            ):
+                _add('Square', 'Application ID', m.group(1),
+                     'html/js', 'https://web.squarecdn.com/v1/square.js')
+
+            # PayPal client-id
+            for m in _re.finditer(
+                r'(?:client[-_]?id)\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,80})["\']',
+                combined, _re.I
+            ):
+                _v = m.group(1)
+                if not _re.match(r'pk_|rzp_|sq0', _v):
+                    _add('PayPal', 'Client ID', _v,
+                         'html/js', 'https://api-m.paypal.com/v2/checkout/orders')
+
+            # Generic window.PaymentConfig
+            for m in _re.finditer(
+                r'(?:window\.(?:PaymentConfig|gatewayConfig|checkoutConfig)'
+                r'|paymentConfig)\s*=\s*(\{[^;]{20,300}\})',
+                combined, _re.I | _re.S
+            ):
+                _snippet = m.group(1)[:200].replace('\n', ' ')
+                _add('Generic', 'Payment Config Object', _snippet, 'window config')
+
+            return results
+    ''').lstrip('\n')
+    sc.extend(_DETECT_DTS_SRC.splitlines())
+    sc.append('')
+
+    # ── Token extractor utility ────────────────────────────────────────────
+    # Use textwrap.dedent + triple-quote to avoid ALL quote-escaping issues
+    import textwrap as _tw
+    _EXTRACT_TOKENS_SRC = _tw.dedent(r'''
+        # ── Token Extractor ─────────────────────────────────────────────────
+        def extract_tokens(html: str, extra_names: list[str] | None = None) -> dict:
+            """
+            Extract hidden tokens (CSRF, nonce, session, honeypot) from HTML.
+            Returns dict of {field_name: value}.
+
+            Patterns covered:
+              • <input type="hidden" name="..." value="...">
+              • <meta name="csrf-token" content="...">
+              • JS variable:  window.csrfToken = "..."
+              • JS inline:    _token: "..." / nonce: "..."
+              • Next.js:      __NEXT_DATA__ csrfToken
+            """
+            found: dict[str, str] = {}
+
+            # ── Pattern 1: <input type="hidden"> ─────────────────────────
+            _HIDDEN_PAT = re.compile(
+                r'<input[^>]+type=[\x22\x27]hidden[\x22\x27][^>]*>',
+                re.I | re.S,
+            )
+            _NAME_PAT = re.compile(r'name=[\x22\x27]([^\x22\x27]+)[\x22\x27]',  re.I)
+            _VAL_PAT  = re.compile(r'value=[\x22\x27]([^\x22\x27]*)[\x22\x27]', re.I)
+            for tag in _HIDDEN_PAT.findall(html):
+                nm = _NAME_PAT.search(tag)
+                vl = _VAL_PAT.search(tag)
+                if nm and vl:
+                    found[nm.group(1)] = vl.group(1)
+
+            # ── Pattern 2: <meta name="csrf-token" content="..."> ────────
+            _META_PAT = re.compile(
+                r'<meta[^>]+name=[\x22\x27](?:csrf[-_]?token|_token|nonce|authenticity[-_]token)[\x22\x27]'
+                r'[^>]+content=[\x22\x27]([^\x22\x27]+)[\x22\x27]',
+                re.I,
+            )
+            for m in _META_PAT.finditer(html):
+                found["_meta_csrf"] = m.group(1)
+
+            # ── Pattern 3: JS window.X = "value" ─────────────────────────
+            _JS_WIN_PAT = re.compile(
+                r'window\.(\w+)\s*=\s*[\x22\x27]([A-Za-z0-9+/=_\-]{16,})[\x22\x27]',
+                re.I,
+            )
+            for m in _JS_WIN_PAT.finditer(html):
+                k = m.group(1)
+                if re.search(r'csrf|token|nonce|session|auth', k, re.I):
+                    found[k] = m.group(2)
+
+            # ── Pattern 4: JS object literal key: "value" ────────────────
+            _JS_OBJ_PAT = re.compile(
+                r'[\x22\x27]?(\w*(?:csrf|token|nonce|_token|authenticity)\w*)[\x22\x27]?'
+                r'\s*:\s*[\x22\x27]([A-Za-z0-9+/=_\-]{16,})[\x22\x27]',
+                re.I,
+            )
+            for m in _JS_OBJ_PAT.finditer(html):
+                found[m.group(1)] = m.group(2)
+
+            # ── Pattern 5: Next.js __NEXT_DATA__ ─────────────────────────
+            _NEXT_PAT = re.compile(
+                r'<script[^>]+id=[\x22\x27]__NEXT_DATA__[\x22\x27][^>]*>(.+?)</script>',
+                re.S | re.I,
+            )
+            _nm = _NEXT_PAT.search(html)
+            if _nm:
+                try:
+                    import json as _json
+                    _nd = _json.loads(_nm.group(1))
+                    for _key in ("csrfToken", "csrf_token", "_token", "nonce", "authenticity_token"):
+                        _v = (_nd.get("props", {}).get("pageProps", {}) or {}).get(_key)
+                        if not _v:
+                            _v = _nd.get(_key)
+                        if _v and isinstance(_v, str):
+                            found[_key] = _v
+                except Exception:
+                    pass
+
+            # ── Pattern 6: custom field names passed by caller ────────────
+            if extra_names:
+                for _en in extra_names:
+                    if _en not in found:
+                        _pat = re.compile(
+                            r'(?:name|id)=[\x22\x27]' + re.escape(_en) +
+                            r'[\x22\x27][^>]*value=[\x22\x27]([^\x22\x27]+)[\x22\x27]',
+                            re.I,
+                        )
+                        _ep = _pat.search(html)
+                        if _ep:
+                            found[_en] = _ep.group(1)
+
+            return found
+
+    ''').lstrip('\n')
+    sc.extend(_EXTRACT_TOKENS_SRC.splitlines())
+
+    # ── simulate_cta_click() helper (moved before Step 1) ──────────────
+    sc.append('def simulate_cta_click(sess, post_body: dict,')
+    sc.append('                       listeners: list = None,')
+    sc.append('                       form_attrs: list = None) -> "requests.Response | None":')
+    sc.append('    """')
+    sc.append('    Simulate the CTA button click and form submission sequence.')
+    sc.append('')
+    sc.append('    Steps:')
+    sc.append('      1. Fire any pre-submit JS listener side-effects (headers / tokens).')
+    sc.append('      2. Determine submit URL and method from form_attrs.')
+    sc.append('      3. Send the POST with the assembled post_body.')
+    sc.append('      4. Return the raw Response for further analysis.')
+    sc.append('    """')
+    sc.append('    listeners  = listeners  or EVENT_LISTENERS')
+    sc.append('    form_attrs = form_attrs or FORM_SUBMIT_ATTRS')
+    sc.append('')
+    sc.append('    # ── Step 5d-1: Pre-submit listener side-effects ──────────────')
+    sc.append('    _click_headers = {}')
+    sc.append('    for _lsn in listeners:')
+    sc.append('        _et = _lsn.get("event_type", "").lower()')
+    sc.append('        _hd = _lsn.get("handler", "").lower()')
+    sc.append('        # If listener sets X-Requested-With / X-AJAX header:')
+    sc.append('        if "xmlhttprequest" in _hd or "ajax" in _hd or "fetch" in _hd:')
+    sc.append('            _click_headers["X-Requested-With"] = "XMLHttpRequest"')
+    sc.append('        # If listener sets custom content-type to JSON:')
+    sc.append('        if "json" in _hd and "application/json" not in str(sess._s.headers):')
+    sc.append('            _click_headers["Content-Type"] = "application/json"')
+    sc.append('    if _click_headers:')
+    sc.append('        print(f"  ⚡ Listener side-effects → headers: {list(_click_headers.keys())}")')
+    sc.append('')
+    sc.append('    # ── Step 5d-2: Resolve submit endpoint ───────────────────────')
+    sc.append('    _pay_forms  = [f for f in form_attrs if f.get("is_payment") and f.get("action")]')
+    sc.append('    _any_forms  = [f for f in form_attrs if f.get("action")]')
+    sc.append('    _best_form  = (_pay_forms or _any_forms or [{}])[0]')
+    sc.append('    _submit_url = _best_form.get("action", "")')
+    sc.append('    _method     = _best_form.get("method", "POST").upper()')
+    sc.append('    _enctype    = _best_form.get("enctype", "application/x-www-form-urlencoded")')
+    sc.append('')
+    sc.append('    if not _submit_url:')
+    sc.append('        print("  ⚠️  No form action found — cannot simulate submit")')
+    sc.append('        return None')
+
+    # Step 1
+    sc.append('')
+    sc.append('# ── Step 1: Prime session + get CSRF token ──────────────────────')
+    sc.append(f'session = PayloadSession("{url}")')
+    sc.append(f'log.info("Step 1 — GET {url}")')
+    sc.append(f'r = session.get("{url}", timeout=15)')
+    sc.append('log.debug(f"Page HTML size: {len(r.text)}B")')
+    sc.append('')
+    sc.append('# extract_tokens() scans ALL hidden fields + meta + JS vars at once')
+    sc.append('tokens = extract_tokens(r.text)')
+    sc.append('log.debug(f"Extracted token fields: {list(tokens.keys())}")')
+    sc.append('print(f"Extracted tokens: {list(tokens.keys())}")')
+
+    if csrf_method == 'cookie':
+        sc.append('# CSRF from cookie (Laravel Sanctum / cookie-to-header)')
+        sc.append(f'csrf = unquote(session.cookies().get("{csrf_name}", ""))')
+        sc.append(f'csrf = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
+    elif csrf_method == 'api_endpoint':
+        sc.append('# CSRF from SPA endpoint')
+        sc.append(f'log.debug("Fetching CSRF from SPA endpoint: {_base_origin}{csrf_endpoint}")')
+        sc.append(f'csrf_r = session.get("{_base_origin}{csrf_endpoint}", timeout=10)')
+        sc.append(f'csrf   = csrf_r.json().get("{csrf_name}", "")')
+        sc.append(f'csrf   = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
+    else:
+        sc.append('# CSRF from extracted tokens (hidden field / meta / JS)')
+        if csrf_name:
+            sc.append(f'csrf = tokens.get("{csrf_name}", "")')
+            sc.append('if not csrf:')
+            sc.append(f'    _m = re.search(r\'name="{csrf_name}"[^>]*value="([^"]+)"\', r.text)')
+            sc.append('    csrf = _m.group(1) if _m else ""')
+        else:
+            sc.append('csrf = next((tokens[k] for k in')
+            sc.append('    ("_token","csrf_token","csrfToken","authenticity_token","nonce","_meta_csrf")')
+            sc.append('    if k in tokens), "")')
+
+    sc.append(f'_log_csrf("{csrf_name or "_token"}", csrf, "{csrf_method}")')
+    sc.append(f'session.set_csrf("{csrf_name or "_token"}", csrf)  # auto-injected from here on')
+    sc.append('print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
+    sc.append('session.dump_state()')
+
+    # ── Feature 4: State & Session — inject essential cookies / storage ───
+    # ── Feature 4: State & Session Analysis — full executable block ─────
+    _ss_data        = data.get('state_session') or {}
+    _ess_cookies    = _ss_data.get('essential_cookies') or []
+    _ess_storage    = _ss_data.get('essential_storage') or []
+    _all_cookies_f4 = _ss_data.get('cookies') or []
+    _all_storage_f4 = _ss_data.get('storage') or []
+    sc.append('')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('# 🍪 Feature 4 — State & Session Analysis')
+    sc.append('# Extracted from scan: active cookies + localStorage/sessionStorage')
+    sc.append('# identifies which items are essential to maintain the session state.')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('')
+    # ── 4a: All cookies table (runnable dict) ──────────────────────────────
+    sc.append('# ── 4a. All Active Cookies ─────────────────────────────────────────')
+    sc.append('# Keys: name | value (at scan time) | essential | reason')
+    sc.append('ALL_COOKIES = [')
+    for _ck in _all_cookies_f4[:20]:
+        _ck_n   = _ck.get('name', '').replace('"', '\\"')
+        _ck_v   = str(_ck.get('value', '<server-set>')).replace('"', '\\"')[:60]
+        _ck_ess = _ck.get('essential', False)
+        _ck_rsn = _ck.get('reason', '').replace('"', '\\"')[:80]
+        _ck_src = _ck.get('source', '')
+        sc.append(f'    {{"name": "{_ck_n}", "value": "{_ck_v}", '
+                  f'"essential": {_ck_ess}, "reason": "{_ck_rsn}", "source": "{_ck_src}"}},')
+    sc.append(']')
+    sc.append('')
+    # ── 4b: Essential cookies — pre-seed block ─────────────────────────────
+    if _ess_cookies:
+        sc.append('# ── 4b. Essential Session Cookies ──────────────────────────────────')
+        sc.append('# These cookies maintain the authenticated session.')
+        sc.append('# PayloadSession carries them automatically after the first GET.')
+        sc.append('# Pre-seed below ONLY when replaying a known session (e.g. from DevTools).')
+        sc.append('ESSENTIAL_COOKIES = {')
+        for _ck in _ess_cookies[:10]:
+            _ck_n   = _ck.get('name', '').replace('"', '\\"')
+            _ck_v   = str(_ck.get('value', '<set-by-server>')).replace('"', '\\"')[:60]
+            _ck_rsn = _ck.get('reason', '').replace('"', '\\"')[:80]
+            sc.append(f'    # {_ck_rsn}')
+            sc.append(f'    "{_ck_n}": "{_ck_v}",')
+        sc.append('}')
+        sc.append('')
+        sc.append('def seed_essential_cookies(sess, cookie_dict: dict) -> None:')
+        sc.append('    """Pre-load known session cookies into a PayloadSession."""')
+        sc.append('    for name, value in cookie_dict.items():')
+        sc.append('        sess._s.cookies.set(name, value)')
+        sc.append('        print(f"  🍪 Seeded cookie: {name}={value[:20]}…")')
+        sc.append('')
+        sc.append('# Uncomment to replay a known session:')
+        sc.append('# seed_essential_cookies(session, ESSENTIAL_COOKIES)')
+    else:
+        sc.append('# ── 4b. Essential Session Cookies: none detected at scan time.')
+        sc.append('# Session is likely established automatically via the initial GET.')
+        sc.append('ESSENTIAL_COOKIES = {}')
+    sc.append('')
+    # ── 4c: localStorage / sessionStorage dump ─────────────────────────────
+    sc.append('# ── 4c. localStorage / sessionStorage Items ─────────────────────────')
+    sc.append('# Values captured during Playwright scan. Runnable as a static dict.')
+    sc.append('CLIENT_STORAGE = {')
+    if _all_storage_f4:
+        _ls_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'localStorage']
+        _ss_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'sessionStorage']
+        if _ls_items:
+            sc.append('    "localStorage": {')
+            for _k, _s in _ls_items[:15]:
+                _sv  = str(_s.get('value', '')).replace('"', '\\"').replace('\\', '\\\\')[:80]
+                _ess = '  # ★ ESSENTIAL' if _s.get('essential') else ''
+                _rsn = f' — {_s["reason"]}' if _s.get('reason') else ''
+                sc.append(f'        "{_k}": "{_sv}",{_ess}{_rsn}')
+            sc.append('    },')
+        if _ss_items:
+            sc.append('    "sessionStorage": {')
+            for _k, _s in _ss_items[:10]:
+                _sv  = str(_s.get('value', '')).replace('"', '\\"').replace('\\', '\\\\')[:80]
+                _ess = '  # ★ ESSENTIAL' if _s.get('essential') else ''
+                _rsn = f' — {_s["reason"]}' if _s.get('reason') else ''
+                sc.append(f'        "{_k}": "{_sv}",{_ess}{_rsn}')
+            sc.append('    },')
+    else:
+        sc.append('    "localStorage":   {},  # empty at scan time')
+        sc.append('    "sessionStorage": {},')
+    sc.append('}')
+    sc.append('')
+    # ── 4d: JWT / token injection ──────────────────────────────────────────
+    _jwt_items = [s for s in _ess_storage if
+                  str(s.get('value', '')).startswith('eyJ') or
+                  re.search(r'access.?token|refresh.?token|bearer', s.get('key', ''), re.I)]
+    sc.append('# ── 4d. Token Injection from Storage ───────────────────────────────')
+    sc.append('# Reads access/refresh tokens from CLIENT_STORAGE and injects them')
+    sc.append('# into the session Authorization header automatically.')
+    sc.append('def inject_storage_tokens(sess, storage: dict) -> dict:')
+    sc.append('    """')
+    sc.append('    Scan localStorage and sessionStorage for JWT / access tokens.')
+    sc.append('    Injects the first found token as Authorization: Bearer <token>.')
+    sc.append('    Returns dict of all injected {header: value} pairs.')
+    sc.append('    """')
+    sc.append('    import re as _re')
+    sc.append('    _TOKEN_PAT = _re.compile(')
+    sc.append('        r"access.?token|refresh.?token|bearer|jwt|auth.?token|id.?token", _re.I)')
+    sc.append('    injected = {}')
+    sc.append('    for store_name, store_dict in storage.items():')
+    sc.append('        if not isinstance(store_dict, dict):')
+    sc.append('            continue')
+    sc.append('        for k, v in store_dict.items():')
+    sc.append('            if not isinstance(v, str) or not v:')
+    sc.append('                continue')
+    sc.append('            is_jwt   = v.startswith("eyJ") and v.count(".") >= 2')
+    sc.append('            is_token = bool(_TOKEN_PAT.search(k))')
+    sc.append('            if is_jwt or is_token:')
+    sc.append('                header = "Authorization"')
+    sc.append('                value  = f"Bearer {v}" if not v.lower().startswith("bearer") else v')
+    sc.append('                sess._s.headers[header] = value')
+    sc.append('                injected[header] = value[:40] + "…"')
+    sc.append('                print(f"  💉 Injected [{store_name}][{k}] → {header}: {value[:30]}…")')
+    sc.append('                break  # first valid token wins')
+    sc.append('        if injected:')
+    sc.append('            break')
+    sc.append('    if not injected:')
+    sc.append('        print("  ℹ️  No JWT/access token found in CLIENT_STORAGE")')
+    sc.append('    return injected')
+    sc.append('')
+    if _jwt_items:
+        _jk = _jwt_items[0].get('key', '')
+        sc.append(f'# ★ Token detected at scan time: [{_jwt_items[0].get("store","localStorage")}]["{_jk}"]')
+    sc.append('_injected_tokens = inject_storage_tokens(session, CLIENT_STORAGE)')
+
+    # ── Feature 5: Event Flow Tracing — full executable block ─────────────
+    _ef_data     = data.get('event_flow') or {}
+    _cta         = _ef_data.get('primary_cta') or {}
+    _listeners   = _ef_data.get('event_listeners') or []
+    _form_submit = _ef_data.get('form_submission') or []
+    _all_ctas    = _ef_data.get('cta_candidates') or []
+    sc.append('')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('# ⚡ Feature 5 — Event Flow Tracing')
+    sc.append('# Primary CTA button + JS event listeners + form submission attrs.')
+    sc.append('# Simulate the exact click/submit chain the browser fires.')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('')
+    # ── 5a: CTA identity ──────────────────────────────────────────────────
+    sc.append('# ── 5a. Primary CTA Button ─────────────────────────────────────────')
+    if _cta:
+        _cta_txt = (_cta.get('text') or _cta.get('value') or
+                    _cta.get('id') or '(unknown)')[:60].replace('"', '\\"')
+        _cta_id  = (_cta.get('id') or '').replace('"', '\\"')
+        _cta_cls = ' '.join((_cta.get('class') or '').split()[:6]).replace('"', '\\"')
+        _cta_tp  = (_cta.get('type') or 'button')
+        _cta_nm  = (_cta.get('name') or '').replace('"', '\\"')
+        sc.append('CTA_BUTTON = {')
+        sc.append(f'    "label":   "{_cta_txt}",')
+        sc.append(f'    "type":    "{_cta_tp}",')
+        sc.append(f'    "id":      "{_cta_id}",')
+        sc.append(f'    "name":    "{_cta_nm}",')
+        sc.append(f'    "class":   "{_cta_cls}",')
+        sc.append(f'    "score":   {_cta.get("score", 0)},')
+        sc.append('}')
+        if len(_all_ctas) > 1:
+            sc.append(f'# Other CTA candidates ({len(_all_ctas) - 1} more):')
+            for _alt in _all_ctas[1:4]:
+                _alt_lbl = (_alt.get('text') or _alt.get('id') or '')[:40].replace('"', '\\"')
+                sc.append(f'#   score={_alt.get("score",0)}  label="{_alt_lbl}"  '
+                          f'id="{_alt.get("id","")}"')
+    else:
+        sc.append('CTA_BUTTON = {}  # no CTA button detected — form may auto-submit')
+    sc.append('')
+    # ── 5b: Event listener registry ───────────────────────────────────────
+    sc.append('# ── 5b. JavaScript Event Listeners ─────────────────────────────────')
+    sc.append('# Detected listeners attached to the CTA or form submit chain.')
+    sc.append('EVENT_LISTENERS = [')
+    if _listeners:
+        for _lsn in _listeners[:10]:
+            _et   = _lsn.get('type', '').replace('"', '\\"')
+            _src  = _lsn.get('source', '').replace('"', '\\"')
+            _hndl = str(_lsn.get('handler', '')).replace('"', '\\"').replace('\n', ' ')[:120]
+            sc.append(f'    {{')
+            sc.append(f'        "event_type": "{_et}",')
+            sc.append(f'        "source":     "{_src}",')
+            sc.append(f'        "handler":    "{_hndl}",')
+            sc.append(f'    }},')
+    else:
+        sc.append('    # No explicit JS listeners found — form uses native HTML submit')
+    sc.append(']')
+    sc.append('')
+    # ── 5c: Form submission attributes ────────────────────────────────────
+    sc.append('# ── 5c. Form Submission Attributes ─────────────────────────────────')
+    sc.append('FORM_SUBMIT_ATTRS = [')
+    if _form_submit:
+        for _fa in _form_submit[:8]:
+            _fa_act = _fa.get('action', '').replace('"', '\\"')[:120]
+            _fa_mth = (_fa.get('method') or 'POST').upper()
+            _fa_enc = (_fa.get('enctype') or 'application/x-www-form-urlencoded').replace('"', '\\"')
+            _fa_pay = _fa.get('is_payment', False)
+            _fa_src = _fa.get('source', '').replace('"', '\\"')
+            sc.append(f'    {{')
+            sc.append(f'        "action":     "{_fa_act}",')
+            sc.append(f'        "method":     "{_fa_mth}",')
+            sc.append(f'        "enctype":    "{_fa_enc}",')
+            sc.append(f'        "is_payment": {_fa_pay},')
+            sc.append(f'        "source":     "{_fa_src}",')
+            sc.append(f'    }},')
+    else:
+        sc.append('    # No form submission attributes detected')
+    sc.append(']')
+    sc.append('')
+    # ── 5d: simulate_cta_click() helper ───────────────────────────────────
+    sc.append('# ── 5d. CTA Click Simulator ─────────────────────────────────────────')
+    sc.append('# Replicates the browser event flow:')
+    sc.append('#   mousedown → mouseup → click → [validate] → submit → POST')
+
+    if gw_name in ('Stripe', 'Braintree', 'Adyen') or hosted.get('gateway'):
+        sc.append('')
+        sc.extend(_tokenize_step())
+
+    # Step 3
+    sc.append('')
+    sc.append('# ── Step 3: Build form body + Submit ────────────────────────────────')
+    sc.append('mapper  = DynamicFieldMapper()')
+    # Build overrides from gateway token if available
+    # Check both gw_name and hosted.get('gateway') so hosted-only detections are covered
+    _eff_gw_step3 = gw_name if gw_name in ('Stripe', 'Braintree', 'Adyen') else hosted.get('gateway', '')
+    # Collect actual target field names from hosted extra_fields (required=True entries)
+    _hosted_req_fields = [
+        ef['name'] for ef in (hosted.get('extra_fields') or [])
+        if ef.get('name') and ef.get('required')
+    ]
+    if _eff_gw_step3 == 'Stripe':
+        sc.append('# Override gateway token field automatically (Stripe pm_xxx → all known token fields)')
+        if _hosted_req_fields:
+            # Build overrides dict from actual detected field names + common fallbacks
+            _all_stripe_fields = list(dict.fromkeys(
+                _hosted_req_fields + ['stripeToken', 'payment_method', 'paymentMethodId']
+            ))
+            _ovr_pairs = ', '.join(f'"{n}": stripe_pm' for n in _all_stripe_fields)
+            sc.append(f'_overrides = {{{_ovr_pairs}}}')
+        else:
+            sc.append('_overrides = {"stripeToken": stripe_pm, "payment_method": stripe_pm,')
+            sc.append('              "paymentMethodId": stripe_pm, "payment_method_nonce": stripe_pm}')
+    elif _eff_gw_step3 == 'Braintree':
+        if _hosted_req_fields:
+            _ovr_pairs = ', '.join(f'"{n}": nonce' for n in _hosted_req_fields)
+            sc.append(f'_overrides = {{{_ovr_pairs}}}')
+        else:
+            sc.append('_overrides = {"payment_method_nonce": nonce}')
+    else:
+        sc.append('_overrides = {}')
+    sc.append('')
+    sc.append('# Build the POST body — auto-typed from field name/type/placeholder')
+    sc.append(f'_raw_fields = {repr(fields)}')
+    sc.append('post_body = mapper.build_form(')
+    sc.append('    fields    = _raw_fields,')
+    sc.append('    overrides = _overrides,')
+    sc.append('    token_map = tokens,   # CSRF/nonce injected automatically')
+    sc.append(')')
+    sc.append('mapper.diff_report(_raw_fields, post_body)')
+    sc.append('print(f"POST body ({len(post_body)} fields): {list(post_body.keys())}")')
+    sc.append('')
+    _ct_header = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
+
+    if submit_url:
+        sc.append('# ── Step 3b: Submit via simulate_cta_click (Feature 5) ───────────────')
+        sc.append('# simulate_cta_click fires pre-submit listener side-effects,')
+        sc.append('# resolves the best form action, then sends the POST — matching')
+        sc.append('# the exact browser event flow captured by Event Flow Tracing.')
+        sc.append('resp = simulate_cta_click(session, post_body)')
+        sc.append('')
+        sc.append('# Fallback: direct POST if simulate_cta_click returns None')
+        sc.append('if resp is None:')
+        sc.append(f'    resp = session.{method.lower()}(')
+        sc.append(f'        "{submit_url}",')
+        sc.append(f'        {"json" if is_json_enc else "data"}=post_body,')
+        sc.append('        headers={')
+        sc.append(f'            "Content-Type": "{_ct_header}",')
+        sc.append('            # Referer, Origin, X-CSRF-Token auto-set by PayloadSession')
+        sc.append('        },')
+        sc.append('        timeout=20,')
+        sc.append('        allow_redirects=True,')
+        sc.append('    )')
+    else:
+        sc.append('# ⚠️ Submit endpoint not detected — running simulate_cta_click with empty form_attrs')
+        sc.append('resp = simulate_cta_click(session, post_body)')
+        sc.append('if resp is None:')
+        sc.append('    print("⚠️ No endpoint found — resp is None, check scan results")')
+
     sc.append('# ── Step 4: Analyse response ─────────────────────────────────────────')
     sc.append('engine = ResponseAnalysisEngine()')
     sc.append('if resp is not None:')
     sc.append('    print(f"\\nHTTP {resp.status_code}  →  {resp.url}")')
+    sc.append('    log.info(f"Step 4 — Analysing response HTTP {resp.status_code}")')
     sc.append('    analysis = engine.analyse(resp)')
     sc.append('    engine.print_result(analysis)')
+    sc.append('    _log_verdict(analysis["state"], resp.status_code, analysis.get("hits", []))')
     sc.append('')
     sc.append('    # ── Act on state ──────────────────────────────────────────────')
     sc.append('    if analysis["state"] == ResponseAnalysisEngine.SUCCESS:')
@@ -40796,6 +41502,7 @@ def _build_python_script(data: dict) -> str:
     sc.append('            _j = analysis["json"]')
     sc.append('            order_id = str(_j.get("id") or _j.get("order_id") or')
     sc.append('                           _j.get("transaction_id") or _j.get("charge_id") or "")')
+    sc.append('        log.info(f"  ✅ Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
     sc.append('        print(f"  ✅ Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
     sc.append('')
     sc.append('    elif analysis["state"] == ResponseAnalysisEngine.RE_VERIFICATION_REQUIRED:')
@@ -40807,6 +41514,7 @@ def _build_python_script(data: dict) -> str:
     sc.append('            redirect_url = redirect_url or str(')
     sc.append('                _j.get("redirect_url") or _j.get("acs_url") or')
     sc.append('                _j.get("challenge_url") or "")')
+    sc.append('        log.warning(f"  🔐 Re-verification required: {redirect_url or \'(check JSON)\'}")')
     sc.append('        print(f"  🔐 Re-verification URL: {redirect_url or \'(check JSON above)\'}")')
     if threeds:
         sc.append('        # ⚠️  3DS signals detected during scan — browser redirect required')
@@ -40818,6 +41526,7 @@ def _build_python_script(data: dict) -> str:
     sc.append('            decline_code = str(_j.get("decline_code") or')
     sc.append('                (_j.get("error") or {}).get("code") or')
     sc.append('                (_j.get("error") or {}).get("decline_code") or "")')
+    sc.append('        log.warning(f"  🔴 Decline code: {decline_code or \'(check JSON)\'}")')
     sc.append('        print(f"  🔴 Decline code: {decline_code or \'(check JSON above)\'}")')
     if recaptcha and recaptcha.get('site_key'):
         sc.append('')
@@ -40825,7 +41534,10 @@ def _build_python_script(data: dict) -> str:
         sc.append('    # Solve recaptcha token before Step 3 and add:')
         sc.append('    #   "g-recaptcha-response": RECAPTCHA_TOKEN')
     sc.append('else:')
+    sc.append('    log.error("No response — resp is None. Check submit endpoint detection.")')
     sc.append('    print("⚠️  No response — check submit endpoint detection.")')
+    sc.append('')
+    sc.append('log.info("Script finished.")')
 
     # ── BatchProcessor class ───────────────────────────────────────────────
     import textwrap as _tw
@@ -41222,6 +41934,177 @@ def _build_python_script(data: dict) -> str:
                 print("\\n[Single mode] Steps 1-4 executed above.")
                 print("To run batch mode: python script.py --batch cases.txt")
     ''').lstrip('\n')
+    # ── ClientConfigExtractor class ───────────────────────────────────────
+    import textwrap as _tw
+    _cc_site_url_r = repr(url)
+    _CLIENT_CONFIG_SRC = _tw.dedent(rf'''
+
+        # ══════════════════════════════════════════════════════════════════
+        #  ClientConfigExtractor
+        #  Scans the global window object and all <script> tags to extract
+        #  public API keys, merchant identifiers, and config variables.
+        #  Call after a successful session.get() to harvest live page state.
+        # ══════════════════════════════════════════════════════════════════
+        class ClientConfigExtractor:
+            """
+            Regex + JSON parse extraction of client-side config from HTML.
+
+            Extracts:
+              api_keys      — Stripe pk_, Google Maps, Firebase, Sentry DSN,
+                              Segment, Mixpanel, Amplitude, GA4, GTM, Pusher …
+              merchant_ids  — PayPal client_id, Braintree merchant, Square appId,
+                              Intercom app_id, Algolia appId …
+              config_objects— window.__CONFIG__, window.ENV, window.Shopify,
+                              __NEXT_DATA__, __NUXT__ blobs …
+              env_vars      — API_BASE_URL, APP_VERSION, BUILD_ID, CDN_URL …
+              data_attrs    — data-key, data-api-key, data-client-id … attrs
+              raw_window    — broad window.UPPER_CASE = "value" scan
+            """
+
+            import re as _re
+
+            # ── pattern bank ───────────────────────────────────────────────
+            _PATTERNS: list = [
+                # payment keys
+                ('Stripe pk_',        _re.compile(r'["\']?(pk_(?:live|test)_[A-Za-z0-9]{{20,}})["\']?'),        'api_keys',      'stripe_pk'),
+                ('PayPal client_id',  _re.compile(r'client[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{{10,80}})["\']', _re.I), 'merchant_ids', 'paypal_client_id'),
+                ('Braintree merchant',_re.compile(r'merchant[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_]{{6,40}})["\']', _re.I),  'merchant_ids', 'braintree_merchant_id'),
+                ('Square appId',      _re.compile(r'app(?:lication)?[-_]?id["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{{10,60}})["\']', _re.I), 'merchant_ids', 'square_app_id'),
+                ('Adyen clientKey',   _re.compile(r'adyen.*?client[-_]?key["\']\s*[=:]\s*["\']([A-Za-z0-9_]{{20,100}})["\']', _re.I), 'api_keys', 'adyen_client_key'),
+                # maps / geo
+                ('Google Maps key',   _re.compile(r'["\']?(AIza[A-Za-z0-9_\-]{{35}})["\']?'),                   'api_keys',      'google_maps_api_key'),
+                ('Mapbox token',      _re.compile(r'["\']?(pk\.eyJ1[A-Za-z0-9._\-]{{30,}})["\']?'),             'api_keys',      'mapbox_token'),
+                # firebase
+                ('Firebase apiKey',   _re.compile(r'apiKey["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{{30,}})["\']', _re.I), 'api_keys', 'firebase_api_key'),
+                ('Firebase projectId',_re.compile(r'projectId["\']\s*[=:]\s*["\']([a-z0-9\-]{{4,40}})["\']', _re.I), 'config_objects', 'firebase_project_id'),
+                # analytics
+                ('GA4 ID',            _re.compile(r'["\']?(G-[A-Z0-9]{{8,12}})["\']?'),                         'api_keys',      'ga4_id'),
+                ('GTM ID',            _re.compile(r'["\']?(GTM-[A-Z0-9]{{4,10}})["\']?'),                       'api_keys',      'gtm_id'),
+                ('Sentry DSN',        _re.compile(r'["\']?(https://[a-f0-9]{{32}}@(?:o\d+\.)?ingest\.sentry\.io/\d+)["\']?'), 'api_keys', 'sentry_dsn'),
+                ('Segment writeKey',  _re.compile(r'write[-_]?key["\']\s*[=:]\s*["\']([A-Za-z0-9]{{20,50}})["\']', _re.I), 'api_keys', 'segment_write_key'),
+                ('Mixpanel token',    _re.compile(r'mixpanel.*?token["\']\s*[=:]\s*["\']([A-Za-z0-9]{{20,50}})["\']', _re.I), 'api_keys', 'mixpanel_token'),
+                ('Pusher app key',    _re.compile(r'pusher.*?app[-_]?key["\']\s*[=:]\s*["\']([A-Za-z0-9]{{10,30}})["\']', _re.I), 'api_keys', 'pusher_app_key'),
+                ('Intercom app_id',   _re.compile(r'intercom.*?app[-_]?id["\']\s*[=:]\s*["\']([a-z0-9]{{6,16}})["\']', _re.I), 'merchant_ids', 'intercom_app_id'),
+                # env / build
+                ('API base URL',      _re.compile(r'(?:API|api)[-_]?(?:BASE[-_]?URL|URL|ROOT)["\']\s*[=:]\s*["\']?(https?://[^\s"\'<>]{{8,100}})["\']?', _re.I), 'env_vars', 'api_base_url'),
+                ('App version',       _re.compile(r'(?:APP_VERSION|appVersion|version)["\']\s*[=:]\s*["\']([0-9a-zA-Z._\-]{{3,30}})["\']', _re.I), 'env_vars', 'app_version'),
+                ('Build ID',          _re.compile(r'(?:BUILD_ID|buildId|COMMIT_HASH)["\']\s*[=:]\s*["\']([A-Za-z0-9_\-]{{6,64}})["\']', _re.I), 'env_vars', 'build_id'),
+                ('Env mode',          _re.compile(r'(?:NODE_ENV|APP_ENV|ENVIRONMENT)["\']\s*[=:]\s*["\']([a-z]{{3,15}})["\']', _re.I), 'env_vars', 'environment'),
+                # window config objects
+                ('window.__CONFIG__', _re.compile(r'window\.__CONFIG__\s*=\s*(\{{[^;]{{0,1000}})', _re.S),       'config_objects','window.__CONFIG__'),
+                ('window.ENV',        _re.compile(r'window\.(?:ENV|_env_)\s*=\s*(\{{[^;]{{0,500}})', _re.S),    'config_objects','window.ENV'),
+                ('window.Shopify',    _re.compile(r'window\.Shopify\s*=\s*(?:window\.Shopify\s*\|\|\s*)?\{{([^;]{{0,400}})', _re.S), 'config_objects', 'window.Shopify'),
+            ]
+
+            _STATE_PATS: list = [
+                _re.compile(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.+?)</script>', _re.S | _re.I),
+                _re.compile(r'window\.__NUXT__\s*=\s*(\{{.+?\}});?\s*</script>', _re.S),
+                _re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{{.+?\}});?\s*</script>', _re.S),
+            ]
+
+            _STATE_KEYS: set = {{
+                'stripePublishableKey','stripe_pk','publicKey','paypalClientId',
+                'googleMapsKey','sentryDsn','segmentKey','firebaseApiKey',
+                'apiBaseUrl','apiUrl','baseUrl','appVersion','buildId','env',
+            }}
+
+            def extract(self, html: str) -> dict:
+                """Run full extraction on HTML string. Returns structured dict."""
+                html = html or ""
+                out   = {{'api_keys':[],'merchant_ids':[],'config_objects':[],
+                          'env_vars':[],'data_attrs':[],'raw_window':{{}}}}
+                seen  = set()
+
+                def _add(bucket, key, value, category, source):
+                    d = f"{{bucket}}:{{key}}:{{value[:30]}}"
+                    if d in seen or not value or len(value) < 3: return
+                    seen.add(d)
+                    out[bucket].append({{'key':key,'value':value[:300],
+                                         'category':category,'source':source}})
+
+                # 1. Pattern scan
+                for label, pat, bucket, category in self._PATTERNS:
+                    try:
+                        for m in pat.finditer(html):
+                            val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                            if val: _add(bucket, label, val, category, 'html_scan')
+                    except Exception: pass
+
+                # 2. State blob extraction (__NEXT_DATA__ etc.)
+                for sp in self._STATE_PATS:
+                    try:
+                        m = sp.search(html)
+                        if not m: continue
+                        blob = m.group(1)[:8000]
+                        import json as _j
+                        try:
+                            obj = _j.loads(blob)
+                            def _walk(o, depth=0):
+                                if depth > 4 or not isinstance(o, dict): return
+                                for k, v in o.items():
+                                    if k in self._STATE_KEYS and isinstance(v, str) and len(v) > 4:
+                                        _add('config_objects', k, v, 'state_blob', 'state_blob')
+                                    elif isinstance(v, dict): _walk(v, depth+1)
+                            _walk(obj)
+                        except Exception: pass
+                        for label, pat, bucket, category in self._PATTERNS:
+                            try:
+                                for m2 in pat.finditer(blob):
+                                    val = (m2.group(1) if m2.lastindex else m2.group(0)).strip()
+                                    if val: _add(bucket, label, val, category, 'state_blob')
+                            except Exception: pass
+                    except Exception: pass
+
+                # 3. data-* attribute scan
+                _da_pat = self._re.compile(
+                    r'data-(?:key|api[-_]?key|client[-_]?id|merchant[-_]?id|'
+                    r'pub(?:lishable)?[-_]?key|app[-_]?id|token)\s*=\s*["\']([A-Za-z0-9+/=_.\-]{{8,200}})["\']',
+                    self._re.I,
+                )
+                for m in _da_pat.finditer(html):
+                    an = self._re.search(r'data-([\w\-]+)', m.group(0), self._re.I)
+                    k = an.group(1) if an else 'data-attr'
+                    _add('data_attrs', k, m.group(1), 'html_data_attr', '<html data-*>')
+
+                # 4. Broad window.UPPER = "value" scan
+                _win = self._re.compile(
+                    r'window\.((?:__)?[A-Z_][A-Z0-9_]{{2,40}}(?:__)?)\s*=\s*["\']([A-Za-z0-9+/=_.\-]{{6,200}})["\']'
+                )
+                _skip = {{'onload','onerror','location','document','navigator','history'}}
+                for m in _win.finditer(html):
+                    k, v = m.group(1), m.group(2)
+                    if k not in _skip and k not in out['raw_window']:
+                        out['raw_window'][k] = v[:200]
+                out['raw_window'] = dict(list(out['raw_window'].items())[:30])
+                return out
+
+            def print_report(self, result: dict):
+                """Pretty-print extracted config to stdout."""
+                total = sum(len(result[b]) for b in
+                            ('api_keys','merchant_ids','config_objects','env_vars','data_attrs'))
+                print(f"\\n{'═'*56}")
+                print(f"  CLIENT CONFIG EXTRACTION — {{total}} vars found")
+                print('─'*56)
+                labels = {{'api_keys':'🔑 API Keys','merchant_ids':'🏷️  Merchant IDs',
+                           'config_objects':'⚙️  Config Objects','env_vars':'📦 Env/Build',
+                           'data_attrs':'🏷️  data-* attrs'}}
+                for bucket, label in labels.items():
+                    items = result.get(bucket, [])
+                    if not items: continue
+                    print(f"\\n  {{label}}  ({{len(items)}})")
+                    for e in items:
+                        v = e['value']
+                        preview = v[:60] + ('…' if len(v)>60 else '')
+                        print(f"    {{e['key']:<32}}  {{preview}}")
+                if result.get('raw_window'):
+                    print(f"\\n  🌐 window.* globals  ({{len(result['raw_window'])}})")
+                    for k, v in list(result['raw_window'].items())[:8]:
+                        print(f"    {{k:<32}}  {{str(v)[:60]}}")
+                print('═'*56)
+
+    ''').lstrip('\n')
+    sc.extend(_CLIENT_CONFIG_SRC.splitlines())
+
     sc.append(_BATCH_SRC)
 
     return '\n'.join(sc) + '\n'
@@ -42066,6 +42949,18 @@ def _build_json_export(data: dict) -> str:
             ) if _an_l else None,
             'both_found': bool(_an_l and _an_c),
         }.items() if v is not None}
+
+    # ── [15] client_config ──────────────────────────────────────
+    _cc = data.get('client_config') or {}
+    _cc_out: dict = {}
+    for _bucket in ('api_keys', 'merchant_ids', 'config_objects', 'env_vars', 'data_attrs'):
+        _items = _cc.get(_bucket, [])
+        if _items:
+            _cc_out[_bucket] = _items
+    if _cc.get('raw_window'):
+        _cc_out['raw_window'] = _cc['raw_window']
+    if _cc_out:
+        out['client_config'] = _cc_out
 
     safe = _sanitize_for_json(out)
     return json.dumps(safe, indent=2, ensure_ascii=False)
