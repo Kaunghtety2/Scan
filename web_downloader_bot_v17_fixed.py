@@ -39793,6 +39793,7 @@ def _build_python_script(data: dict) -> str:
     _wc_pay_keys = _wincfg.get('summary', {}).get('payment_keys', []) or []
     _wc_merch    = _wincfg.get('summary', {}).get('merchant_ids',  []) or []
     _wc_env      = _wincfg.get('summary', {}).get('env_vars',      {}) or {}
+    _an_keys     = data.get('authnet_keys')  # (login_id, client_key) tuple or None
 
     # ── Find best payment form entry ──────────────────────────────────────
     _all = forms + requests_list
@@ -40135,7 +40136,7 @@ def _build_python_script(data: dict) -> str:
 
         def _log_csrf(name: str, value: str, method: str = "html_parse"):
             if value:
-                log.info(f"CSRF token  : {{name}} = {{value[:30]}}{'…' if len(value) > 30 else ''}")
+                log.info(f"CSRF token  : {{name}} = {{(value[:30] + '…') if len(value) > 30 else value}}")
                 log.debug(f"CSRF method : {{method}}")
             else:
                 log.warning(f"CSRF token  : NOT FOUND (field: {{name or 'unknown'}})")
