@@ -33976,6 +33976,324 @@ def _extract_window_config(html: str, js_text: str) -> dict:
 
 
 
+def _analyze_state_session(client_storage: dict, auth_cookies: list, live_result: dict) -> dict:
+    """
+    Feature 4 — State & Session Analysis
+    Collects all active cookies and localStorage/sessionStorage items,
+    then classifies which ones are essential for maintaining the session state.
+    """
+    _ESSENTIAL_COOKIE_PATTERNS = re.compile(
+        r'session|sess|auth|token|jwt|access|refresh|remember|logged|login|'
+        r'phpsessid|asp\.net_session|jsessionid|csrf|xsrf|nonce|sid|uid|'
+        r'user_?id|account|identity|passport|bearer|oauth|sso|saml|openid',
+        re.I,
+    )
+    _ESSENTIAL_STORAGE_PATTERNS = re.compile(
+        r'token|auth|session|user|profile|account|access|refresh|jwt|'
+        r'logged|login|csrf|xsrf|nonce|identity|credential|oauth|sso|'
+        r'cart|basket|order|checkout|payment|customer|member|subscriber',
+        re.I,
+    )
+    _EXPIRY_PATTERNS = re.compile(
+        r'exp(?:iry|ires?|_at)?|ttl|max.?age|valid.?until|not.?after', re.I
+    )
+
+    # ── Cookies ───────────────────────────────────────────────────────────
+    all_cookies   = []
+    seen_ck_names = set()
+
+    # From auth_cookie analysis (security-flagged cookies)
+    for ck in (auth_cookies or []):
+        nm = ck.get('name', '')
+        if not nm or nm in seen_ck_names:
+            continue
+        seen_ck_names.add(nm)
+        is_essential = bool(_ESSENTIAL_COOKIE_PATTERNS.search(nm))
+        all_cookies.append({
+            'name':      nm,
+            'value':     ck.get('value', '')[:80] or '<set-by-server>',
+            'flags':     ck.get('flags', []),
+            'essential': is_essential,
+            'reason':    _cookie_essential_reason(nm) if is_essential else '',
+            'source':    'response-header',
+        })
+
+    # From live_result cookies (captured during Playwright intercept)
+    for lr in (live_result or {}).get('live_requests', []):
+        for raw_ck in (lr.get('cookies') or []):
+            nm = raw_ck if isinstance(raw_ck, str) else raw_ck.get('name', '')
+            if not nm or nm in seen_ck_names:
+                continue
+            seen_ck_names.add(nm)
+            is_essential = bool(_ESSENTIAL_COOKIE_PATTERNS.search(nm))
+            all_cookies.append({
+                'name':      nm,
+                'value':     (raw_ck.get('value', '')[:80]
+                              if isinstance(raw_ck, dict) else '<intercepted>'),
+                'flags':     [],
+                'essential': is_essential,
+                'reason':    _cookie_essential_reason(nm) if is_essential else '',
+                'source':    'live-intercept',
+            })
+
+    # ── localStorage / sessionStorage ─────────────────────────────────────
+    all_storage = []
+    _ls = (client_storage or {}).get('localStorage',   {})
+    _ss = (client_storage or {}).get('sessionStorage', {})
+
+    for store_name, store_dict in [('localStorage', _ls), ('sessionStorage', _ss)]:
+        if not isinstance(store_dict, dict):
+            continue
+        for k, v in list(store_dict.items())[:50]:
+            is_essential = bool(_ESSENTIAL_STORAGE_PATTERNS.search(k))
+            has_expiry   = bool(_EXPIRY_PATTERNS.search(k))
+            # Treat JWT-like values as always essential
+            if isinstance(v, str) and v.startswith('eyJ'):
+                is_essential = True
+            all_storage.append({
+                'store':     store_name,
+                'key':       k,
+                'value':     str(v)[:100] if v else '',
+                'essential': is_essential,
+                'has_expiry_hint': has_expiry,
+                'reason':    _storage_essential_reason(k, v) if is_essential else '',
+            })
+
+    essential_cookies  = [c for c in all_cookies  if c['essential']]
+    essential_storage  = [s for s in all_storage  if s['essential']]
+
+    return {
+        'cookies':          all_cookies,
+        'storage':          all_storage,
+        'essential_cookies': essential_cookies,
+        'essential_storage': essential_storage,
+        'summary': {
+            'total_cookies':         len(all_cookies),
+            'essential_cookies':     len(essential_cookies),
+            'total_storage_items':   len(all_storage),
+            'essential_storage_items': len(essential_storage),
+        },
+    }
+
+
+def _cookie_essential_reason(name: str) -> str:
+    """Return a human-readable reason why a cookie is session-essential."""
+    nl = name.lower()
+    if re.search(r'phpsessid|jsessionid|asp\.net_session|sid$', nl):
+        return 'Server-side session identifier — must be sent with every request'
+    if re.search(r'jwt|access.?token|bearer', nl):
+        return 'JWT / access token — authenticates the user on each request'
+    if re.search(r'refresh', nl):
+        return 'Refresh token — used to obtain new access tokens silently'
+    if re.search(r'csrf|xsrf|nonce', nl):
+        return 'CSRF / nonce token — required to pass server-side forgery check'
+    if re.search(r'remember|logged|auth|login', nl):
+        return 'Persistent auth marker — keeps the user logged in across sessions'
+    if re.search(r'session|sess', nl):
+        return 'Session cookie — ties browser to a server-side session'
+    if re.search(r'oauth|sso|saml|openid', nl):
+        return 'SSO / federated auth cookie — required for OAuth / SAML flow'
+    return 'Matches session-essential pattern'
+
+
+def _storage_essential_reason(key: str, value) -> str:
+    """Return a human-readable reason why a storage item is session-essential."""
+    kl = key.lower()
+    if isinstance(value, str) and value.startswith('eyJ'):
+        return 'JWT value — carry in Authorization header for API calls'
+    if re.search(r'access.?token|bearer', kl):
+        return 'Access token — API authentication credential'
+    if re.search(r'refresh.?token', kl):
+        return 'Refresh token — used to silently renew access token'
+    if re.search(r'csrf|xsrf|nonce', kl):
+        return 'Anti-CSRF / nonce — must be submitted with state-changing requests'
+    if re.search(r'session|auth|logged|login', kl):
+        return 'Session / auth state — determines authenticated context'
+    if re.search(r'cart|basket|order|checkout', kl):
+        return 'Cart / order state — lost if cleared before checkout completes'
+    if re.search(r'user|profile|account|customer|member', kl):
+        return 'User identity data — required to personalise and authorise requests'
+    return 'Matches session-essential storage pattern'
+
+
+def _trace_event_flow(html: str, js_text: str, forms: list) -> dict:
+    """
+    Feature 5 — Event Flow Tracing
+    Identifies the primary CTA (submit / pay) button, its attached JavaScript
+    event listeners, and form submission attributes (action / method / enctype).
+    """
+    from html.parser import HTMLParser
+
+    # ── Step A: Collect all <button> / <input type=submit> candidates ─────
+    _BTN_RE = re.compile(
+        r'<(?:button|input)[^>]*(?:type\s*=\s*["\']?(?:submit|button)["\']?)?[^>]*>',
+        re.I | re.S,
+    )
+    _CTA_KEYWORDS = re.compile(
+        r'pay|submit|checkout|place.?order|confirm|buy|purchase|complete|'
+        r'proceed|continue|donate|subscribe|register|sign.?up|book|reserve',
+        re.I,
+    )
+    _ID_RE    = re.compile(r'\bid\s*=\s*["\']([^"\']+)["\']',    re.I)
+    _CLASS_RE = re.compile(r'\bclass\s*=\s*["\']([^"\']+)["\']', re.I)
+    _NAME_RE  = re.compile(r'\bname\s*=\s*["\']([^"\']+)["\']',  re.I)
+    _TYPE_RE  = re.compile(r'\btype\s*=\s*["\']([^"\']+)["\']',  re.I)
+    _VAL_RE   = re.compile(r'\bvalue\s*=\s*["\']([^"\']+)["\']', re.I)
+
+    # ── Step B: Score each button candidate ───────────────────────────────
+    cta_candidates = []
+    for m in _BTN_RE.finditer(html or ''):
+        tag      = m.group(0)
+        tag_text = re.sub(r'<[^>]+>', '', tag).strip()  # inner text for <button>
+        btn_id   = (_ID_RE.search(tag)    or type('', (), {'group': lambda s, n: ''})()).group(1)
+        btn_cls  = (_CLASS_RE.search(tag) or type('', (), {'group': lambda s, n: ''})()).group(1)
+        btn_name = (_NAME_RE.search(tag)  or type('', (), {'group': lambda s, n: ''})()).group(1)
+        btn_type = (_TYPE_RE.search(tag)  or type('', (), {'group': lambda s, n: ''})()).group(1)
+        btn_val  = (_VAL_RE.search(tag)   or type('', (), {'group': lambda s, n: ''})()).group(1)
+
+        combined = ' '.join(filter(None, [tag_text, btn_id, btn_cls, btn_name, btn_val]))
+        score    = 0
+        if _CTA_KEYWORDS.search(combined):
+            score += 10
+        if btn_type and btn_type.lower() == 'submit':
+            score += 5
+        if 'primary' in (btn_cls or '').lower() or 'btn-' in (btn_cls or '').lower():
+            score += 3
+        if score == 0:
+            continue
+
+        cta_candidates.append({
+            'tag':      tag[:200],
+            'id':       btn_id,
+            'class':    btn_cls,
+            'name':     btn_name,
+            'type':     btn_type or 'button',
+            'value':    btn_val,
+            'text':     tag_text[:100],
+            'score':    score,
+        })
+
+    cta_candidates.sort(key=lambda x: x['score'], reverse=True)
+    primary_cta = cta_candidates[0] if cta_candidates else None
+
+    # ── Step C: Extract JS event listeners for the CTA ────────────────────
+    _listeners = []
+    if primary_cta:
+        # Collect identifiers to search in JS
+        idents = list(filter(None, [
+            primary_cta.get('id'),
+            primary_cta.get('name'),
+            primary_cta.get('class', '').split()[0] if primary_cta.get('class') else '',
+        ]))
+
+        # 1. Inline onclick / onsubmit in tag itself
+        _INLINE_EV_RE = re.compile(
+            r'(?:on(?:click|submit|change|keyup|keydown|mousedown|touchstart))'
+            r'\s*=\s*["\']([^"\']{1,200})["\']',
+            re.I,
+        )
+        for ev_m in _INLINE_EV_RE.finditer(primary_cta.get('tag', '')):
+            _listeners.append({
+                'type':   ev_m.group(0).split('=')[0].strip().lower(),
+                'source': 'inline-html-attribute',
+                'handler': ev_m.group(1)[:200],
+            })
+
+        # 2. addEventListener / jQuery .on() calls referencing CTA id/class/name
+        _ADDEV_RE = re.compile(
+            r'(?:addEventListener\s*\(\s*["\'](\w+)["\']|'
+            r'\.on\s*\(\s*["\'](\w+)["\'])\s*,\s*(?:function|\w+)',
+            re.I,
+        )
+        for ident in idents[:3]:
+            if not ident:
+                continue
+            # Locate JS blocks that reference the identifier
+            _CTX_RE = re.compile(
+                r'(?:getElementById|querySelector|getElementByName|\.find)\s*'
+                r'\(\s*["\']#?' + re.escape(ident) + r'["\'][^)]*\)'
+                r'.{0,600}',
+                re.I | re.S,
+            )
+            for ctx_m in _CTX_RE.finditer(js_text or ''):
+                ctx = ctx_m.group(0)
+                for ev_m in _ADDEV_RE.finditer(ctx):
+                    ev_type = ev_m.group(1) or ev_m.group(2) or ''
+                    if ev_type and not any(
+                            l['type'] == ev_type and l['source'] != 'inline-html-attribute'
+                            for l in _listeners):
+                        _listeners.append({
+                            'type':    ev_type,
+                            'source':  f'addEventListener / .on() for #{ident}',
+                            'handler': ctx[:200].replace('\n', ' ').strip(),
+                        })
+
+        # 3. Delegate listeners on form / document (submit, click)
+        _DELEGATE_RE = re.compile(
+            r'(?:document|window|body|\$\(document\))'
+            r'[^;]{0,120}'
+            r'(?:addEventListener|\.on)\s*\(\s*["\']'
+            r'(submit|click|payment\.?submit|checkout\.?submit)'
+            r'["\'][^;]{0,300}',
+            re.I | re.S,
+        )
+        for d_m in _DELEGATE_RE.finditer(js_text or ''):
+            ev_type = d_m.group(1) or ''
+            if ev_type and not any(l['type'] == ev_type for l in _listeners):
+                _listeners.append({
+                    'type':    ev_type,
+                    'source':  'document/window delegate listener',
+                    'handler': d_m.group(0)[:200].replace('\n', ' ').strip(),
+                })
+
+    # ── Step D: Form submission attributes ────────────────────────────────
+    form_attrs = []
+    for frm in (forms or []):
+        endpoint = frm.get('endpoint') or frm.get('action', '')
+        if not endpoint:
+            continue
+        form_attrs.append({
+            'action':  endpoint,
+            'method':  (frm.get('method') or 'POST').upper(),
+            'enctype': frm.get('enctype') or 'application/x-www-form-urlencoded',
+            'is_payment': frm.get('is_payment', False),
+            'source':  frm.get('source', ''),
+        })
+
+    # Also parse raw <form> tags for action/method/enctype not already captured
+    _FORM_TAG_RE = re.compile(r'<form[^>]*>', re.I | re.S)
+    _ACT_RE      = re.compile(r'\baction\s*=\s*["\']([^"\']+)["\']',  re.I)
+    _MTH_RE      = re.compile(r'\bmethod\s*=\s*["\']([^"\']+)["\']',  re.I)
+    _ENC_RE      = re.compile(r'\benctype\s*=\s*["\']([^"\']+)["\']', re.I)
+    _existing_ep = {fa['action'] for fa in form_attrs}
+    for fm in _FORM_TAG_RE.finditer(html or ''):
+        act = (_ACT_RE.search(fm.group(0)) or type('', (), {'group': lambda s, n: ''})()).group(1)
+        mth = (_MTH_RE.search(fm.group(0)) or type('', (), {'group': lambda s, n: ''})()).group(1)
+        enc = (_ENC_RE.search(fm.group(0)) or type('', (), {'group': lambda s, n: ''})()).group(1)
+        if act and act not in _existing_ep:
+            form_attrs.append({
+                'action':     act,
+                'method':     (mth or 'POST').upper(),
+                'enctype':    enc or 'application/x-www-form-urlencoded',
+                'is_payment': False,
+                'source':     'raw-html-parse',
+            })
+            _existing_ep.add(act)
+
+    return {
+        'cta_candidates': cta_candidates[:5],
+        'primary_cta':    primary_cta,
+        'event_listeners': _listeners,
+        'form_submission': form_attrs,
+        'summary': {
+            'cta_found':        primary_cta is not None,
+            'listener_count':   len(_listeners),
+            'listener_types':   list({l['type'] for l in _listeners}),
+            'form_count':       len(form_attrs),
+        },
+    }
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     import traceback as _tb_mod
@@ -35243,6 +35561,37 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
             f"({_wc_pay} payment key(s))"
         )
 
+    # ── Feature 4: State & Session Analysis ───────────────────────────────
+    _safe_cb("🍪 State & Session: extracting active cookies + storage items...")
+    _state_session = _analyze_state_session(client_storage, auth_cookies, live_result)
+    if progress_cb:
+        _ss_sum = _state_session.get('summary', {})
+        progress_cb(
+            f"🍪 Session state: "
+            f"{_ss_sum.get('essential_cookies', 0)} essential cookie(s), "
+            f"{_ss_sum.get('essential_storage_items', 0)} essential storage item(s)"
+        )
+
+    # ── Feature 5: Event Flow Tracing ─────────────────────────────────────
+    _safe_cb("⚡ Event Flow: identifying CTA + JS event listeners...")
+    _event_flow = _trace_event_flow(
+        (static_html or '') + (js_html or ''),
+        js_text,
+        static_forms + js_forms + subpage_forms,
+    )
+    if progress_cb:
+        _ef_sum  = _event_flow.get('summary', {})
+        _cta_lbl = (
+            (_event_flow.get('primary_cta') or {}).get('text') or
+            (_event_flow.get('primary_cta') or {}).get('id') or
+            'not detected'
+        )[:40]
+        progress_cb(
+            f"⚡ CTA: \"{_cta_lbl}\" — "
+            f"{_ef_sum.get('listener_count', 0)} listener(s): "
+            f"{', '.join(_ef_sum.get('listener_types', [])) or 'none detected'}"
+        )
+
     return {
         'url':               url,
         'base_url':          base_url,
@@ -35298,6 +35647,8 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                    base_url,
                                ),
         'window_config':     _window_config,
+        'state_session':     _state_session,
+        'event_flow':        _event_flow,
         'payment_flow_analysis': {
             'flow_sequence':   _flow_sequence,
             'dependencies':    _dependencies,
@@ -36420,6 +36771,88 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
             )
             for i in iss[:2]:
                 lines.append(f"    _{escape_md(i)}_")
+
+    # ── STATE & SESSION ANALYSIS (Feature 4) ─────────────────
+    _ss = data.get('state_session') or {}
+    _ss_sum = _ss.get('summary') or {}
+    if _ss_sum.get('total_cookies', 0) or _ss_sum.get('total_storage_items', 0):
+        lines.append(_sec("State & Session Analysis", "🍪"))
+        _ess_ck = _ss.get('essential_cookies') or []
+        _ess_st = _ss.get('essential_storage') or []
+        _all_ck = _ss.get('cookies') or []
+        _all_st = _ss.get('storage') or []
+        lines.append(
+            f"  Cookies: `{_ss_sum.get('total_cookies', 0)}` active  "
+            f"(`{_ss_sum.get('essential_cookies', 0)}` session\\-essential)"
+        )
+        lines.append(
+            f"  Storage: `{_ss_sum.get('total_storage_items', 0)}` items  "
+            f"(`{_ss_sum.get('essential_storage_items', 0)}` session\\-essential)"
+        )
+        if _ess_ck:
+            lines.append("  *Essential Cookies:*")
+            for _ck in _ess_ck[:6]:
+                _flag_str = '  '.join(_ck.get('flags', [])[:3])
+                lines.append(
+                    f"  🔑 `{raw_code(_ck['name'], 28)}`"
+                    + (f"  `{raw_code(_flag_str)}`" if _flag_str else '')
+                )
+                if _ck.get('reason'):
+                    lines.append(f"    _{escape_md(_ck['reason'])}_")
+        _non_ess_ck = [c for c in _all_ck if not c['essential']]
+        if _non_ess_ck:
+            _ne_names = ', '.join(f"`{raw_code(c['name'])}`" for c in _non_ess_ck[:4])
+            lines.append(f"  Non\\-essential: {_ne_names}")
+        if _ess_st:
+            lines.append("  *Essential Storage Items:*")
+            for _st in _ess_st[:6]:
+                _val_prev = str(_st.get('value', ''))[:40]
+                lines.append(
+                    f"  🗄️ `{raw_code(_st['store'])}` → `{raw_code(_st['key'], 28)}`"
+                    + (f"  `{raw_code(_val_prev)}…`" if _val_prev else '')
+                )
+                if _st.get('reason'):
+                    lines.append(f"    _{escape_md(_st['reason'])}_")
+
+    # ── EVENT FLOW TRACING (Feature 5) ────────────────────────
+    _ef = data.get('event_flow') or {}
+    _ef_sum = _ef.get('summary') or {}
+    if _ef_sum.get('cta_found') or _ef_sum.get('form_count', 0):
+        lines.append(_sec("Event Flow Tracing", "⚡"))
+        _cta = _ef.get('primary_cta') or {}
+        if _cta:
+            _cta_label = (_cta.get('text') or _cta.get('value') or
+                          _cta.get('id') or _cta.get('name') or '—')[:50]
+            _cta_id    = _cta.get('id', '')
+            _cta_cls   = ' '.join((_cta.get('class') or '').split()[:3])
+            _cta_type  = _cta.get('type', 'button')
+            lines.append(f"  *Primary CTA Button:*")
+            lines.append(f"  Label: `{raw_code(_cta_label)}`  "
+                         f"Type: `{raw_code(_cta_type)}`")
+            if _cta_id:
+                lines.append(f"  ID: `{raw_code(_cta_id)}`  "
+                              + (f"Class: `{raw_code(_cta_cls)}`" if _cta_cls else ''))
+        _listeners = _ef.get('event_listeners') or []
+        if _listeners:
+            lines.append(f"  *JS Event Listeners* ({len(_listeners)} found):")
+            for _lsn in _listeners[:5]:
+                _handler_prev = str(_lsn.get('handler', ''))[:80].replace('\n', ' ')
+                lines.append(
+                    f"  ⚡ `{raw_code(_lsn['type'])}` — _{escape_md(_lsn['source'])}_"
+                )
+                if _handler_prev:
+                    lines.append(f"    `{raw_code(_handler_prev)}…`")
+        else:
+            lines.append("  ℹ️ _No explicit JS listeners detected \\(may use native form submit\\)_")
+        _form_attrs = _ef.get('form_submission') or []
+        if _form_attrs:
+            lines.append(f"  *Form Submission Attributes:*")
+            for _fa in _form_attrs[:4]:
+                _pay_badge = " 💳" if _fa.get('is_payment') else ''
+                lines.append(
+                    f"  `{raw_code(_fa['method'])}` → `{raw_code(_fa['action'][:70])}`"
+                    f"  enc:`{raw_code(_fa['enctype'][:30])}`{_pay_badge}"
+                )
 
     # ── CSP ───────────────────────────────────────────────────
     csp = data.get('csp_info')
@@ -39497,7 +39930,275 @@ def _build_python_script(data: dict) -> str:
     sc.append('print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
     sc.append('session.dump_state()')
 
-    # Step 2
+    # ── Feature 4: State & Session — inject essential cookies / storage ───
+    # ── Feature 4: State & Session Analysis — full executable block ─────
+    _ss_data        = data.get('state_session') or {}
+    _ess_cookies    = _ss_data.get('essential_cookies') or []
+    _ess_storage    = _ss_data.get('essential_storage') or []
+    _all_cookies_f4 = _ss_data.get('cookies') or []
+    _all_storage_f4 = _ss_data.get('storage') or []
+    sc.append('')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('# 🍪 Feature 4 — State & Session Analysis')
+    sc.append('# Extracted from scan: active cookies + localStorage/sessionStorage')
+    sc.append('# identifies which items are essential to maintain the session state.')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('')
+    # ── 4a: All cookies table (runnable dict) ──────────────────────────────
+    sc.append('# ── 4a. All Active Cookies ─────────────────────────────────────────')
+    sc.append('# Keys: name | value (at scan time) | essential | reason')
+    sc.append('ALL_COOKIES = [')
+    for _ck in _all_cookies_f4[:20]:
+        _ck_n   = _ck.get('name', '').replace('"', '\\"')
+        _ck_v   = str(_ck.get('value', '<server-set>')).replace('"', '\\"')[:60]
+        _ck_ess = _ck.get('essential', False)
+        _ck_rsn = _ck.get('reason', '').replace('"', '\\"')[:80]
+        _ck_src = _ck.get('source', '')
+        sc.append(f'    {{"name": "{_ck_n}", "value": "{_ck_v}", '
+                  f'"essential": {_ck_ess}, "reason": "{_ck_rsn}", "source": "{_ck_src}"}},')
+    sc.append(']')
+    sc.append('')
+    # ── 4b: Essential cookies — pre-seed block ─────────────────────────────
+    if _ess_cookies:
+        sc.append('# ── 4b. Essential Session Cookies ──────────────────────────────────')
+        sc.append('# These cookies maintain the authenticated session.')
+        sc.append('# PayloadSession carries them automatically after the first GET.')
+        sc.append('# Pre-seed below ONLY when replaying a known session (e.g. from DevTools).')
+        sc.append('ESSENTIAL_COOKIES = {')
+        for _ck in _ess_cookies[:10]:
+            _ck_n   = _ck.get('name', '').replace('"', '\\"')
+            _ck_v   = str(_ck.get('value', '<set-by-server>')).replace('"', '\\"')[:60]
+            _ck_rsn = _ck.get('reason', '').replace('"', '\\"')[:80]
+            sc.append(f'    # {_ck_rsn}')
+            sc.append(f'    "{_ck_n}": "{_ck_v}",')
+        sc.append('}')
+        sc.append('')
+        sc.append('def seed_essential_cookies(sess, cookie_dict: dict) -> None:')
+        sc.append('    """Pre-load known session cookies into a PayloadSession."""')
+        sc.append('    for name, value in cookie_dict.items():')
+        sc.append('        sess._s.cookies.set(name, value)')
+        sc.append('        print(f"  🍪 Seeded cookie: {name}={value[:20]}…")')
+        sc.append('')
+        sc.append('# Uncomment to replay a known session:')
+        sc.append('# seed_essential_cookies(session, ESSENTIAL_COOKIES)')
+    else:
+        sc.append('# ── 4b. Essential Session Cookies: none detected at scan time.')
+        sc.append('# Session is likely established automatically via the initial GET.')
+        sc.append('ESSENTIAL_COOKIES = {}')
+    sc.append('')
+    # ── 4c: localStorage / sessionStorage dump ─────────────────────────────
+    sc.append('# ── 4c. localStorage / sessionStorage Items ─────────────────────────')
+    sc.append('# Values captured during Playwright scan. Runnable as a static dict.')
+    sc.append('CLIENT_STORAGE = {')
+    if _all_storage_f4:
+        _ls_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'localStorage']
+        _ss_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'sessionStorage']
+        if _ls_items:
+            sc.append('    "localStorage": {')
+            for _k, _s in _ls_items[:15]:
+                _sv  = str(_s.get('value', '')).replace('"', '\\"').replace('\\', '\\\\')[:80]
+                _ess = '  # ★ ESSENTIAL' if _s.get('essential') else ''
+                _rsn = f' — {_s["reason"]}' if _s.get('reason') else ''
+                sc.append(f'        "{_k}": "{_sv}",{_ess}{_rsn}')
+            sc.append('    },')
+        if _ss_items:
+            sc.append('    "sessionStorage": {')
+            for _k, _s in _ss_items[:10]:
+                _sv  = str(_s.get('value', '')).replace('"', '\\"').replace('\\', '\\\\')[:80]
+                _ess = '  # ★ ESSENTIAL' if _s.get('essential') else ''
+                _rsn = f' — {_s["reason"]}' if _s.get('reason') else ''
+                sc.append(f'        "{_k}": "{_sv}",{_ess}{_rsn}')
+            sc.append('    },')
+    else:
+        sc.append('    "localStorage":   {},  # empty at scan time')
+        sc.append('    "sessionStorage": {},')
+    sc.append('}')
+    sc.append('')
+    # ── 4d: JWT / token injection ──────────────────────────────────────────
+    _jwt_items = [s for s in _ess_storage if
+                  str(s.get('value', '')).startswith('eyJ') or
+                  re.search(r'access.?token|refresh.?token|bearer', s.get('key', ''), re.I)]
+    sc.append('# ── 4d. Token Injection from Storage ───────────────────────────────')
+    sc.append('# Reads access/refresh tokens from CLIENT_STORAGE and injects them')
+    sc.append('# into the session Authorization header automatically.')
+    sc.append('def inject_storage_tokens(sess, storage: dict) -> dict:')
+    sc.append('    """')
+    sc.append('    Scan localStorage and sessionStorage for JWT / access tokens.')
+    sc.append('    Injects the first found token as Authorization: Bearer <token>.')
+    sc.append('    Returns dict of all injected {header: value} pairs.')
+    sc.append('    """')
+    sc.append('    import re as _re')
+    sc.append('    _TOKEN_PAT = _re.compile(')
+    sc.append('        r"access.?token|refresh.?token|bearer|jwt|auth.?token|id.?token", _re.I)')
+    sc.append('    injected = {}')
+    sc.append('    for store_name, store_dict in storage.items():')
+    sc.append('        if not isinstance(store_dict, dict):')
+    sc.append('            continue')
+    sc.append('        for k, v in store_dict.items():')
+    sc.append('            if not isinstance(v, str) or not v:')
+    sc.append('                continue')
+    sc.append('            is_jwt   = v.startswith("eyJ") and v.count(".") >= 2')
+    sc.append('            is_token = bool(_TOKEN_PAT.search(k))')
+    sc.append('            if is_jwt or is_token:')
+    sc.append('                header = "Authorization"')
+    sc.append('                value  = f"Bearer {v}" if not v.lower().startswith("bearer") else v')
+    sc.append('                sess._s.headers[header] = value')
+    sc.append('                injected[header] = value[:40] + "…"')
+    sc.append('                print(f"  💉 Injected [{store_name}][{k}] → {header}: {value[:30]}…")')
+    sc.append('                break  # first valid token wins')
+    sc.append('        if injected:')
+    sc.append('            break')
+    sc.append('    if not injected:')
+    sc.append('        print("  ℹ️  No JWT/access token found in CLIENT_STORAGE")')
+    sc.append('    return injected')
+    sc.append('')
+    if _jwt_items:
+        _jk = _jwt_items[0].get('key', '')
+        sc.append(f'# ★ Token detected at scan time: [{_jwt_items[0].get("store","localStorage")}]["{_jk}"]')
+    sc.append('_injected_tokens = inject_storage_tokens(session, CLIENT_STORAGE)')
+
+    # ── Feature 5: Event Flow Tracing — full executable block ─────────────
+    _ef_data     = data.get('event_flow') or {}
+    _cta         = _ef_data.get('primary_cta') or {}
+    _listeners   = _ef_data.get('event_listeners') or []
+    _form_submit = _ef_data.get('form_submission') or []
+    _all_ctas    = _ef_data.get('cta_candidates') or []
+    sc.append('')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('# ⚡ Feature 5 — Event Flow Tracing')
+    sc.append('# Primary CTA button + JS event listeners + form submission attrs.')
+    sc.append('# Simulate the exact click/submit chain the browser fires.')
+    sc.append('# ══════════════════════════════════════════════════════════════════')
+    sc.append('')
+    # ── 5a: CTA identity ──────────────────────────────────────────────────
+    sc.append('# ── 5a. Primary CTA Button ─────────────────────────────────────────')
+    if _cta:
+        _cta_txt = (_cta.get('text') or _cta.get('value') or
+                    _cta.get('id') or '(unknown)')[:60].replace('"', '\\"')
+        _cta_id  = (_cta.get('id') or '').replace('"', '\\"')
+        _cta_cls = ' '.join((_cta.get('class') or '').split()[:6]).replace('"', '\\"')
+        _cta_tp  = (_cta.get('type') or 'button')
+        _cta_nm  = (_cta.get('name') or '').replace('"', '\\"')
+        sc.append('CTA_BUTTON = {')
+        sc.append(f'    "label":   "{_cta_txt}",')
+        sc.append(f'    "type":    "{_cta_tp}",')
+        sc.append(f'    "id":      "{_cta_id}",')
+        sc.append(f'    "name":    "{_cta_nm}",')
+        sc.append(f'    "class":   "{_cta_cls}",')
+        sc.append(f'    "score":   {_cta.get("score", 0)},')
+        sc.append('}')
+        if len(_all_ctas) > 1:
+            sc.append(f'# Other CTA candidates ({len(_all_ctas) - 1} more):')
+            for _alt in _all_ctas[1:4]:
+                _alt_lbl = (_alt.get('text') or _alt.get('id') or '')[:40].replace('"', '\\"')
+                sc.append(f'#   score={_alt.get("score",0)}  label="{_alt_lbl}"  '
+                          f'id="{_alt.get("id","")}"')
+    else:
+        sc.append('CTA_BUTTON = {}  # no CTA button detected — form may auto-submit')
+    sc.append('')
+    # ── 5b: Event listener registry ───────────────────────────────────────
+    sc.append('# ── 5b. JavaScript Event Listeners ─────────────────────────────────')
+    sc.append('# Detected listeners attached to the CTA or form submit chain.')
+    sc.append('EVENT_LISTENERS = [')
+    if _listeners:
+        for _lsn in _listeners[:10]:
+            _et   = _lsn.get('type', '').replace('"', '\\"')
+            _src  = _lsn.get('source', '').replace('"', '\\"')
+            _hndl = str(_lsn.get('handler', '')).replace('"', '\\"').replace('\n', ' ')[:120]
+            sc.append(f'    {{')
+            sc.append(f'        "event_type": "{_et}",')
+            sc.append(f'        "source":     "{_src}",')
+            sc.append(f'        "handler":    "{_hndl}",')
+            sc.append(f'    }},')
+    else:
+        sc.append('    # No explicit JS listeners found — form uses native HTML submit')
+    sc.append(']')
+    sc.append('')
+    # ── 5c: Form submission attributes ────────────────────────────────────
+    sc.append('# ── 5c. Form Submission Attributes ─────────────────────────────────')
+    sc.append('FORM_SUBMIT_ATTRS = [')
+    if _form_submit:
+        for _fa in _form_submit[:8]:
+            _fa_act = _fa.get('action', '').replace('"', '\\"')[:120]
+            _fa_mth = (_fa.get('method') or 'POST').upper()
+            _fa_enc = (_fa.get('enctype') or 'application/x-www-form-urlencoded').replace('"', '\\"')
+            _fa_pay = _fa.get('is_payment', False)
+            _fa_src = _fa.get('source', '').replace('"', '\\"')
+            sc.append(f'    {{')
+            sc.append(f'        "action":     "{_fa_act}",')
+            sc.append(f'        "method":     "{_fa_mth}",')
+            sc.append(f'        "enctype":    "{_fa_enc}",')
+            sc.append(f'        "is_payment": {_fa_pay},')
+            sc.append(f'        "source":     "{_fa_src}",')
+            sc.append(f'    }},')
+    else:
+        sc.append('    # No form submission attributes detected')
+    sc.append(']')
+    sc.append('')
+    # ── 5d: simulate_cta_click() helper ───────────────────────────────────
+    sc.append('# ── 5d. CTA Click Simulator ─────────────────────────────────────────')
+    sc.append('# Replicates the browser event flow:')
+    sc.append('#   mousedown → mouseup → click → [validate] → submit → POST')
+    sc.append('def simulate_cta_click(sess, post_body: dict,')
+    sc.append('                       listeners: list = None,')
+    sc.append('                       form_attrs: list = None) -> "requests.Response | None":')
+    sc.append('    """')
+    sc.append('    Simulate the CTA button click and form submission sequence.')
+    sc.append('')
+    sc.append('    Steps:')
+    sc.append('      1. Fire any pre-submit JS listener side-effects (headers / tokens).')
+    sc.append('      2. Determine submit URL and method from form_attrs.')
+    sc.append('      3. Send the POST with the assembled post_body.')
+    sc.append('      4. Return the raw Response for further analysis.')
+    sc.append('    """')
+    sc.append('    listeners  = listeners  or EVENT_LISTENERS')
+    sc.append('    form_attrs = form_attrs or FORM_SUBMIT_ATTRS')
+    sc.append('')
+    sc.append('    # ── Step 5d-1: Pre-submit listener side-effects ──────────────')
+    sc.append('    _click_headers = {}')
+    sc.append('    for _lsn in listeners:')
+    sc.append('        _et = _lsn.get("event_type", "").lower()')
+    sc.append('        _hd = _lsn.get("handler", "").lower()')
+    sc.append('        # If listener sets X-Requested-With / X-AJAX header:')
+    sc.append('        if "xmlhttprequest" in _hd or "ajax" in _hd or "fetch" in _hd:')
+    sc.append('            _click_headers["X-Requested-With"] = "XMLHttpRequest"')
+    sc.append('        # If listener sets custom content-type to JSON:')
+    sc.append('        if "json" in _hd and "application/json" not in str(sess._s.headers):')
+    sc.append('            _click_headers["Content-Type"] = "application/json"')
+    sc.append('    if _click_headers:')
+    sc.append('        print(f"  ⚡ Listener side-effects → headers: {list(_click_headers.keys())}")')
+    sc.append('')
+    sc.append('    # ── Step 5d-2: Resolve submit endpoint ───────────────────────')
+    sc.append('    _pay_forms  = [f for f in form_attrs if f.get("is_payment") and f.get("action")]')
+    sc.append('    _any_forms  = [f for f in form_attrs if f.get("action")]')
+    sc.append('    _best_form  = (_pay_forms or _any_forms or [{}])[0]')
+    sc.append('    _submit_url = _best_form.get("action", "")')
+    sc.append('    _method     = _best_form.get("method", "POST").upper()')
+    sc.append('    _enctype    = _best_form.get("enctype", "application/x-www-form-urlencoded")')
+    sc.append('')
+    sc.append('    if not _submit_url:')
+    sc.append('        print("  ⚠️  No form action found — cannot simulate submit")')
+    sc.append('        return None')
+    sc.append('')
+    sc.append('    print(f"  ⚡ Simulating CTA click → {_method} {_submit_url}")')
+    sc.append('')
+    sc.append('    # ── Step 5d-3: Send the request ──────────────────────────────')
+    sc.append('    _is_json = "json" in _enctype.lower()')
+    sc.append('    _kw = {"json": post_body} if _is_json else {"data": post_body}')
+    sc.append('    try:')
+    sc.append('        if _method == "POST":')
+    sc.append('            resp = sess.post(_submit_url, headers=_click_headers, **_kw, timeout=20,')
+    sc.append('                             allow_redirects=True)')
+    sc.append('        else:')
+    sc.append('            resp = sess.get(_submit_url, headers=_click_headers,')
+    sc.append('                            params=post_body, timeout=20, allow_redirects=True)')
+    sc.append('        print(f"  ✅ Response: HTTP {resp.status_code}  "')
+    sc.append('              f"({len(resp.content)} bytes)")')
+    sc.append('        return resp')
+    sc.append('    except Exception as _e:')
+    sc.append('        print(f"  ❌ Request failed: {_e}")')
+    sc.append('        return None')
+
     if gw_name in ('Stripe', 'Braintree', 'Adyen') or hosted.get('gateway'):
         sc.append('')
         sc.extend(_tokenize_step())
@@ -39548,19 +40249,29 @@ def _build_python_script(data: dict) -> str:
     _ct_header = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
 
     if submit_url:
-        sc.append(f'resp = session.{method.lower()}(')
-        sc.append(f'    "{submit_url}",')
-        sc.append(f'    {"json" if is_json_enc else "data"}=post_body,')
-        sc.append('    headers={')
-        sc.append(f'        "Content-Type": "{_ct_header}",')
-        sc.append('        # Referer, Origin, X-CSRF-Token auto-set by PayloadSession')
-        sc.append('    },')
-        sc.append('    timeout=20,')
-        sc.append('    allow_redirects=True,')
-        sc.append(')')
+        sc.append('# ── Step 3b: Submit via simulate_cta_click (Feature 5) ───────────────')
+        sc.append('# simulate_cta_click fires pre-submit listener side-effects,')
+        sc.append('# resolves the best form action, then sends the POST — matching')
+        sc.append('# the exact browser event flow captured by Event Flow Tracing.')
+        sc.append('resp = simulate_cta_click(session, post_body)')
+        sc.append('')
+        sc.append('# Fallback: direct POST if simulate_cta_click returns None')
+        sc.append('if resp is None:')
+        sc.append(f'    resp = session.{method.lower()}(')
+        sc.append(f'        "{submit_url}",')
+        sc.append(f'        {"json" if is_json_enc else "data"}=post_body,')
+        sc.append('        headers={')
+        sc.append(f'            "Content-Type": "{_ct_header}",')
+        sc.append('            # Referer, Origin, X-CSRF-Token auto-set by PayloadSession')
+        sc.append('        },')
+        sc.append('        timeout=20,')
+        sc.append('        allow_redirects=True,')
+        sc.append('    )')
     else:
-        sc.append('# ⚠️ Submit endpoint not detected — check scan results')
-        sc.append('resp = None')
+        sc.append('# ⚠️ Submit endpoint not detected — running simulate_cta_click with empty form_attrs')
+        sc.append('resp = simulate_cta_click(session, post_body)')
+        sc.append('if resp is None:')
+        sc.append('    print("⚠️ No endpoint found — resp is None, check scan results")')
 
     # ── ResponseAnalysisEngine class ──────────────────────────────────────
     sc += [
@@ -41555,6 +42266,8 @@ async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("🗺️", "Payment flow sequence mapping",       ["Building payment flow sequence", "payment flow sequence"]),
         ("🔗", "Request dependency mapping",           ["Mapping request dependencies", "request dependencies"]),
         ("🔐", "Encryption logic replication",         ["Detecting and replicating encryption", "encryption logic"]),
+        ("🍪", "State & Session Analysis",              ["State & Session", "essential cookie", "storage item"]),
+        ("⚡", "Event Flow Tracing",                    ["Event Flow", "CTA", "event listener", "JS listener"]),
     ]
     TOTAL_PHASES = len(_PAYLOAD_PHASES)
 
