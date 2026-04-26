@@ -34221,7 +34221,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
         html    = (static_html or "") + (js_html or ""),
         js_text = js_text,
         headers = getattr(_engine, '_last_headers', {}),
-        cookies = {c.name: c.value for c in getattr(_engine, 'cookies', [])},
+        cookies = (lambda _raw: {c.name: c.value for c in _raw} if _raw and hasattr(next(iter(_raw), None), 'name') else (_raw if isinstance(_raw, dict) else {}))(getattr(_engine, 'cookies', {})),
     )
     if _waf_results and progress_cb:
         _waf_names = ', '.join(w['vendor'] for w in _waf_results[:3])
