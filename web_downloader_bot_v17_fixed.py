@@ -5432,10 +5432,38 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'captcha[_\-]?key\s*[=:]\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
     ],
     "reCAPTCHA v3": [
+        # ── grecaptcha.execute() — standard v3 call ───────────────────────────
         re.compile(r'grecaptcha\.execute\s*\(\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
         re.compile(r'grecaptcha\.execute\s*\(\s*([6L][A-Za-z0-9_\-]{38})\s*,', re.I),
-        re.compile(r'\/recaptcha\/api\.js\?render=([0-9A-Za-z_\-]{40})', re.I),
+        re.compile(r'grecaptcha\.ready\s*\([^)]{0,200}grecaptcha\.execute\s*\(\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I | re.S),
+        # ── api.js?render= loader URL variants ───────────────────────────────
+        re.compile(r'\/recaptcha\/api\.js[^"\']*[?&]render=([6L][A-Za-z0-9_\-]{38})', re.I),
+        re.compile(r'www\.google\.com\/recaptcha\/api\.js[^"\']*render=([6L][A-Za-z0-9_\-]{38})', re.I),
+        re.compile(r'recaptcha\.net\/recaptcha\/api\.js[^"\']*render=([6L][A-Za-z0-9_\-]{38})', re.I),
+        # ── 'render' key in config objects ───────────────────────────────────
         re.compile(r'["\']render["\']\s*:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── Generic sitekey/captchaKey assignment ─────────────────────────────
+        re.compile(r'(?:sitekey|site_key|captcha_key|captchaKey|recaptchaKey|recaptcha_key|recaptcha_site_key|recaptchaSiteKey)\s*[=:]\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── Environment variable inlining (Vite/CRA/Next.js/Nuxt) ────────────
+        re.compile(r'(?:VITE_|REACT_APP_|NEXT_PUBLIC_|NUXT_PUBLIC_)?(?:RECAPTCHA|CAPTCHA|GRECAPTCHA)[_\-](?:SITE[_\-]?KEY|KEY|PUBLIC[_\-]KEY)\s*[=:]\s*["\']?([6L][A-Za-z0-9_\-]{38})["\']?', re.I),
+        # ── WordPress / plugin config objects ─────────────────────────────────
+        re.compile(r'(?:wpforms|wpcf7|formidable|gravityforms|ninja_forms|wc_checkout_params|woocommerce_params|recaptcha_config)\s*=\s*\{[^}]{0,400}["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I | re.S),
+        # ── PHP inline JSON / Laravel / Symfony / Django ──────────────────────
+        re.compile(r'["\']recaptcha[_\-]?(?:site[_\-]?)?key["\']\s*[=:>]\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── window.* globals ─────────────────────────────────────────────────
+        re.compile(r'window\s*\.\s*(?:___?)?(?:grecaptcha|recaptcha)[_A-Za-z]*(?:Site[_]?Key|_key|Key|sitekey)?\s*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'var\s+(?:___?)?(?:recaptcha|captcha|grecaptcha)[A-Za-z_]*\s*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── HTML data-* attributes ────────────────────────────────────────────
+        re.compile(r'data-(?:recaptcha-)?(?:site-?key|sitekey)\s*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── Meta tags ────────────────────────────────────────────────────────
+        re.compile(r'<meta[^>]+name=["\'](?:recaptcha|google-recaptcha)[^"\']*["\'][^>]*content=["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── JSON config blobs / __NEXT_DATA__ ────────────────────────────────
+        re.compile(r'"(?:siteKey|site_key|recaptchaSiteKey|recaptchaKey|captchaKey)"\s*:\s*"([6L][A-Za-z0-9_\-]{38})"', re.I),
+        # ── React / Vue component props ───────────────────────────────────────
+        re.compile(r'siteKey\s*=\s*\{["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r':siteKey\s*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        # ── Broad 6L fallback ─────────────────────────────────────────────────
+        re.compile(r'(?<![A-Za-z0-9_\-])([6L][A-Za-z0-9_\-]{38})(?![A-Za-z0-9_\-])', re.I),
     ],
     "reCAPTCHA Enterprise": [
         re.compile(r'grecaptcha\.enterprise\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
@@ -26311,8 +26339,6 @@ def _detect_checkout_steps(html: str, js_text: str, url: str) -> dict:
     """
     html    = html    or ""
     js_text = js_text or ""
-    html    = html    or ""
-    js_text = js_text or ""
     combined = html + js_text
     steps_found: list[dict] = []
     current_step: int | None = None
@@ -26679,6 +26705,8 @@ def _detect_waf_fingerprint(
         })
 
     # ── Cloudflare ────────────────────────────────────────────────────────
+    html    = html    or ""
+    js_text = js_text or ""
     _cf_sigs = []
     if 'cf-ray' in headers:
         _cf_sigs.append('cf-ray header')
