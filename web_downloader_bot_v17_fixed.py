@@ -29380,6 +29380,533 @@ def _score_response_confidence(
 # ── /payload Enhancement Helpers (Features 1, 5–12) ──────────
 # ══════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📋  CURL COMMAND EXPORT  —  _build_curl_export(data)
+#
+#     Generates a complete multi-step shell script (.sh) covering every
+#     phase of the payment flow detected by /payload scan:
+#
+#       Step 0 — Cookie jar init + baseline GET (session prime)
+#       Step 1 — CSRF token extraction  (grep from GET response)
+#       Step 2 — Gateway tokenization   (Stripe / Braintree / Adyen / Square)
+#       Step 3 — Form submit            (POST with all fields)
+#       Step 4 — Response inspection    (status code + body grep)
+#
+#     Each step is annotated with comments explaining WHY it exists.
+#     The output is valid bash — pipe directly to bash or edit as needed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+import json as _json
+from urllib.parse import urlparse as _urlparse, urlencode as _urlencode
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _sh_escape(s: str) -> str:
+    """Single-quote escape a value for safe shell embedding."""
+    s = str(s) if not isinstance(s, str) else s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _ua_string() -> str:
+    return ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/136.0.0.0 Safari/537.36')
+
+
+def _header_flags(h: dict) -> str:
+    """Convert a headers dict to curl -H flags."""
+    return ' \\\n  '.join(f"-H {_sh_escape(k + ': ' + v)}" for k, v in h.items() if v)
+
+
+def _field_flags(fields: dict, enctype: str) -> str:
+    """Convert field dict to curl body flags based on enctype."""
+    enc = (enctype or '').lower()
+    if 'json' in enc:
+        return f"--data-raw {_sh_escape(_json.dumps(fields, ensure_ascii=False))}"
+    if 'multipart' in enc:
+        return ' \\\n  '.join(f"-F {_sh_escape(k + '=' + v)}" for k, v in fields.items())
+    # Default: urlencoded — one --data-urlencode per field
+    return ' \\\n  '.join(
+        f"--data-urlencode {_sh_escape(k + '=' + v)}"
+        for k, v in fields.items()
+    )
+
+
+# ── Main export function ───────────────────────────────────────────────────────
+
+def _build_curl_export(data: dict) -> str:
+    """
+    Build a complete multi-step curl shell script from /payload scan data.
+
+    Returns the script as a string (UTF-8 bash).
+    """
+    data = data if isinstance(data, dict) else {}
+
+    url             = data.get('url', '')
+    base_url        = data.get('base_url', url)
+    domain          = _urlparse(url).hostname or url
+    gateways        = data.get('gateways') or []
+    hosted_ep       = data.get('hosted_ep') or {}
+    resolved        = data.get('resolved_tokens') or {}
+    forms           = data.get('forms') or []
+    recaptcha       = data.get('recaptcha') or {}
+    threeds         = data.get('threeds_signals') or []
+    auth_cookies    = data.get('auth_cookies') or []
+    curl_snip       = data.get('curl_snippet') or {}
+    window_cfg      = (data.get('window_config') or {}).get('summary', {})
+    state_sess      = data.get('state_session') or {}
+    event_flow      = data.get('event_flow') or {}
+    waf_results     = data.get('waf_results') or {}
+    multistep       = data.get('multistep') or {}
+
+    # Detect gateway name
+    gw_name = ''
+    for gw in gateways:
+        n = gw.get('gateway') or gw.get('name') or ''
+        if n:
+            gw_name = n
+            break
+    if not gw_name and hosted_ep.get('gateway'):
+        gw_name = hosted_ep['gateway']
+
+    # Detect submit endpoint + method + enctype from best available source
+    submit_url  = (curl_snip.get('curl', '') or '').split("'")[1] if curl_snip.get('curl') else ''
+    method      = 'POST'
+    enctype     = 'application/x-www-form-urlencoded'
+
+    _pay_forms = [f for f in forms if f.get('has_payment') or f.get('has_card')]
+    if not submit_url and _pay_forms:
+        _bf = _pay_forms[0]
+        submit_url = _bf.get('action') or url
+        method     = (_bf.get('method') or 'POST').upper()
+        enctype    = _bf.get('enctype') or enctype
+    if not submit_url:
+        submit_url = hosted_ep.get('endpoint') or url
+
+    # Build field map from best-known form
+    field_map: dict[str, str] = {}
+    _CARD_PH = {
+        'Card Number':     '4111111111111111',
+        'CVV/CVC':         '123',
+        'Expiry Month':    '12',
+        'Expiry Year':     '2029',
+        'Cardholder Name': 'John Doe',
+        'Amount':          '10.00',
+        'Email':           'test@test.com',
+        'First Name':      'John',
+        'Last Name':       'Doe',
+        'Billing Zip':     '10001',
+    }
+    all_fields = _pay_forms[0].get('fields', []) if _pay_forms else []
+    for f in all_fields:
+        nm = f.get('name', '')
+        if not nm or f.get('type') in ('submit', 'button', 'reset', 'image'):
+            continue
+        if f.get('is_honeypot'):
+            continue
+        rt = resolved.get(nm, {})
+        if rt.get('value') and rt.get('confidence') in ('live', 'static', 'inferred'):
+            field_map[nm] = rt['value']
+        elif f.get('is_dynamic'):
+            field_map[nm] = f'${{{nm.upper()}}}'   # shell variable placeholder
+        elif f.get('value') and len(str(f.get('value', ''))) > 1:
+            field_map[nm] = str(f['value'])
+        elif f.get('card_type') in _CARD_PH:
+            field_map[nm] = _CARD_PH[f['card_type']]
+        else:
+            field_map[nm] = f.get('placeholder') or f'<{nm}>'
+
+    # CSRF token name
+    csrf_name = ''
+    for nm, rt in resolved.items():
+        if rt.get('is_dynamic') or 'csrf' in nm.lower() or 'token' in nm.lower():
+            csrf_name = nm
+            break
+
+    # Essential cookies from session analysis
+    ess_cookies = [
+        c for c in (state_sess.get('essential_cookies') or [])
+        if c.get('name') and c.get('value')
+    ]
+
+    # Stripe pk_ key from window config or resolved tokens
+    stripe_pk = ''
+    for pk in (window_cfg.get('payment_keys') or []):
+        v = pk.get('value', '')
+        if _re.match(r'pk_(?:live|test)_', v):
+            stripe_pk = v
+            break
+    if not stripe_pk:
+        for rt in resolved.values():
+            v = rt.get('value', '')
+            if v and _re.match(r'pk_(?:live|test)_', v):
+                stripe_pk = v
+                break
+
+    # Braintree client token
+    bt_token = ''
+    for rt in resolved.values():
+        v = rt.get('value', '')
+        if v and len(v) > 20 and not _re.match(r'pk_', v) and not v.startswith('eyJ'):
+            bt_token = v[:80]
+            break
+
+    # ── Assemble standard headers ──────────────────────────────────────────────
+    parsed_ep = _urlparse(submit_url)
+    parsed_pg = _urlparse(url)
+    origin    = f"{parsed_pg.scheme}://{parsed_pg.netloc}"
+    ua        = _ua_string()
+
+    std_headers = {
+        'User-Agent':      ua,
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin':          origin,
+        'Referer':         url,
+    }
+    if 'json' in enctype.lower():
+        std_headers['Content-Type'] = 'application/json'
+        std_headers['Accept']       = 'application/json'
+    elif 'multipart' not in enctype.lower():
+        std_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+
+    # ── WAF / rate-limit notice ────────────────────────────────────────────────
+    waf_name = ''
+    if isinstance(waf_results, dict):
+        for v in waf_results.values():
+            if isinstance(v, dict) and v.get('detected'):
+                waf_name = v.get('name', '')
+                break
+    elif isinstance(waf_results, list):
+        for w in waf_results:
+            if isinstance(w, dict) and w.get('detected'):
+                waf_name = w.get('name', '')
+                break
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BUILD THE SCRIPT
+    # ══════════════════════════════════════════════════════════════════════════
+    lines: list[str] = []
+    A = lines.append   # shorthand
+
+    def sep(title: str = ''):
+        A('')
+        A('# ' + '─' * 66)
+        if title:
+            A(f'# {title}')
+            A('# ' + '─' * 66)
+
+    # ── Header block ──────────────────────────────────────────────────────────
+    A('#!/usr/bin/env bash')
+    A('# ═══════════════════════════════════════════════════════════════════')
+    A(f'# Auto-generated curl export  —  /payload scan')
+    A(f'# Site    : {domain}')
+    A(f'# URL     : {url}')
+    A(f'# Gateway : {gw_name or "Unknown / direct post"}')
+    A(f'# 3DS     : {"Detected — " + threeds[0].get("signal","") if threeds else "Not detected"}')
+    A(f'# CAPTCHA : {"Detected — sitekey: " + recaptcha.get("site_key","?")[:30] if recaptcha.get("site_key") else "Not detected"}')
+    A(f'# WAF     : {waf_name or "Not detected"}')
+    A('# ═══════════════════════════════════════════════════════════════════')
+    A('#')
+    A('# Usage:')
+    A('#   bash script.sh')
+    A('#   bash -x script.sh    # debug mode — prints every command')
+    A('#')
+    A('# Requirements: curl (≥7.55), jq (optional, for JSON pretty-print)')
+    A('# ═══════════════════════════════════════════════════════════════════')
+
+    # ── Variables block ───────────────────────────────────────────────────────
+    sep('CONFIGURATION — edit before running')
+    A(f"BASE_URL={_sh_escape(url)}")
+    A(f"SUBMIT_URL={_sh_escape(submit_url)}")
+    A(f"UA={_sh_escape(ua)}")
+    A('')
+    A('# ── Test card (replace with real values) ─────────────────────────────')
+    A('CARD_NUMBER="4111111111111111"')
+    A('CARD_EXP_MONTH="12"')
+    A('CARD_EXP_YEAR="2029"')
+    A('CARD_CVC="123"')
+    A('CARD_NAME="John Doe"')
+    A('EMAIL="test@test.com"')
+    A('FIRST_NAME="John"')
+    A('LAST_NAME="Doe"')
+    A('BILLING_ZIP="10001"')
+    A('AMOUNT="10.00"')
+    if stripe_pk:
+        A('')
+        A(f'STRIPE_PK={_sh_escape(stripe_pk)}  # Stripe publishable key')
+    if bt_token:
+        A(f'BT_CLIENT_TOKEN={_sh_escape(bt_token)}  # Braintree client token')
+    A('')
+    A('# ── Cookie jar (shared across all steps) ─────────────────────────────')
+    A('COOKIEJAR=$(mktemp /tmp/payload_cookies_XXXXXX.txt)')
+    A('trap "rm -f $COOKIEJAR" EXIT   # auto-cleanup on script exit')
+
+    # Inject known essential cookies
+    if ess_cookies:
+        sep('PRE-POPULATE essential cookies from scan')
+        A('# These cookies were observed as session-critical during the scan.')
+        A('# They may be pre-populated here to skip the session init step.')
+        for c in ess_cookies[:6]:
+            c_domain = c.get('domain') or _urlparse(url).hostname or domain
+            c_path   = c.get('path') or '/'
+            c_secure = '1' if c.get('secure') else '0'
+            c_http   = '0'  # can't set HttpOnly via curl jar
+            exp      = '0'  # session cookie
+            A(f'# {c["name"]} (essential={c.get("is_essential")}, httponly={c.get("httponly")})')
+            A(f'printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" \\')
+            A(f'  "{c_domain}" "FALSE" "{c_path}" '
+              f'"{"TRUE" if c.get("secure") else "FALSE"}" '
+              f'"{exp}" "{c["name"]}" '
+              f'{_sh_escape(c.get("value","")[:80])} >> "$COOKIEJAR"')
+
+    # ── Step 0: GET to prime session ──────────────────────────────────────────
+    sep('STEP 0 — Prime session (GET checkout page)')
+    A('# Purpose: establish session cookie, pick up CSRF token from HTML.')
+    if waf_name:
+        A(f'# Note: {waf_name} WAF detected — a real browser UA and correct headers are')
+        A('#       required. If you get a 403, try adding: -H "sec-ch-ua: ..."')
+    A('')
+    A('echo "[Step 0] GET ${BASE_URL} ..."')
+    A('STEP0_RESP=$(curl -sS -L --compressed \\')
+    A(f'  -A {_sh_escape(ua)} \\')
+    for k, v in {
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Sec-Fetch-Site':  'none',
+        'Sec-Fetch-Mode':  'navigate',
+        'Sec-Fetch-User':  '?1',
+        'Sec-Fetch-Dest':  'document',
+        'Cache-Control':   'max-age=0',
+    }.items():
+        A(f'  -H {_sh_escape(k + ": " + v)} \\')
+    A('  -c "$COOKIEJAR" -b "$COOKIEJAR" \\')
+    A('  "${BASE_URL}")')
+    A('')
+    A('STEP0_HTTP=$(curl -sS -L --compressed -o /dev/null -w "%{http_code}" \\')
+    A(f'  -A {_sh_escape(ua)} \\')
+    A('  -c "$COOKIEJAR" -b "$COOKIEJAR" \\')
+    A('  "${BASE_URL}")')
+    A('echo "[Step 0] HTTP ${STEP0_HTTP}"')
+    A('[[ "$STEP0_HTTP" =~ ^2 ]] || echo "  ⚠️  Non-2xx on Step 0 — session may be invalid"')
+
+    # ── Step 1: Extract CSRF token ─────────────────────────────────────────────
+    sep('STEP 1 — Extract CSRF token from response')
+    if csrf_name:
+        A(f'# Detected CSRF field name: {_sh_escape(csrf_name)}')
+        A(f'# Extracts hidden field value: <input name="{csrf_name}" value="...">')
+        A('')
+        A(f'CSRF_TOKEN=$(echo "$STEP0_RESP" | \\')
+        A(f'  grep -oP \'name="{_re.escape(csrf_name)}"[^>]*value="\\K[^"]+\' | head -1)')
+        A('')
+        A('if [[ -z "$CSRF_TOKEN" ]]; then')
+        A(f'  CSRF_TOKEN=$(echo "$STEP0_RESP" | \\')
+        A(f'    grep -oP \'value="\\K[^"]+(?="[^>]*name="{_re.escape(csrf_name)}")\' | head -1)')
+        A('fi')
+        A('')
+        A('if [[ -z "$CSRF_TOKEN" ]]; then')
+        A('  # Fallback: meta tag csrf-token')
+        A('  CSRF_TOKEN=$(echo "$STEP0_RESP" | \\')
+        A('    grep -oP \'<meta[^>]+name="csrf-token"[^>]+content="\\K[^"]+\' | head -1)')
+        A('fi')
+        A('')
+        A('echo "[Step 1] CSRF token: ${CSRF_TOKEN:0:40}..."')
+        A('[[ -n "$CSRF_TOKEN" ]] || echo "  ⚠️  CSRF token not found — Step 3 may fail"')
+    else:
+        A('# No dynamic CSRF token detected — skipping extraction.')
+        A('CSRF_TOKEN=""')
+
+    # ── Step 2: Gateway tokenization ──────────────────────────────────────────
+    sep('STEP 2 — Gateway tokenization')
+    if gw_name == 'Stripe' and stripe_pk:
+        A('# Stripe: create a PaymentMethod via Stripe API, get pm_xxx token.')
+        A('# This token replaces raw card data in the Step 3 POST body.')
+        A('')
+        A('echo "[Step 2] Tokenizing card via Stripe API..."')
+        A('STRIPE_RESP=$(curl -sS -X POST \\')
+        A("  -H 'Content-Type: application/x-www-form-urlencoded' \\")
+        A(f"  -u {_sh_escape(stripe_pk + ':')} \\")
+        A('  --data-urlencode "type=card" \\')
+        A('  --data-urlencode "card[number]=${CARD_NUMBER}" \\')
+        A('  --data-urlencode "card[exp_month]=${CARD_EXP_MONTH}" \\')
+        A('  --data-urlencode "card[exp_year]=${CARD_EXP_YEAR}" \\')
+        A('  --data-urlencode "card[cvc]=${CARD_CVC}" \\')
+        A("  'https://api.stripe.com/v1/payment_methods')")
+        A('')
+        A('STRIPE_PM=$(echo "$STRIPE_RESP" | grep -oP \'"id":\\s*"\\Kpm_[^"]+\')')
+        A('echo "[Step 2] Stripe PaymentMethod: ${STRIPE_PM}"')
+        A('[[ -n "$STRIPE_PM" ]] || { echo "  ❌ Tokenization failed — check STRIPE_PK"; cat <(echo "$STRIPE_RESP" | head -5); }')
+    elif gw_name == 'Braintree' and bt_token:
+        A('# Braintree: use client SDK to get a payment_method_nonce.')
+        A('# The SDK call requires a browser — replicated here via direct API.')
+        A('')
+        A('echo "[Step 2] Fetching Braintree config..."')
+        A('BT_RESP=$(curl -sS -X POST \\')
+        A(f"  -H 'Authorization: Bearer {bt_token}' \\")
+        A("  -H 'Braintree-Version: 2018-05-10' \\")
+        A("  -H 'Content-Type: application/json' \\")
+        A("  --data-raw '{\"query\":\"{ ping }\"}' \\")
+        A("  'https://payments.braintree-api.com/graphql')")
+        A('echo "[Step 2] Braintree: ${BT_RESP:0:80}"')
+        A('# Note: full nonce generation requires Braintree JS SDK in a browser.')
+        A('BT_NONCE="<braintree_nonce_from_sdk>"')
+    elif gw_name == 'Adyen':
+        A('# Adyen: encrypt card data using Adyen CSE library.')
+        A('# Full encryption requires the Adyen JS CSE library in a browser context.')
+        A('# Here we pass the raw field values — use Adyen CSE for production.')
+        A('echo "[Step 2] Adyen — no server-side tokenization step needed for direct post."')
+        A('ADYEN_ENCRYPTED_DATA=""  # populate via Adyen CSE if required')
+    else:
+        A('# No gateway tokenization detected — card fields POST directly.')
+        A('echo "[Step 2] No tokenization step — direct card POST."')
+
+    # ── Step 3: Submit POST ────────────────────────────────────────────────────
+    sep('STEP 3 — Submit payment form (POST)')
+    A('echo "[Step 3] Submitting to ${SUBMIT_URL} ..."')
+    A('')
+
+    # Build dynamic field map for bash
+    A('# ── Build POST body ──────────────────────────────────────────────────')
+    for nm, val in field_map.items():
+        # Replace placeholder values with bash variable references
+        if nm in (csrf_name,):
+            bash_val = '"${CSRF_TOKEN}"'
+        elif 'card' in nm.lower() and 'number' in nm.lower():
+            bash_val = '"${CARD_NUMBER}"'
+        elif 'cvc' in nm.lower() or 'cvv' in nm.lower() or 'security' in nm.lower():
+            bash_val = '"${CARD_CVC}"'
+        elif 'exp' in nm.lower() and 'month' in nm.lower():
+            bash_val = '"${CARD_EXP_MONTH}"'
+        elif 'exp' in nm.lower() and 'year' in nm.lower():
+            bash_val = '"${CARD_EXP_YEAR}"'
+        elif 'email' in nm.lower():
+            bash_val = '"${EMAIL}"'
+        elif 'first' in nm.lower() and 'name' in nm.lower():
+            bash_val = '"${FIRST_NAME}"'
+        elif 'last' in nm.lower() and 'name' in nm.lower():
+            bash_val = '"${LAST_NAME}"'
+        elif 'zip' in nm.lower() or 'postal' in nm.lower():
+            bash_val = '"${BILLING_ZIP}"'
+        elif 'amount' in nm.lower() or 'total' in nm.lower():
+            bash_val = '"${AMOUNT}"'
+        elif gw_name == 'Stripe' and nm in ('payment_method', 'stripeToken', 'paymentMethodId'):
+            bash_val = '"${STRIPE_PM}"'
+        elif gw_name == 'Braintree' and nm in ('payment_method_nonce', 'nonce'):
+            bash_val = '"${BT_NONCE}"'
+        elif val.startswith('$'):
+            bash_val = f'"{val}"'
+        elif val.startswith('<') and val.endswith('>'):
+            bash_val = f'"REPLACE_{nm.upper()}"'
+        else:
+            bash_val = _sh_escape(val)
+        A(f'{nm.upper().replace("-","_").replace(".","_")}_VAL={bash_val}')
+
+    A('')
+    A('STEP3_RESP=$(curl -sS -L --compressed -w "\\n__HTTP_CODE__%{http_code}" \\')
+    A(f'  -X {method} \\')
+    A(f'  -A {_sh_escape(ua)} \\')
+    A(f'  -H {_sh_escape("Origin: " + origin)} \\')
+    A(f'  -H {_sh_escape("Referer: " + url)} \\')
+    if 'json' in enctype.lower():
+        A(f'  -H "Content-Type: application/json" \\')
+        A(f'  -H "Accept: application/json" \\')
+    elif 'multipart' not in enctype.lower():
+        A(f'  -H "Content-Type: application/x-www-form-urlencoded" \\')
+    if csrf_name:
+        A(f'  -H "X-CSRF-Token: ${{CSRF_TOKEN}}" \\')
+        A(f'  -H "X-Requested-With: XMLHttpRequest" \\')
+    A('  -c "$COOKIEJAR" -b "$COOKIEJAR" \\')
+
+    # Body flags
+    if 'json' in enctype.lower():
+        # Build JSON body inline
+        json_parts = []
+        for nm in field_map:
+            varname = nm.upper().replace('-','_').replace('.','_') + '_VAL'
+            json_parts.append(f'"${{{varname}}}"')
+        # Use jq to build JSON safely
+        A('  --data-raw "$(jq -nc \\')
+        jq_args = []
+        for nm in list(field_map.keys())[:20]:
+            varname = nm.upper().replace('-','_').replace('.','_') + '_VAL'
+            jq_args.append(f'    --arg {nm.replace("-","_")} "${{{varname}}}" \\')
+        for arg in jq_args:
+            A(f'{arg}')
+        jq_obj = ' | '.join(f'.{nm.replace("-","_")} = ${nm.replace("-","_")}' for nm in list(field_map.keys())[:20])
+        A(f'    \'{{ {jq_obj} }}\')" \\')
+    elif 'multipart' in enctype.lower():
+        for nm in field_map:
+            varname = nm.upper().replace('-','_').replace('.','_') + '_VAL'
+            A(f'  -F {_sh_escape(nm)}="${{{varname}}}" \\')
+    else:
+        for nm in field_map:
+            varname = nm.upper().replace('-','_').replace('.','_') + '_VAL'
+            A(f'  --data-urlencode "{nm}=${{{varname}}}" \\')
+
+    A(f'  {_sh_escape(submit_url)})')
+    A('')
+    A('# ── Parse response ───────────────────────────────────────────────────')
+    A('STEP3_HTTP=$(echo "$STEP3_RESP" | grep -oP "__HTTP_CODE__\\K[0-9]+")')
+    A('STEP3_BODY=$(echo "$STEP3_RESP" | sed "s/__HTTP_CODE__[0-9]*//")')
+    A('echo "[Step 3] HTTP ${STEP3_HTTP}"')
+    A('echo "[Step 3] Body (first 500 chars):"')
+    A('echo "${STEP3_BODY:0:500}"')
+
+    # ── Step 4: Analyse response ───────────────────────────────────────────────
+    sep('STEP 4 — Analyse response')
+    A('echo ""')
+    A('echo "════════════════════════════════════════"')
+    A('echo "  TRANSACTION RESULT"')
+    A('echo "════════════════════════════════════════"')
+    A('')
+    A('# ── Success signals ──────────────────────────────────────────────────')
+    A('if echo "$STEP3_BODY" | grep -qiE "approved|succeeded|success|thank.you|order.confirmed|paid"; then')
+    A('  echo "  ✅ SUCCESS — payment appears approved"')
+    A('elif echo "$STEP3_BODY" | grep -qiE "declined|failed|invalid.card|do.not.honor|insufficient"; then')
+    A('  echo "  🔴 FAILURE — card declined or error"')
+    A('  DECLINE_CODE=$(echo "$STEP3_BODY" | grep -oP \'"decline_code":\\s*"\\K[^"]+\' | head -1)')
+    A('  [[ -n "$DECLINE_CODE" ]] && echo "  Decline code: ${DECLINE_CODE}"')
+    A('elif echo "$STEP3_BODY" | grep -qiE "requires_action|3ds|authentication.required|redirect"; then')
+    A('  echo "  🔐 3DS / ACTION REQUIRED"')
+    A('  REDIRECT=$(echo "$STEP3_BODY" | grep -oP \'"url":\\s*"\\Khttps://[^"]+\' | head -1)')
+    A('  [[ -n "$REDIRECT" ]] && echo "  Redirect URL: ${REDIRECT}"')
+    if recaptcha.get('site_key'):
+        A('elif echo "$STEP3_BODY" | grep -qiE "captcha|robot|recaptcha"; then')
+        A('  echo "  🤖 CAPTCHA triggered — solve before retry"')
+    A('else')
+    A('  echo "  ⚪ UNKNOWN — check body above"')
+    A('fi')
+    A('')
+    A('# ── JSON pretty-print if jq is available ─────────────────────────────')
+    A('if command -v jq &>/dev/null; then')
+    A('  echo ""')
+    A('  echo "JSON response:"')
+    A('  echo "$STEP3_BODY" | jq . 2>/dev/null || true')
+    A('fi')
+    A('')
+    A('echo "[Done] Cookie jar cleaned up."')
+    if threeds:
+        A('')
+        sep('3DS NOTE')
+        A(f'# 3DS signals detected during scan: {threeds[0].get("signal", "")}')
+        A('# If Step 4 shows "3DS / ACTION REQUIRED", the payment requires a browser')
+        A('# redirect to the ACS URL. curl cannot complete the 3DS challenge.')
+        A('# Use the generated Python script instead — it handles the redirect flow.')
+    if recaptcha.get('site_key'):
+        A('')
+        sep('CAPTCHA NOTE')
+        A(f'# reCAPTCHA sitekey: {recaptcha["site_key"][:60]}')
+        A('# Add the solved token to Step 3 body:')
+        A('#   --data-urlencode "g-recaptcha-response=<SOLVED_TOKEN>"')
+        A('# Use 2captcha / CapSolver / manual solve to get the token.')
+
+    return '\n'.join(lines) + '\n'
+
+
 def _generate_curl_snippet(endpoint: str, method: str, enctype: str,
                            all_fields: list, headers_required: list = None,
                            resolved_tokens: dict = None,
@@ -34323,6 +34850,350 @@ def _trace_event_flow(html: str, js_text: str, forms: list) -> dict:
 
 
 
+def _trace_token_lifecycle(
+    html: str,
+    js_text: str,
+    token_sources: list,
+    network_log: list,
+    client_storage: dict,
+    live_result: dict,
+    response_headers: dict,
+) -> dict:
+    """
+    Token Lifecycle Tracer.
+
+    Finds every dynamic session identifier and maps:
+      source  → where it first appears
+                (hidden input, meta tag, JS var, cookie,
+                 localStorage, sessionStorage, WS frame, response header)
+      reuse   → which POST body fields / request headers it flows into
+
+    Returns:
+    {
+      "tokens":  [{name, value_preview, sources, reused_in, lifecycle}],
+      "summary": {total_tokens, sources_new, reuse_count}
+    }
+    """
+    html    = html    or ''
+    js_text = js_text or ''
+
+    _TOKEN_KW = (
+        'token', 'csrf', 'nonce', 'auth', 'key', 'secret', 'verify',
+        'hash', 'session', 'xsrf', 'signature', 'hmac', 'fingerprint',
+        'captcha', 'idempotency', 'requestverification',
+    )
+
+    def _is_tok_name(name):
+        n = name.lower().replace('-', '_')
+        return any(kw in n for kw in _TOKEN_KW)
+
+    def _is_tok_val(v):
+        return bool(v) and len(str(v)) >= 8 and not re.match(r'^\d{1,3}$', str(v))
+
+    candidates: dict = {}
+
+    def _add(name, value, src_type, location, detail=''):
+        if not _is_tok_name(name):
+            return
+        norm = name.lower().strip()
+        if norm not in candidates:
+            candidates[norm] = {
+                'name':          name,
+                'value_preview': (str(value)[:24] + '…') if len(str(value)) > 24 else str(value),
+                'sources':       [],
+                'reused_in':     [],
+            }
+        e = {'type': src_type, 'location': location, 'detail': str(detail)[:120]}
+        if e not in candidates[norm]['sources']:
+            candidates[norm]['sources'].append(e)
+
+    # 1. Existing token_sources (hidden input, meta, JS var, cookie)
+    for ts in (token_sources or []):
+        _add(ts.get('name', ''), ts.get('value_preview', '') or ts.get('value', ''),
+             ts.get('source_type', 'unknown'), ts.get('location', ''), ts.get('label', ''))
+
+    # 2. localStorage
+    for k, v in ((client_storage or {}).get('localStorage', {}) or {}).items():
+        if _is_tok_name(k) and _is_tok_val(v):
+            _add(k, str(v), 'localStorage', 'Browser localStorage', f'key={k}')
+
+    # 3. sessionStorage
+    for k, v in ((client_storage or {}).get('sessionStorage', {}) or {}).items():
+        if _is_tok_name(k) and _is_tok_val(v):
+            _add(k, str(v), 'sessionStorage', 'Browser sessionStorage', f'key={k}')
+
+    # 4. HTTP response headers
+    _HDR_WATCH = {
+        'x-csrf-token', 'x-xsrf-token', 'x-auth-token', 'x-nonce',
+        'x-request-id', 'x-correlation-id', 'x-idempotency-key', 'set-cookie',
+    }
+    for hn, hv in (response_headers or {}).items():
+        if (hn.lower() in _HDR_WATCH or _is_tok_name(hn)) and _is_tok_val(str(hv)):
+            _add(hn, str(hv), 'response_header', f'HTTP response header: {hn}', str(hv)[:80])
+
+    # 5. WebSocket frames
+    _ws_pat = re.compile(
+        r'["\']([a-zA-Z_][\w\-]{2,40})["\']:\s*["\']([A-Za-z0-9+/=_.\-]{8,200})["\']'
+    )
+    for frame in ((live_result or {}).get('ws_frames', []) or []):
+        payload = frame.get('data', '') or frame.get('payload', '') or ''
+        if not isinstance(payload, str):
+            continue
+        for m in _ws_pat.finditer(payload[:2000]):
+            k, v = m.group(1), m.group(2)
+            if _is_tok_name(k) and _is_tok_val(v):
+                _add(k, v, 'websocket_frame',
+                     f"WebSocket ({frame.get('dir','recv')})",
+                     f"url={frame.get('url','')[:60]}")
+
+    # 6. GET response body JSON scan
+    for entry in (network_log or []):
+        if entry.get('method', '').upper() != 'GET':
+            continue
+        body = entry.get('response_body', '') or ''
+        if not body or not isinstance(body, str):
+            continue
+        try:
+            import json as _json
+            obj = _json.loads(body[:8000])
+            def _walk(o, depth=0):
+                if depth > 4 or not isinstance(o, dict):
+                    return
+                for k, v in o.items():
+                    if _is_tok_name(k) and isinstance(v, str) and _is_tok_val(v):
+                        _add(k, v, 'get_response_body', 'GET JSON response body',
+                             f"from {entry.get('url','')[:60]}")
+                    elif isinstance(v, dict):
+                        _walk(v, depth + 1)
+            _walk(obj)
+        except Exception:
+            pass
+
+    # 7. XHR response headers
+    for entry in (network_log or []):
+        for hn, hv in (entry.get('response_headers') or {}).items():
+            if _is_tok_name(hn) and _is_tok_val(str(hv)):
+                _add(hn, str(hv), 'xhr_response_header', f'XHR response header: {hn}',
+                     f"from {entry.get('url','')[:60]}")
+
+    # ── Reuse mapping: token → POST/PUT/PATCH body, header, query ────────
+    _HDR_TOKEN = {
+        'x-csrf-token', 'x-xsrf-token', 'x-auth-token',
+        'x-nonce', 'authorization', 'x-idempotency-key',
+        'x-request-id', 'x-session-id', 'x-correlation-id',
+    }
+
+    # Build reverse lookup: value_prefix → [norm_key] for value-based matching
+    _val_index: dict = {}
+    for norm, cand in candidates.items():
+        vp = cand['value_preview'].rstrip('…')
+        if len(vp) >= 8:
+            _val_index.setdefault(vp, []).append(norm)
+
+    # Track XHR response → next XHR chain (multi-hop)
+    # Sort entries by sequence (assume list order = network order)
+    _xhr_sequence = [e for e in (network_log or [])
+                     if e.get('url') or e.get('endpoint')]
+
+    for seq_idx, entry in enumerate(_xhr_sequence):
+        method = entry.get('method', '').upper()
+
+        # ── A. POST/PUT/PATCH body matching ───────────────────────────
+        if method in ('POST', 'PUT', 'PATCH'):
+            req_url  = entry.get('url', '') or entry.get('endpoint', '')
+            post_data = entry.get('post_data', '') or ''
+            req_hdrs  = entry.get('headers', {}) or {}
+
+            # Parse body (JSON or urlencoded)
+            body_fields: dict = {}
+            if isinstance(post_data, str) and post_data:
+                try:
+                    import json as _j
+                    body_fields = _j.loads(post_data)
+                    if not isinstance(body_fields, dict):
+                        body_fields = {}
+                except Exception:
+                    try:
+                        from urllib.parse import parse_qs as _pqs
+                        body_fields = {k: v[0] for k, v in _pqs(post_data).items()}
+                    except Exception:
+                        pass
+
+            # Parse query string from URL
+            from urllib.parse import urlparse as _up, parse_qs as _pqs2
+            try:
+                _qs = {k: v[0] for k, v in _pqs2(_up(req_url).query).items()}
+            except Exception:
+                _qs = {}
+
+            for norm, cand in candidates.items():
+                vp_raw = cand['value_preview'].rstrip('…')
+
+                # 1. Field name match (norm ↔ field name)
+                for field, val in {**body_fields, **_qs}.items():
+                    fl = field.lower().replace('-', '_')
+                    name_match = norm in fl or fl in norm
+                    # 2. Value exact or prefix match
+                    val_str = str(val)
+                    val_match = (len(vp_raw) >= 8 and
+                                 (val_str == vp_raw or
+                                  val_str.startswith(vp_raw) or
+                                  vp_raw.startswith(val_str[:16])))
+                    if name_match or val_match:
+                        via = 'query' if field in _qs else 'body'
+                        ru = {'request_url': req_url[:80],
+                              'field': field, 'via': via,
+                              'match': 'name' if name_match else 'value'}
+                        if ru not in cand['reused_in']:
+                            cand['reused_in'].append(ru)
+
+                # 3. Request header match
+                for hn, hv in req_hdrs.items():
+                    hn_l = hn.lower()
+                    if hn_l in _HDR_TOKEN and norm in hn_l:
+                        hv_str = str(hv)
+                        val_match = (len(vp_raw) >= 8 and
+                                     (hv_str == vp_raw or hv_str.startswith(vp_raw)))
+                        ru = {'request_url': req_url[:80],
+                              'field': hn, 'via': 'header',
+                              'match': 'name+value' if val_match else 'name'}
+                        if ru not in cand['reused_in']:
+                            cand['reused_in'].append(ru)
+
+                # 4. Cookie → POST body cross-reference
+                # Token found in cookie AND appears as body field name
+                _cookie_src = [s for s in cand['sources'] if s['type'] == 'cookie']
+                if _cookie_src:
+                    for field in body_fields:
+                        if norm in field.lower():
+                            ru = {'request_url': req_url[:80],
+                                  'field': field, 'via': 'cookie→body',
+                                  'match': 'cookie_name_in_field'}
+                            if ru not in cand['reused_in']:
+                                cand['reused_in'].append(ru)
+
+        # ── B. XHR response → next XHR injection (multi-hop chain) ───
+        resp_body = entry.get('response_body', '') or ''
+        resp_hdrs = entry.get('response_headers', {}) or {}
+        if not resp_body and not resp_hdrs:
+            continue
+
+        # Extract tokens from THIS response body/headers
+        _resp_token_vals: dict = {}   # field_name → value
+        try:
+            import json as _j2
+            _rb_obj = _j2.loads(resp_body[:8000]) if resp_body else {}
+            if isinstance(_rb_obj, dict):
+                def _rw(o, depth=0):
+                    if depth > 3 or not isinstance(o, dict):
+                        return
+                    for k, v in o.items():
+                        if _is_tok_name(k) and isinstance(v, str) and _is_tok_val(v):
+                            _resp_token_vals[k.lower()] = v
+                        elif isinstance(v, dict):
+                            _rw(v, depth + 1)
+                _rw(_rb_obj)
+        except Exception:
+            pass
+        for hn, hv in resp_hdrs.items():
+            if _is_tok_name(hn) and _is_tok_val(str(hv)):
+                _resp_token_vals[hn.lower()] = str(hv)
+
+        if not _resp_token_vals:
+            continue
+
+        # Check if any of these response tokens appear in SUBSEQUENT requests
+        for next_entry in _xhr_sequence[seq_idx + 1:seq_idx + 6]:
+            next_method = next_entry.get('method', '').upper()
+            if next_method not in ('POST', 'PUT', 'PATCH', 'GET'):
+                continue
+            next_url  = next_entry.get('url', '') or next_entry.get('endpoint', '')
+            next_pd   = next_entry.get('post_data', '') or ''
+            next_hdrs = next_entry.get('headers', {}) or {}
+
+            next_body: dict = {}
+            if next_pd and isinstance(next_pd, str):
+                try:
+                    next_body = _j2.loads(next_pd)
+                    if not isinstance(next_body, dict):
+                        next_body = {}
+                except Exception:
+                    try:
+                        next_body = {k: v[0] for k, v in _pqs2(next_pd).items()}
+                    except Exception:
+                        pass
+
+            for resp_fname, resp_fval in _resp_token_vals.items():
+                # Check if this response token name/value appears in candidates
+                matching_norm = None
+                if resp_fname in candidates:
+                    matching_norm = resp_fname
+                else:
+                    # Value-based lookup
+                    for vp_key, norms in _val_index.items():
+                        if resp_fval.startswith(vp_key) or vp_key.startswith(resp_fval[:16]):
+                            matching_norm = norms[0]
+                            break
+
+                if not matching_norm:
+                    continue
+
+                cand = candidates[matching_norm]
+                # Does it appear in the next request?
+                for field, val in {**next_body}.items():
+                    val_str = str(val)
+                    if (resp_fname in field.lower() or
+                            val_str == resp_fval or
+                            val_str.startswith(resp_fval[:16])):
+                        ru = {
+                            'request_url': next_url[:80],
+                            'field':       field,
+                            'via':         'multihop_body',
+                            'match':       f"via {entry.get('url','')[-40:]}",
+                        }
+                        if ru not in cand['reused_in']:
+                            cand['reused_in'].append(ru)
+                for hn, hv in next_hdrs.items():
+                    if resp_fname in hn.lower() and _is_tok_val(str(hv)):
+                        ru = {
+                            'request_url': next_url[:80],
+                            'field':       hn,
+                            'via':         'multihop_header',
+                            'match':       f"via {entry.get('url','')[-40:]}",
+                        }
+                        if ru not in cand['reused_in']:
+                            cand['reused_in'].append(ru)
+
+    def _lifecycle_summary(cand):
+        src_types  = list(dict.fromkeys(s['type'] for s in cand['sources']))
+        reuse_locs = list(dict.fromkeys(f"{r['via']}:{r['field']}" for r in cand['reused_in']))
+        parts = [f"Found in: {', '.join(src_types)}"]
+        parts.append(f"Injected into: {', '.join(reuse_locs[:3])}" if reuse_locs
+                     else "Not observed in any POST")
+        return ' → '.join(parts)
+
+    tokens_out = [
+        {**cand, 'lifecycle': _lifecycle_summary(cand)}
+        for cand in candidates.values()
+    ]
+    tokens_out.sort(key=lambda t: (-len(t['reused_in']), t['name']))
+
+    existing_src_types = {ts.get('source_type') for ts in (token_sources or [])}
+    new_types = list(dict.fromkeys(
+        s['type'] for t in tokens_out for s in t['sources']
+        if s['type'] not in existing_src_types
+    ))
+
+    return {
+        'tokens': tokens_out,
+        'summary': {
+            'total_tokens': len(tokens_out),
+            'sources_new':  new_types,
+            'reuse_count':  sum(len(t['reused_in']) for t in tokens_out),
+        },
+    }
+
+
 def _extract_client_config(html: str, js_text: str, page_url: str = '') -> dict:
     """
     Client-Side Config Extraction.
@@ -35932,6 +36803,15 @@ def _payload_sync(url: str, progress_cb=None) -> dict:
                                    _combined_text or '',
                                    url,
                                ),
+        'token_lifecycle':     _trace_token_lifecycle(
+                                   html             = (static_html or '') + (js_html or ''),
+                                   js_text          = _combined_text or '',
+                                   token_sources    = token_sources,
+                                   network_log      = real_requests,
+                                   client_storage   = client_storage,
+                                   live_result      = live_result,
+                                   response_headers = _resp_headers,
+                               ),
         'window_config':     _window_config,
         'state_session':     _state_session,
         'event_flow':        _event_flow,
@@ -37212,6 +38092,60 @@ def _format_payload_report(data: dict) -> str:  # noqa: C901
                 lines.append(f"  `{raw_code(_k, 28)}`  `{raw_code(str(_v)[:60])}`")
             if len(_cc_win) > 6:
                 lines.append(f"  _\\+{len(_cc_win)-6} more_")
+
+    # ── TOKEN LIFECYCLE ─────────────────────────────────────────────────
+    _tl      = data.get('token_lifecycle') or {}
+    _tl_toks = _tl.get('tokens', [])
+    _tl_sum  = _tl.get('summary', {})
+    if _tl_toks:
+        _tl_total  = _tl_sum.get('total_tokens', len(_tl_toks))
+        _tl_reused = _tl_sum.get('reuse_count', 0)
+        _tl_new    = _tl_sum.get('sources_new', [])
+        lines.append(_sec(
+            f"Token Lifecycle  ·  {_tl_total} token(s)  ·  {_tl_reused} reuse(s)", "🔄"
+        ))
+        if _tl_new:
+            lines.append(
+                "  🆕 New sources: "
+                + "  ".join(f"`{raw_code(s)}`" for s in _tl_new[:5])
+            )
+        for _tok in _tl_toks[:8]:
+            _name   = _tok.get('name', '')
+            _vp     = _tok.get('value_preview', '')
+            _srcs   = _tok.get('sources', [])
+            _reuses = _tok.get('reused_in', [])
+            lines.append(f"\n{SEP_MINOR}")
+            _reuse_badge = (
+                f"  🔁 `{len(_reuses)}` reuse(s)" if _reuses
+                else "  ⬜ _not observed in POST_"
+            )
+            lines.append(f"  🪙 *{escape_md(_name)}*  `{raw_code(_vp, 28)}`{_reuse_badge}")
+            _src_strs = list(dict.fromkeys(s['type'] for s in _srcs))
+            lines.append("  📥 Source: " + "  ›  ".join(
+                f"`{raw_code(s)}`" for s in _src_strs[:4]
+            ))
+            for _ru in _reuses[:6]:
+                _via = _ru.get('via', '')
+                _match = _ru.get('match', '')
+                if 'multihop' in _via:
+                    _via_icon = "🔗"
+                elif _via == 'header':
+                    _via_icon = "📋"
+                elif _via == 'cookie→body':
+                    _via_icon = "🍪"
+                elif _via == 'query':
+                    _via_icon = "🔍"
+                else:
+                    _via_icon = "📤"
+                _match_tag = f" _{escape_md('(' + _match + ')')}_" if _match else ''
+                lines.append(
+                    f"  {_via_icon} → `{raw_code(_ru['field'], 30)}`"
+                    f"  `{raw_code(_via)}`"
+                    f"  `{raw_code(_ru['request_url'][-40:])}`"
+                    f"{_match_tag}"
+                )
+        if len(_tl_toks) > 8:
+            lines.append(f"  _\\+{len(_tl_toks)-8} more — see JSON export_")
 
     # ── CLIENT STORAGE ────────────────────────────────────────
     cs   = data.get('client_storage', {})
@@ -41207,45 +42141,48 @@ def _build_python_script(data: dict) -> str:
     sc.append('        print("  ⚠️  No form action found — cannot simulate submit")')
     sc.append('        return None')
 
-    # Step 1
+    # Step 1 — wrapped inside def main() so it only runs on direct execution
     sc.append('')
-    sc.append('# ── Step 1: Prime session + get CSRF token ──────────────────────')
-    sc.append(f'session = PayloadSession("{url}")')
-    sc.append(f'log.info("Step 1 — GET {url}")')
-    sc.append(f'r = session.get("{url}", timeout=15)')
-    sc.append('log.debug(f"Page HTML size: {len(r.text)}B")')
-    sc.append('')
-    sc.append('# extract_tokens() scans ALL hidden fields + meta + JS vars at once')
-    sc.append('tokens = extract_tokens(r.text)')
-    sc.append('log.debug(f"Extracted token fields: {list(tokens.keys())}")')
-    sc.append('print(f"Extracted tokens: {list(tokens.keys())}")')
+    sc.append('def main():')
+    sc.append('    """Single-run mode: Steps 1–4."""')
+    sc.append('    global session, r, tokens, csrf, resp, analysis')
+    sc.append(f'    session = PayloadSession("{url}")')
+    sc.append(f'    log.info("Step 1 — GET {url}")')
+    sc.append(f'    r = session.get("{url}", timeout=15)')
+    sc.append('    _html = r.text or ""')
+    sc.append('    log.debug(f"Page HTML size: {len(_html)}B")')
+    sc.append('    ')
+    sc.append('    # extract_tokens() scans ALL hidden fields + meta + JS vars at once')
+    sc.append('    tokens = extract_tokens(_html)')
+    sc.append('    log.debug(f"Extracted token fields: {list(tokens.keys())}")')
+    sc.append('    print(f"Extracted tokens: {list(tokens.keys())}")')
 
     if csrf_method == 'cookie':
-        sc.append('# CSRF from cookie (Laravel Sanctum / cookie-to-header)')
-        sc.append(f'csrf = unquote(session.cookies().get("{csrf_name}", ""))')
-        sc.append(f'csrf = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
+        sc.append('    # CSRF from cookie (Laravel Sanctum / cookie-to-header)')
+        sc.append(f'    csrf = unquote(session.cookies().get("{csrf_name}", ""))')
+        sc.append(f'    csrf = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
     elif csrf_method == 'api_endpoint':
-        sc.append('# CSRF from SPA endpoint')
-        sc.append(f'log.debug("Fetching CSRF from SPA endpoint: {_base_origin}{csrf_endpoint}")')
-        sc.append(f'csrf_r = session.get("{_base_origin}{csrf_endpoint}", timeout=10)')
-        sc.append(f'csrf   = csrf_r.json().get("{csrf_name}", "")')
-        sc.append(f'csrf   = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
+        sc.append('    # CSRF from SPA endpoint')
+        sc.append(f'    log.debug("Fetching CSRF from SPA endpoint: {_base_origin}{csrf_endpoint}")')
+        sc.append(f'    csrf_r = session.get("{_base_origin}{csrf_endpoint}", timeout=10)')
+        sc.append(f'    csrf   = (csrf_r.json() or {{}}).get("{csrf_name}", "")')
+        sc.append(f'    csrf   = csrf or tokens.get("{csrf_name}", "")  # fallback HTML')
     else:
-        sc.append('# CSRF from extracted tokens (hidden field / meta / JS)')
+        sc.append('    # CSRF from extracted tokens (hidden field / meta / JS)')
         if csrf_name:
-            sc.append(f'csrf = tokens.get("{csrf_name}", "")')
-            sc.append('if not csrf:')
-            sc.append(f'    _m = re.search(r\'name="{csrf_name}"[^>]*value="([^"]+)"\', r.text)')
-            sc.append('    csrf = _m.group(1) if _m else ""')
+            sc.append(f'    csrf = tokens.get("{csrf_name}", "")')
+            sc.append('    if not csrf:')
+            sc.append(f'        _m = re.search(r\'name="{csrf_name}"[^>]*value="([^"]+)"\', _html)')
+            sc.append('        csrf = _m.group(1) if _m else ""')
         else:
-            sc.append('csrf = next((tokens[k] for k in')
-            sc.append('    ("_token","csrf_token","csrfToken","authenticity_token","nonce","_meta_csrf")')
-            sc.append('    if k in tokens), "")')
+            sc.append('    csrf = next((tokens[k] for k in')
+            sc.append('        ("_token","csrf_token","csrfToken","authenticity_token","nonce","_meta_csrf")')
+            sc.append('        if k in tokens), "")')
 
-    sc.append(f'_log_csrf("{csrf_name or "_token"}", csrf, "{csrf_method}")')
-    sc.append(f'session.set_csrf("{csrf_name or "_token"}", csrf)  # auto-injected from here on')
-    sc.append('print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
-    sc.append('session.dump_state()')
+    sc.append(f'    _log_csrf("{csrf_name or "_token"}", csrf, "{csrf_method}")')
+    sc.append(f'    session.set_csrf("{csrf_name or "_token"}", csrf)  # auto-injected from here on')
+    sc.append('    print(f"CSRF: {csrf[:30]}…" if csrf else "⚠️ CSRF not found")')
+    sc.append('    session.dump_state()')
 
     # ── Feature 4: State & Session — inject essential cookies / storage ───
     # ── Feature 4: State & Session Analysis — full executable block ─────
@@ -41254,17 +42191,17 @@ def _build_python_script(data: dict) -> str:
     _ess_storage    = _ss_data.get('essential_storage') or []
     _all_cookies_f4 = _ss_data.get('cookies') or []
     _all_storage_f4 = _ss_data.get('storage') or []
-    sc.append('')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('# 🍪 Feature 4 — State & Session Analysis')
-    sc.append('# Extracted from scan: active cookies + localStorage/sessionStorage')
-    sc.append('# identifies which items are essential to maintain the session state.')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('')
+    sc.append('    ')
+    sc.append('    # ══════════════════════════════════════════════════════════════════')
+    sc.append('    # 🍪 Feature 4 — State & Session Analysis')
+    sc.append('    # Extracted from scan: active cookies + localStorage/sessionStorage')
+    sc.append('    # identifies which items are essential to maintain the session state.')
+    sc.append('    # ══════════════════════════════════════════════════════════════════')
+    sc.append('    ')
     # ── 4a: All cookies table (runnable dict) ──────────────────────────────
-    sc.append('# ── 4a. All Active Cookies ─────────────────────────────────────────')
-    sc.append('# Keys: name | value (at scan time) | essential | reason')
-    sc.append('ALL_COOKIES = [')
+    sc.append('    # ── 4a. All Active Cookies ─────────────────────────────────────────')
+    sc.append('    # Keys: name | value (at scan time) | essential | reason')
+    sc.append('    ALL_COOKIES = [')
     for _ck in _all_cookies_f4[:20]:
         _ck_n   = _ck.get('name', '').replace('"', '\\"')
         _ck_v   = str(_ck.get('value', '<server-set>')).replace('"', '\\"')[:60]
@@ -41273,8 +42210,8 @@ def _build_python_script(data: dict) -> str:
         _ck_src = _ck.get('source', '')
         sc.append(f'    {{"name": "{_ck_n}", "value": "{_ck_v}", '
                   f'"essential": {_ck_ess}, "reason": "{_ck_rsn}", "source": "{_ck_src}"}},')
-    sc.append(']')
-    sc.append('')
+    sc.append('    ]')
+    sc.append('    ')
     # ── 4b: Essential cookies — pre-seed block ─────────────────────────────
     if _ess_cookies:
         sc.append('# ── 4b. Essential Session Cookies ──────────────────────────────────')
@@ -41302,11 +42239,11 @@ def _build_python_script(data: dict) -> str:
         sc.append('# ── 4b. Essential Session Cookies: none detected at scan time.')
         sc.append('# Session is likely established automatically via the initial GET.')
         sc.append('ESSENTIAL_COOKIES = {}')
-    sc.append('')
+    sc.append('    ')
     # ── 4c: localStorage / sessionStorage dump ─────────────────────────────
-    sc.append('# ── 4c. localStorage / sessionStorage Items ─────────────────────────')
-    sc.append('# Values captured during Playwright scan. Runnable as a static dict.')
-    sc.append('CLIENT_STORAGE = {')
+    sc.append('    # ── 4c. localStorage / sessionStorage Items ─────────────────────────')
+    sc.append('    # Values captured during Playwright scan. Runnable as a static dict.')
+    sc.append('    CLIENT_STORAGE = {')
     if _all_storage_f4:
         _ls_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'localStorage']
         _ss_items = [(s['key'], s) for s in _all_storage_f4 if s.get('store') == 'sessionStorage']
@@ -41329,16 +42266,16 @@ def _build_python_script(data: dict) -> str:
     else:
         sc.append('    "localStorage":   {},  # empty at scan time')
         sc.append('    "sessionStorage": {},')
-    sc.append('}')
-    sc.append('')
+    sc.append('    }')
+    sc.append('    ')
     # ── 4d: JWT / token injection ──────────────────────────────────────────
     _jwt_items = [s for s in _ess_storage if
                   str(s.get('value', '')).startswith('eyJ') or
                   re.search(r'access.?token|refresh.?token|bearer', s.get('key', ''), re.I)]
-    sc.append('# ── 4d. Token Injection from Storage ───────────────────────────────')
-    sc.append('# Reads access/refresh tokens from CLIENT_STORAGE and injects them')
-    sc.append('# into the session Authorization header automatically.')
-    sc.append('def inject_storage_tokens(sess, storage: dict) -> dict:')
+    sc.append('    # ── 4d. Token Injection from Storage ───────────────────────────────')
+    sc.append('    # Reads access/refresh tokens from CLIENT_STORAGE and injects them')
+    sc.append('    # into the session Authorization header automatically.')
+    sc.append('    def inject_storage_tokens(sess, storage: dict) -> dict:')
     sc.append('    """')
     sc.append('    Scan localStorage and sessionStorage for JWT / access tokens.')
     sc.append('    Injects the first found token as Authorization: Bearer <token>.')
@@ -41368,11 +42305,11 @@ def _build_python_script(data: dict) -> str:
     sc.append('    if not injected:')
     sc.append('        print("  ℹ️  No JWT/access token found in CLIENT_STORAGE")')
     sc.append('    return injected')
-    sc.append('')
+    sc.append('    ')
     if _jwt_items:
         _jk = _jwt_items[0].get('key', '')
         sc.append(f'# ★ Token detected at scan time: [{_jwt_items[0].get("store","localStorage")}]["{_jk}"]')
-    sc.append('_injected_tokens = inject_storage_tokens(session, CLIENT_STORAGE)')
+    sc.append('    _injected_tokens = inject_storage_tokens(session, CLIENT_STORAGE)')
 
     # ── Feature 5: Event Flow Tracing — full executable block ─────────────
     _ef_data     = data.get('event_flow') or {}
@@ -41380,15 +42317,15 @@ def _build_python_script(data: dict) -> str:
     _listeners   = _ef_data.get('event_listeners') or []
     _form_submit = _ef_data.get('form_submission') or []
     _all_ctas    = _ef_data.get('cta_candidates') or []
-    sc.append('')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('# ⚡ Feature 5 — Event Flow Tracing')
-    sc.append('# Primary CTA button + JS event listeners + form submission attrs.')
-    sc.append('# Simulate the exact click/submit chain the browser fires.')
-    sc.append('# ══════════════════════════════════════════════════════════════════')
-    sc.append('')
+    sc.append('    ')
+    sc.append('    # ══════════════════════════════════════════════════════════════════')
+    sc.append('    # ⚡ Feature 5 — Event Flow Tracing')
+    sc.append('    # Primary CTA button + JS event listeners + form submission attrs.')
+    sc.append('    # Simulate the exact click/submit chain the browser fires.')
+    sc.append('    # ══════════════════════════════════════════════════════════════════')
+    sc.append('    ')
     # ── 5a: CTA identity ──────────────────────────────────────────────────
-    sc.append('# ── 5a. Primary CTA Button ─────────────────────────────────────────')
+    sc.append('    # ── 5a. Primary CTA Button ─────────────────────────────────────────')
     if _cta:
         _cta_txt = (_cta.get('text') or _cta.get('value') or
                     _cta.get('id') or '(unknown)')[:60].replace('"', '\\"')
@@ -41412,11 +42349,11 @@ def _build_python_script(data: dict) -> str:
                           f'id="{_alt.get("id","")}"')
     else:
         sc.append('CTA_BUTTON = {}  # no CTA button detected — form may auto-submit')
-    sc.append('')
+    sc.append('    ')
     # ── 5b: Event listener registry ───────────────────────────────────────
-    sc.append('# ── 5b. JavaScript Event Listeners ─────────────────────────────────')
-    sc.append('# Detected listeners attached to the CTA or form submit chain.')
-    sc.append('EVENT_LISTENERS = [')
+    sc.append('    # ── 5b. JavaScript Event Listeners ─────────────────────────────────')
+    sc.append('    # Detected listeners attached to the CTA or form submit chain.')
+    sc.append('    EVENT_LISTENERS = [')
     if _listeners:
         for _lsn in _listeners[:10]:
             _et   = _lsn.get('type', '').replace('"', '\\"')
@@ -41429,11 +42366,11 @@ def _build_python_script(data: dict) -> str:
             sc.append(f'    }},')
     else:
         sc.append('    # No explicit JS listeners found — form uses native HTML submit')
-    sc.append(']')
-    sc.append('')
+    sc.append('    ]')
+    sc.append('    ')
     # ── 5c: Form submission attributes ────────────────────────────────────
-    sc.append('# ── 5c. Form Submission Attributes ─────────────────────────────────')
-    sc.append('FORM_SUBMIT_ATTRS = [')
+    sc.append('    # ── 5c. Form Submission Attributes ─────────────────────────────────')
+    sc.append('    FORM_SUBMIT_ATTRS = [')
     if _form_submit:
         for _fa in _form_submit[:8]:
             _fa_act = _fa.get('action', '').replace('"', '\\"')[:120]
@@ -41450,21 +42387,21 @@ def _build_python_script(data: dict) -> str:
             sc.append(f'    }},')
     else:
         sc.append('    # No form submission attributes detected')
-    sc.append(']')
-    sc.append('')
+    sc.append('    ]')
+    sc.append('    ')
     # ── 5d: simulate_cta_click() helper ───────────────────────────────────
-    sc.append('# ── 5d. CTA Click Simulator ─────────────────────────────────────────')
-    sc.append('# Replicates the browser event flow:')
-    sc.append('#   mousedown → mouseup → click → [validate] → submit → POST')
+    sc.append('    # ── 5d. CTA Click Simulator ─────────────────────────────────────────')
+    sc.append('    # Replicates the browser event flow:')
+    sc.append('    #   mousedown → mouseup → click → [validate] → submit → POST')
 
     if gw_name in ('Stripe', 'Braintree', 'Adyen') or hosted.get('gateway'):
         sc.append('')
         sc.extend(_tokenize_step())
 
     # Step 3
-    sc.append('')
-    sc.append('# ── Step 3: Build form body + Submit ────────────────────────────────')
-    sc.append('mapper  = DynamicFieldMapper()')
+    sc.append('    ')
+    sc.append('    # ── Step 3: Build form body + Submit ────────────────────────────────')
+    sc.append('    mapper  = DynamicFieldMapper()')
     # Build overrides from gateway token if available
     # Check both gw_name and hosted.get('gateway') so hosted-only detections are covered
     _eff_gw_step3 = gw_name if gw_name in ('Stripe', 'Braintree', 'Adyen') else hosted.get('gateway', '')
@@ -41493,17 +42430,17 @@ def _build_python_script(data: dict) -> str:
             sc.append('_overrides = {"payment_method_nonce": nonce}')
     else:
         sc.append('_overrides = {}')
-    sc.append('')
-    sc.append('# Build the POST body — auto-typed from field name/type/placeholder')
-    sc.append(f'_raw_fields = {repr(fields)}')
-    sc.append('post_body = mapper.build_form(')
+    sc.append('    ')
+    sc.append('    # Build the POST body — auto-typed from field name/type/placeholder')
+    sc.append(f'    _raw_fields = {repr(fields)}')
+    sc.append('    post_body = mapper.build_form(')
     sc.append('    fields    = _raw_fields,')
     sc.append('    overrides = _overrides,')
     sc.append('    token_map = tokens,   # CSRF/nonce injected automatically')
-    sc.append(')')
-    sc.append('mapper.diff_report(_raw_fields, post_body)')
-    sc.append('print(f"POST body ({len(post_body)} fields): {list(post_body.keys())}")')
-    sc.append('')
+    sc.append('    )')
+    sc.append('    mapper.diff_report(_raw_fields, post_body)')
+    sc.append('    print(f"POST body ({len(post_body)} fields): {list(post_body.keys())}")')
+    sc.append('    ')
     _ct_header = 'application/json' if is_json_enc else 'application/x-www-form-urlencoded'
 
     if submit_url:
@@ -41531,15 +42468,15 @@ def _build_python_script(data: dict) -> str:
         sc.append('if resp is None:')
         sc.append('    print("⚠️ No endpoint found — resp is None, check scan results")')
 
-    sc.append('# ── Step 4: Analyse response ─────────────────────────────────────────')
-    sc.append('engine = ResponseAnalysisEngine()')
-    sc.append('if resp is not None:')
+    sc.append('    # ── Step 4: Analyse response ─────────────────────────────────────────')
+    sc.append('    engine = ResponseAnalysisEngine()')
+    sc.append('    if resp is not None:')
     sc.append('    print(f"\\nHTTP {resp.status_code}  →  {resp.url}")')
     sc.append('    log.info(f"Step 4 — Analysing response HTTP {resp.status_code}")')
     sc.append('    analysis = engine.analyse(resp)')
     sc.append('    engine.print_result(analysis)')
     sc.append('    _log_verdict(analysis["state"], resp.status_code, analysis.get("hits", []))')
-    sc.append('')
+    sc.append('    ')
     sc.append('    # ── Act on state ──────────────────────────────────────────────')
     sc.append('    if analysis["state"] == ResponseAnalysisEngine.SUCCESS:')
     sc.append('        order_id = ""')
@@ -41549,7 +42486,7 @@ def _build_python_script(data: dict) -> str:
     sc.append('                           _j.get("transaction_id") or _j.get("charge_id") or "")')
     sc.append('        log.info(f"  ✅ Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
     sc.append('        print(f"  ✅ Order/Charge ID: {order_id or \'(not found in JSON)\'}")')
-    sc.append('')
+    sc.append('    ')
     sc.append('    elif analysis["state"] == ResponseAnalysisEngine.RE_VERIFICATION_REQUIRED:')
     sc.append('        redirect_url = ""')
     sc.append('        if analysis["json"]:')
@@ -41563,7 +42500,7 @@ def _build_python_script(data: dict) -> str:
     sc.append('        print(f"  🔐 Re-verification URL: {redirect_url or \'(check JSON above)\'}")')
     if threeds:
         sc.append('        # ⚠️  3DS signals detected during scan — browser redirect required')
-    sc.append('')
+    sc.append('    ')
     sc.append('    elif analysis["state"] == ResponseAnalysisEngine.FAILED:')
     sc.append('        decline_code = ""')
     sc.append('        if analysis["json"]:')
@@ -41578,11 +42515,11 @@ def _build_python_script(data: dict) -> str:
         sc.append(f'    # ⚠️ CAPTCHA detected (sitekey: {recaptcha["site_key"][:30]}…)')
         sc.append('    # Solve recaptcha token before Step 3 and add:')
         sc.append('    #   "g-recaptcha-response": RECAPTCHA_TOKEN')
-    sc.append('else:')
+    sc.append('    else:')
     sc.append('    log.error("No response — resp is None. Check submit endpoint detection.")')
     sc.append('    print("⚠️  No response — check submit endpoint detection.")')
-    sc.append('')
-    sc.append('log.info("Script finished.")')
+    sc.append('    ')
+    sc.append('    log.info("Script finished.")')
 
     # ── BatchProcessor class ───────────────────────────────────────────────
     import textwrap as _tw
@@ -41944,7 +42881,7 @@ def _build_python_script(data: dict) -> str:
                 print(f"   Columns: {{FIELD_COLUMNS}}")
                 print("─"*52)
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 tasks = [
                     self._run_one_async(loop, ln, raw)
                     for ln, raw in cases
@@ -41952,32 +42889,6 @@ def _build_python_script(data: dict) -> str:
                 self.results = list(await asyncio.gather(*tasks))
                 self._print_summary()
 
-
-        # ══════════════════════════════════════════════════════════════════
-        #  Entry point — single run OR batch mode
-        # ══════════════════════════════════════════════════════════════════
-        if __name__ == "__main__":
-            import argparse
-            ap = argparse.ArgumentParser(
-                description="Payload script — single or batch mode"
-            )
-            ap.add_argument("--batch",       metavar="FILE",
-                            help="Path to pipe-delimited test-case file")
-            ap.add_argument("--concurrency", metavar="N", type=int, default=3,
-                            help="Max concurrent workers (default: 3)")
-            args = ap.parse_args()
-
-            if args.batch:
-                # ── Batch mode ────────────────────────────────────────────
-                processor = BatchProcessor(
-                    batch_file  = args.batch,
-                    concurrency = args.concurrency,
-                )
-                asyncio.run(processor.run())
-            else:
-                # ── Single mode (original Steps 1-4 above already ran) ────
-                print("\\n[Single mode] Steps 1-4 executed above.")
-                print("To run batch mode: python script.py --batch cases.txt")
     ''').lstrip('\n')
     # ── ClientConfigExtractor class ───────────────────────────────────────
     import textwrap as _tw
@@ -42149,6 +43060,127 @@ def _build_python_script(data: dict) -> str:
 
     ''').lstrip('\n')
     sc.extend(_CLIENT_CONFIG_SRC.splitlines())
+
+    # ── TokenLifecycleTracer ───────────────────────────────────────────────
+    import textwrap as _tw_tlc
+    _TLC_SRC = _tw_tlc.dedent(r'''
+
+        # ══════════════════════════════════════════════════════════════════
+        #  TokenLifecycleTracer
+        #  Maps each dynamic token from its origin (hidden input, meta tag,
+        #  JS variable, cookie, localStorage, sessionStorage, WebSocket frame,
+        #  HTTP response header) to POST body fields / request headers.
+        # ══════════════════════════════════════════════════════════════════
+        class TokenLifecycleTracer:
+
+            _TOKEN_KW = (
+                'token', 'csrf', 'nonce', 'auth', 'key', 'secret', 'verify',
+                'hash', 'session', 'xsrf', 'signature', 'hmac', 'fingerprint',
+                'captcha', 'idempotency', 'requestverification',
+            )
+
+            def _is_tok_name(self, name):
+                n = name.lower().replace('-', '_')
+                return any(kw in n for kw in self._TOKEN_KW)
+
+            def _is_tok_val(self, v):
+                return bool(v) and len(str(v)) >= 8 and not re.match(r'\\d{1,3}', str(v))
+
+            def capture(self, session, url, client_storage=None, ws_frames=None):
+                """GET page and capture all token sources from response."""
+                import json as _j
+                tokens = {}
+
+                def _add(name, value, src_type, location, detail=''):
+                    if not self._is_tok_name(name): return
+                    norm = name.lower().strip()
+                    if norm not in tokens:
+                        tokens[norm] = {'name': name,
+                            'value': str(value),
+                            'sources': [], 'reused_in': []}
+                    e = {'type': src_type, 'location': location, 'detail': str(detail)[:80]}
+                    if e not in tokens[norm]['sources']:
+                        tokens[norm]['sources'].append(e)
+
+                resp = session.get(url, timeout=15)
+                found = extract_tokens(resp.text or '')
+                for k, v in found.items():
+                    _add(k, v, 'html_js_scan', 'Page HTML/JS')
+                for ck, cv in session.cookies.items():
+                    if self._is_tok_name(ck) and self._is_tok_val(cv):
+                        _add(ck, cv, 'cookie', 'Session cookie')
+                _HDR = {'x-csrf-token','x-xsrf-token','x-auth-token','x-nonce','x-request-id'}
+                for hn, hv in resp.headers.items():
+                    if (hn.lower() in _HDR or self._is_tok_name(hn)) and self._is_tok_val(hv):
+                        _add(hn, hv, 'response_header', f'HTTP header: {hn}')
+                for sname, store in (client_storage or {}).items():
+                    for k, v in (store or {}).items():
+                        if self._is_tok_name(k) and self._is_tok_val(str(v)):
+                            _add(k, str(v), sname, f'Browser {sname}')
+                _ws_pat = re.compile(r'["\\']+([\w\-]{3,40})["\\']+:\\s*["\\']+([A-Za-z0-9+/=_.\\-]{8,200})["\\']+')
+                for frame in (ws_frames or []):
+                    p = frame.get('data','') or ''
+                    if isinstance(p, str):
+                        for m in _ws_pat.finditer(p[:2000]):
+                            k,v = m.group(1), m.group(2)
+                            if self._is_tok_name(k) and self._is_tok_val(v):
+                                _add(k, v, 'websocket_frame', f"WS ({frame.get('dir','recv')})")
+                self._tokens = tokens
+                return tokens
+
+            def trace_reuse(self, post_body, req_headers, req_url):
+                """After POST/GET, record which tokens are reused (body/query/header)."""
+                from urllib.parse import urlparse as _up, parse_qs as _pqs
+                _HDR_TOK = {'x-csrf-token','x-xsrf-token','x-auth-token',
+                             'x-nonce','authorization','x-idempotency-key'}
+                try:
+                    _qs = {k: v[0] for k, v in _pqs(_up(req_url).query).items()}
+                except Exception:
+                    _qs = {}
+                all_fields = {**post_body, **_qs}
+                for norm, tok in getattr(self, '_tokens', {}).items():
+                    vp = tok['value']
+                    # Body + query string: name match OR value match
+                    for field, val in all_fields.items():
+                        fl = field.lower().replace('-','_')
+                        name_m = norm in fl or fl in norm
+                        val_m  = str(val) == vp or (len(vp)>=8 and str(val).startswith(vp[:16]))
+                        if name_m or val_m:
+                            via = 'query' if field in _qs else 'body'
+                            ru = {'url': req_url[:80], 'field': field,
+                                  'via': via, 'match': 'name' if name_m else 'value'}
+                            if ru not in tok['reused_in']: tok['reused_in'].append(ru)
+                    # Request headers: name match + optional value match
+                    for hn, hv in req_headers.items():
+                        if hn.lower() in _HDR_TOK and norm in hn.lower():
+                            val_m = len(vp)>=8 and str(hv).startswith(vp[:16])
+                            ru = {'url': req_url[:80], 'field': hn, 'via': 'header',
+                                  'match': 'name+value' if val_m else 'name'}
+                            if ru not in tok['reused_in']: tok['reused_in'].append(ru)
+                    # Cookie → body cross-ref
+                    _cookie_src = [s for s in tok.get('sources',[]) if s.get('type')=='cookie']
+                    if _cookie_src:
+                        for field in post_body:
+                            if norm in field.lower():
+                                ru = {'url': req_url[:80], 'field': field,
+                                      'via': 'cookie→body', 'match': 'cookie_name'}
+                                if ru not in tok['reused_in']: tok['reused_in'].append(ru)
+
+            def report(self):
+                """Print formatted lifecycle table."""
+                toks = getattr(self, '_tokens', {})
+                if not toks:
+                    print("No tokens captured."); return
+                print(f"\n{'═'*56}\n  TOKEN LIFECYCLE  ({len(toks)} token(s))\n{'─'*56}")
+                for norm, t in toks.items():
+                    srcs   = ', '.join(dict.fromkeys(s['type'] for s in t['sources']))
+                    reuses = ' | '.join(f"{r['via']}:{r['field']}" for r in t['reused_in'][:3]) or '(not in POST)'
+                    vp = t['value'][:24] + ('…' if len(t['value'])>24 else '')
+                    print(f"\n  🪙 {t['name']}  [{vp}]\n     Source : {srcs}\n     Reused : {reuses}")
+                print('═'*56)
+
+    ''').lstrip('\n')
+    sc.extend(_TLC_SRC.splitlines())
 
     sc.append(_BATCH_SRC)
 
@@ -43006,6 +44038,23 @@ def _build_json_export(data: dict) -> str:
         _cc_out['raw_window'] = _cc['raw_window']
     if _cc_out:
         out['client_config'] = _cc_out
+
+    # ── [16] token_lifecycle ─────────────────────────────────────
+    _tl = data.get('token_lifecycle') or {}
+    if _tl.get('tokens'):
+        out['token_lifecycle'] = {
+            'summary': _tl.get('summary', {}),
+            'tokens': [
+                {
+                    'name':          t['name'],
+                    'value_preview': t['value_preview'],
+                    'lifecycle':     t['lifecycle'],
+                    'sources':       t['sources'],
+                    'reused_in':     t['reused_in'],
+                }
+                for t in _tl['tokens']
+            ],
+        }
 
     safe = _sanitize_for_json(out)
     return json.dumps(safe, indent=2, ensure_ascii=False)
@@ -50937,40 +51986,39 @@ async def payload_action_callback(
         await cmd_payload(update, context)
 
     elif action == 'curl':
-        snip = data.get('curl_snippet') or {}
-        curl_text = snip.get('curl', '')
-        py_text   = snip.get('python', '')
-        out = ''
-        if curl_text:
-            out += f"```bash\n{curl_text}\n```\n\n"
-        if py_text:
-            out += f"```python\n{py_text}\n```"
-        if out:
-            _CHUNK = 4000
-            if len(out) <= _CHUNK:
-                await query.message.reply_text(out, parse_mode='Markdown')
+        # ── 📋 curl: send full multi-step shell script as .sh file ──────
+        try:
+            domain   = urlparse(url).hostname or url
+            safe_dom = re.sub(r'[^\w\-]', '_', domain)[:40]
+            fname    = f'payload_{safe_dom}.sh'
+            sh_str   = _build_curl_export(data)
+            import tempfile, os as _os
+            tmp = _os.path.join(tempfile.gettempdir(), fname)
+            with open(tmp, 'w', encoding='utf-8') as _f:
+                _f.write(sh_str)
+            with open(tmp, 'rb') as _f:
+                await query.message.reply_document(
+                    document=_f,
+                    filename=fname,
+                    caption=(
+                        f'📋 *{escape_md(domain)}* — Multi-step curl script\n'
+                        f'`bash {fname}`  •  requires curl + jq'
+                    ),
+                    parse_mode='Markdown',
+                )
+            _os.unlink(tmp)
+        except Exception as e:
+            # Fallback: send the original single-snippet if export fails
+            snip     = data.get('curl_snippet') or {}
+            curl_txt = snip.get('curl', '')
+            if curl_txt:
+                await query.message.reply_text(
+                    f'```bash\n{curl_txt[:3800]}\n```',
+                    parse_mode='Markdown')
             else:
-                # Split on double-newline between blocks to avoid cutting mid-code-fence
-                _parts = out.split('\n\n')
-                _buf = ''
-                for _part in _parts:
-                    if len(_buf) + len(_part) + 2 > _CHUNK:
-                        if _buf:
-                            try:
-                                await query.message.reply_text(_buf.strip(), parse_mode='Markdown')
-                            except Exception:
-                                await query.message.reply_text(_buf.strip())
-                        _buf = _part
-                    else:
-                        _buf = (_buf + '\n\n' + _part) if _buf else _part
-                if _buf:
-                    try:
-                        await query.message.reply_text(_buf.strip(), parse_mode='Markdown')
-                    except Exception:
-                        await query.message.reply_text(_buf.strip())
-        else:
-            await query.message.reply_text(
-                "_Snippet မရှိပါ_", parse_mode='Markdown')
+                await query.message.reply_text(
+                    f'❌ curl export error: `{escape_md(str(e)[:120])}`',
+                    parse_mode='Markdown')
 
     elif action == 'json':
         try:
